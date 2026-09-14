@@ -33,8 +33,11 @@ export VAL_INDEX_DIR="/mnt/vast-nhr/projects/nib00021/jonathan/repos/_data_cache
 # Run outputs (PER-USER — repoint both). The defaults below are group-readable but
 # writable only by u25995. /mnt/vast-nhr/projects/nib00021 itself IS group-writable,
 # so create your own subdirectory there and point these at it.
-export LOGS_DIR="/mnt/vast-nhr/projects/nib00021/jonathan/repos/canvit/logs"
-export WANDB_DIR="/mnt/vast-nhr/projects/nib00021/jonathan"
+#
+# LOCAL EDIT (Caglar, u29298 — NOT committed): repointed both from jonathan's folder
+# to my own (per his instructions — "replace my user with your user").
+export LOGS_DIR="$HOME/caglar/logs"
+export WANDB_DIR="$HOME/caglar/wandb"
 
 # Tracker config
 export WANDB_PROJECT="canvit-train"   # TODO: change as needed
