@@ -241,6 +241,26 @@ def test_prune_with_per_ring_kernel():
     assert pruned.kpe.weight.shape[0] == pruned.kpe.n_rings
 
 
+def test_rf_interp_bilinear_same_params_different_output():
+    """rf_interp only changes how samples read the kernel grid: the default is
+    'nearest', 'bilinear' keeps every parameter shape (so a nearest checkpoint
+    loads into it) and changes the patch embeddings."""
+    assert FoveatedPatcherConfig().rf_interp == "nearest"
+    backbone = create_backbone("vits16")
+    nearest = create_patcher("foveated", backbone=backbone, foveated_config=_fov_cfg())
+    bilinear = create_patcher("foveated", backbone=backbone, foveated_config=_fov_cfg(rf_interp="bilinear"))
+    assert nearest.kpe.rf_interp == "nearest" and bilinear.kpe.rf_interp == "bilinear"
+    bilinear.load_state_dict(nearest.state_dict())          # strict: identical keys and shapes
+    image = torch.randn(2, 3, IMAGE_PX, IMAGE_PX)
+    vp = Viewpoint.full_scene(batch_size=2, device=image.device)
+    with torch.inference_mode():
+        p_n, pos_n = nearest(image, vp)
+        p_b, pos_b = bilinear(image, vp)
+    assert p_n.shape == p_b.shape
+    assert torch.equal(pos_n, pos_b)                          # token geometry unchanged
+    assert not torch.allclose(p_n, p_b)
+
+
 def test_to_migrates_fovi_state(foveated_patcher):
     """``.to(device)`` must migrate fovi's plain-attribute tensors.
 

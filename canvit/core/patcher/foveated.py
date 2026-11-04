@@ -100,6 +100,12 @@ class FoveatedPatcherConfig:
     on the fovi config) but no extra FLOPs. Shared-kernel-identical at init, so
     ``False`` (default) and a freshly-toggled ``True`` start from the same point.
     Only meaningful for the foveated (KNNPartitioning) embedding."""
+    rf_interp: Literal["nearest", "bilinear"] = "nearest"
+    """How each sample reads fovi's kernel grid. ``nearest`` (default, original
+    behavior): the grid cell nearest to the sample's in-patch position.
+    ``bilinear``: its 4 surrounding cells with bilinear weights (a degree-1 B-spline
+    kernel). Same grid (``arch_flag`` / ``ref_frame_side_length``) and same
+    parameters either way, so checkpoints load into both."""
     pattern_reference_size: int = 512
     """Reference window size (px) at which per-ring pixel coverage is reckoned
     for ``min_ring_new_pixels`` pruning. Decoupled from the deploy window (which
@@ -216,6 +222,7 @@ class FoveatedPatcher(Patcher):
             ref_frame_side_length=cfg.ref_frame_side_length,
             padding=cfg.padding,
             per_ring_kernel=cfg.per_ring_kernel,
+            rf_interp=cfg.rf_interp,
             device=str(dev),
         )
 
