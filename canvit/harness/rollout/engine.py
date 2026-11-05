@@ -213,11 +213,17 @@ def run_rollout(
         viz.viewpoints.append(vp_named)
         viz.frames.append(viz_hook(model=model, images=images, gout=gout, viewpoint=vp, loss=L))
 
-    def _tw_loss(L: Any) -> Tensor:
+    # Optional per-glimpse task-loss weight (visual search's `supervise='last'`). Absent
+    # (every other task) => weight 1.0 and the identical expression as before.
+    sw_hook = getattr(task, "step_weight", None)
+
+    def _tw_loss(L: Any, t: int) -> Tensor:
         """The per-glimpse task loss scaled by ``task_weight`` (design §4). The
         ``== 1.0`` guard makes the default/parity path hit the identical expression as
         before (no float multiply), so the digest ``9a0100a1a3de3acd`` is preserved."""
         lf = L.combined.float()
+        if sw_hook is not None:
+            lf = lf * sw_hook(t, n_glimpses)
         return lf if task_weight == 1.0 else task_weight * lf
 
     def run_branch(t0_type: ViewpointType, branch_idx: int = 0) -> BranchResult:
@@ -247,6 +253,11 @@ def run_rollout(
                 acc[k] = v if k not in acc else acc[k] + v
 
         ctx = sel.start_rollout(t0_type=t0_type, batch_size=B, device=device)
+        # Target conditioning for a FiLM-conditioned scorer (visual search). Tasks without
+        # the hook leave the context untouched.
+        cond_fn = getattr(task, "policy_cond", None)
+        if cond_fn is not None:
+            ctx.cond = cond_fn
 
         # Pre-glimpse capture (initial scene/canvas panels), branch 0 only.
         if viz is not None and branch_idx == 0:
@@ -267,7 +278,7 @@ def run_rollout(
         if is_policy and not defer:  # seed the reward denominator with the FULL-anchor loss (no policy loss at t0)
             prev_pi_loss = task.per_image_loss(gout.readout).detach()
 
-        chunk_loss = _tw_loss(L)
+        chunk_loss = _tw_loss(L, 0)
         total_detached = L.combined.detach().float()
         n_steps = 1
         state = gout.state
@@ -290,7 +301,7 @@ def run_rollout(
                 )
                 L = task.step_loss(gout.readout)
 
-            chunk_loss = chunk_loss + _tw_loss(L)
+            chunk_loss = chunk_loss + _tw_loss(L, t)
             _viz_capture(branch_idx, gout, vp_named, vp, L)
             _acc(L)
 
@@ -304,11 +315,11 @@ def run_rollout(
                 # it joins the FINAL chunk's backward — see the `t == n_glimpses - 1` block).
                 assert joint is not None and aux is not None
                 traj.append({"scores": aux["scores"], "flat_idx": aux["flat_idx"],
-                             "value": joint.state_value(aux["feats"])})
+                             "value": joint.state_value(aux["feats"]) if joint.needs_value else None})
             elif is_policy:
                 assert joint is not None and prev_pi_loss is not None and aux is not None
                 cur_pi = task.per_image_loss(gout.readout).detach()
-                reward = (prev_pi_loss - cur_pi) / prev_pi_loss.clamp_min(1e-4)
+                reward = joint.inline_reward(prev_pi_loss, cur_pi)
                 prev_pi_loss = cur_pi
                 ploss = joint.glimpse_loss(depth=t, scores=aux["scores"], flat_idx=aux["flat_idx"], reward=reward)
                 # chunk_loss is divided by n_glimpses below, but there are only
@@ -349,7 +360,7 @@ def run_rollout(
                 ploss = joint.trajectory_loss(
                     scores=torch.stack([a["scores"] for a in traj], dim=1),
                     flat_idx=torch.stack([a["flat_idx"] for a in traj], dim=1),
-                    values=torch.stack([a["value"] for a in traj], dim=1),
+                    values=torch.stack([a["value"] for a in traj], dim=1) if joint.needs_value else None,
                     reward=reward,
                 ) * n_glimpses
                 chunk_loss = chunk_loss + ploss
@@ -379,6 +390,8 @@ def run_rollout(
         # by construction) this never fires, so the parity path is unaffected.
         if n_glimpses % eff_chunk != 0:
             (chunk_loss / n_glimpses / n_branches).backward()
+        if is_policy and joint is not None:
+            joint.end_rollout()  # per_rollout entropy dual step; a no-op otherwise
 
         metrics = {k: v / n_steps for k, v in acc.items()}
         fm_hook = getattr(task, "final_metrics", None)

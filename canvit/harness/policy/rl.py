@@ -35,6 +35,10 @@ class PG:
     entropy_bonus: float = 0.01  # alpha init AND floor (alpha_min); fixed alpha when entropy_target=None
     entropy_target: float | None = 1.0  # nats; dual ascent holds mean policy entropy AT the target
     alpha_lr: float = 0.05  # dual step size on log(alpha)
+    alpha_init: float | None = None  # None = entropy_bonus (historical)
+    alpha_min: float | None = None  # None = entropy_bonus (historical)
+    alpha_max: float | None = None  # None = ALPHA_MAX (historical)
+    entropy_update: Literal["per_glimpse", "per_rollout"] = "per_glimpse"  # FoAViS: per_rollout
     qprop: bool = False  # exact-expectation discrete Q-Prop: second net as control-variate critic
     z_subtract_only: bool = False  # advantage = reward - running mean, NO std division
     credit: Literal["immediate", "return"] = "immediate"
@@ -102,13 +106,62 @@ class VPG:
 
 Objective = QReg | PG | VPG
 
+RewardKind = Literal["fractional", "difference", "terminal"]
+RewardCenter = Literal["none", "running_mean", "batch_mean"]
+RewardScale = Literal["none", "running_std", "batch_std", "ema_abs"]
+EMA_ABS_MOMENTUM = 0.99  # Haoze's `_normalize_reward` alpha
+EMA_ABS_CLIP = 10.0  # Haoze's `_reward_clip_value`
+
+
+@dataclass(frozen=True)
+class RewardSpec:
+    """The resolved reward: what is measured per glimpse, then how it is centred and
+    scaled before it becomes the policy-gradient weight (PG) or regression target (QReg).
+    Unused fields for VPG, which owns its learned baseline and advantage normalisation."""
+
+    kind: RewardKind
+    center: RewardCenter
+    scale: RewardScale
+
+
+def resolve_reward(*, objective: Objective, reward: str = "default", center: str = "default",
+                   scale: str = "default") -> RewardSpec:
+    """Resolve ``default`` to the objective's historical behaviour and refuse combinations
+    it cannot honour. QReg/PG default: fractional reward standardised by ``RunningNorm``
+    (``running_mean`` + ``running_std``; PG ``z_subtract_only`` = ``running_mean`` +
+    ``none``). VPG: terminal reward and nothing else."""
+    if isinstance(objective, VPG):
+        if reward not in ("default", "terminal"):
+            raise ValueError(f"objective='vpg' is defined by its TERMINAL reward; reward={reward!r} "
+                             "is not supported (use objective='pg' for per-glimpse rewards).")
+        if center != "default" or scale != "default":
+            raise ValueError("objective='vpg' owns its baseline (learned V(s)) and its advantage "
+                             "normalisation; reward_center / reward_scale must stay 'default'.")
+        return RewardSpec(kind="terminal", center="none", scale="none")
+    kind = "fractional" if reward == "default" else reward
+    c = "running_mean" if center == "default" else center
+    if scale != "default":
+        s = scale
+    elif isinstance(objective, PG) and objective.z_subtract_only:
+        s = "none"
+    else:
+        s = "running_std"
+    if isinstance(objective, QReg) and kind == "terminal":
+        raise ValueError("objective='qreg' regresses the IMMEDIATE reward at the taken cell; a "
+                         "terminal reward (known only after the last glimpse) is not defined for it.")
+    if s == "running_std" and c != "running_mean":
+        raise ValueError(f"reward_scale='running_std' is the std around the running mean, so it "
+                         f"needs reward_center='running_mean' (got {c!r}).")
+    return RewardSpec(kind=kind, center=c, scale=s)  # type: ignore[arg-type]
+
 
 @torch.no_grad()
-def entropy_floor_step(*, log_alpha: Tensor, entropy: Tensor, target: float, alpha_lr: float, alpha_min: float) -> None:
+def entropy_floor_step(*, log_alpha: Tensor, entropy: Tensor, target: float, alpha_lr: float,
+                       alpha_min: float, alpha_max: float = ALPHA_MAX) -> None:
     """One dual-ascent step on log(alpha), in place: alpha grows while mean policy
     entropy sits below the target, decays toward alpha_min above it. On-device, sync-free."""
     log_alpha += alpha_lr * (target - entropy)
-    log_alpha.clamp_(min=math.log(alpha_min), max=math.log(ALPHA_MAX))
+    log_alpha.clamp_(min=math.log(alpha_min), max=math.log(alpha_max))
 
 
 class RunningNorm:
@@ -133,6 +186,40 @@ class RunningNorm:
         if subtract_only:
             return x - mean
         return (x - mean) / (sq - mean**2).clamp_min(1e-4).sqrt()
+
+
+@torch.no_grad()
+def standardize_reward(
+    r: Tensor, *, spec: RewardSpec, running: RunningNorm, ema_abs: Tensor | None,
+) -> tuple[Tensor, Tensor | None]:
+    """Centre then scale one depth's raw reward ``r`` [N]. Returns the result and the
+    updated ``ema_abs`` state (only ``scale='ema_abs'`` uses it).
+
+    ``running_mean`` + ``running_std`` calls ``running.normalize(r)`` and nothing else, and
+    ``running_mean`` + ``none`` calls ``normalize(r, subtract_only=True)``: exactly the
+    historical QReg/PG paths, so their numbers cannot move. ``batch_std`` is the population
+    std of this step's batch (FoAViS); a batch whose rewards are all equal is left unscaled
+    rather than divided by ~0 (FoAViS falls back to the pooled std over steps instead, which
+    this per-step path does not have). ``ema_abs`` divides by an EMA of the mean absolute raw
+    reward and clips to +-10 (Haoze's ``_normalize_reward``; he applies it before his
+    baseline, here it follows the centring — the same up to where the clip bites)."""
+    c, s = spec.center, spec.scale
+    if c == "running_mean":
+        if s == "running_std":
+            return running.normalize(r), ema_abs
+        x = running.normalize(r, subtract_only=True)
+    elif c == "batch_mean":
+        x = r - r.mean()
+    else:
+        x = r
+    if s == "batch_std":
+        std = r.std(unbiased=False)
+        x = torch.where(std > 1e-8, x / std.clamp_min(1e-8), x)
+    elif s == "ema_abs":
+        batch = r.abs().mean()
+        ema_abs = batch if ema_abs is None else EMA_ABS_MOMENTUM * ema_abs + (1 - EMA_ABS_MOMENTUM) * batch
+        x = (x / (ema_abs + 1e-8)).clamp(-EMA_ABS_CLIP, EMA_ABS_CLIP)
+    return x, ema_abs
 
 
 def qreg_loss(pred_all: Tensor, flat_idx: Tensor, target: Tensor) -> tuple[Tensor, dict[str, Tensor]]:

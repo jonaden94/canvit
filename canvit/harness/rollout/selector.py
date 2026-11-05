@@ -8,6 +8,7 @@ digest is unchanged. PolicySelector / MixtureSelector (ε-curriculum) arrive in
 P3/P4 — the ``state`` and ``t`` arguments exist for them and are unused here.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -25,6 +26,11 @@ class RolloutCtx:
     """Per-rollout selector state (one branch = one rollout)."""
 
     rollout_scales: Tensor | None  # frozen [B] view scale for foveated mode='per_rollout'
+    cond: Callable[[], Tensor] | None = None
+    """Target conditioning for a FiLM-conditioned scorer (visual search): returns the
+    policy's target embedding [B, cond_dim], recomputed on every call so no graph is
+    reused across a backward. Set by the caller after ``start_rollout``; None (every
+    existing task) leaves the scorer call exactly as it was."""
 
 
 class Selector(Protocol):
@@ -111,14 +117,24 @@ class PolicySelector:
                 feats = self.encoder(state)  # type: ignore[operator]
         else:
             feats = self.encoder(state)  # type: ignore[operator]
-        scores = self.net(feats.float()).reshape(batch_size, -1)  # type: ignore[operator]
+        # `ctx` may be None on this path (callers that never start a rollout, e.g. the
+        # select_bn_eval tests): the historical code never read it here, so neither may this.
+        cond_fn = getattr(ctx, "cond", None)
+        cond = cond_fn() if cond_fn is not None else None
+        if cond is None:
+            scores = self.net(feats.float()).reshape(batch_size, -1)  # type: ignore[operator]
+        else:
+            scores = self.net(feats.float(), cond=cond).reshape(batch_size, -1)  # type: ignore[operator]
         if self.select_bn_eval:
             # Mode (b): SELECT under eval-mode BN (running stats), keeping `scores` — the
             # train-mode forward — for the loss. See the field docstring.
             was_training = self.net.training  # type: ignore[attr-defined]
             self.net.eval()  # type: ignore[attr-defined]
             with torch.no_grad():
-                sel_scores = self.net(feats.float()).reshape(batch_size, -1)  # type: ignore[operator]
+                if cond is None:
+                    sel_scores = self.net(feats.float()).reshape(batch_size, -1)  # type: ignore[operator]
+                else:
+                    sel_scores = self.net(feats.float(), cond=cond).reshape(batch_size, -1)  # type: ignore[operator]
             if was_training:
                 self.net.train()  # type: ignore[attr-defined]
         else:

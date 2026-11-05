@@ -103,8 +103,40 @@ class JointPolicyConfig:
     entropy_bonus: float = 0.01
     entropy_target: float | None = 1.0
     alpha_lr: float = 0.05
+    # PG entropy dual ascent: log(alpha) += alpha_lr * (entropy_target - mean entropy), clipped.
+    # The same update as FoAViS Appendix J (lambda <- lambda * exp(eta (H* - H))), in log space.
+    # None = the historical behaviour, so no existing run changes.
+    entropy_alpha_init: float | None = None
+    """Initial alpha. None = ``entropy_bonus`` (historical). FoAViS: 1e-3."""
+    entropy_alpha_min: float | None = None
+    """Lower clip of alpha. None = ``entropy_bonus`` (historical: init and floor coincide). FoAViS: 1e-6."""
+    entropy_alpha_max: float | None = None
+    """Upper clip of alpha. None = ``rl.ALPHA_MAX`` = 10 (historical). FoAViS: 0.1."""
+    entropy_update: Literal["per_glimpse", "per_rollout"] = "per_glimpse"
+    """``per_glimpse`` (historical): one dual step per policy glimpse, i.e. T-1 per training
+    step, each on that glimpse's batch-mean entropy. ``per_rollout`` (FoAViS): one step per
+    rollout on the entropy averaged over its decision steps."""
     policy_warmup_steps: int = 0
     """Steps to ramp prime_on_policy 0 -> its target (0 = constant target from step 0)."""
+
+    # Reward, and how it is centred and scaled before it multiplies log pi (or is regressed,
+    # QReg). "default" resolves to each objective's historical behaviour (see
+    # `canvit.harness.policy.rl.resolve_reward`), so no existing run changes. Combinations an
+    # objective cannot honour are refused when the policy is built.
+    reward: Literal["default", "fractional", "difference", "terminal"] = "default"
+    """``fractional``: (L_{t-1} - L_t) / L_{t-1}, credited to the action that chose glimpse t
+    (qreg/pg default). ``difference``: L_{t-1} - L_t, same credit (FoAViS's per-step reward).
+    ``terminal``: -L_T of the last glimpse, given to every action (vpg default; Haoze's
+    search default). L is the task's ``per_image_loss``."""
+    reward_center: Literal["default", "none", "running_mean", "batch_mean"] = "default"
+    """``running_mean``: subtract an EMA of the reward, one per depth (qreg/pg default, the
+    mean half of ``RunningNorm``). ``batch_mean``: subtract the batch mean at each step
+    (FoAViS ``per_step``). ``none``: no centring."""
+    reward_scale: Literal["default", "none", "running_std", "batch_std", "ema_abs"] = "default"
+    """``running_std``: divide by the EMA std, one per depth (qreg/pg default, the std half of
+    ``RunningNorm``). ``batch_std``: divide by the batch std at each step (FoAViS
+    ``per_step``). ``ema_abs``: divide by an EMA of the mean absolute reward and clip to +-10
+    (Haoze). ``none``: no scaling."""
 
     # VPG only (objective="vpg"); ignored by qreg/pg. Defaults = autoreg exp12's values.
     vpg_entropy_bonus: float = 5e-3

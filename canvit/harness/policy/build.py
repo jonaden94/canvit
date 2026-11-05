@@ -36,7 +36,7 @@ from canvit.core.policy import (
 )
 from canvit.harness.config import FoveatedScaleConfig, JointPolicyConfig
 from canvit.harness.policy.joint import JointPolicy
-from canvit.harness.policy.rl import PG, VPG, Objective, QReg
+from canvit.harness.policy.rl import PG, VPG, Objective, QReg, resolve_reward
 from canvit.harness.rollout.selector import PolicySelector, RandomSelector
 
 log = logging.getLogger(__name__)
@@ -53,11 +53,18 @@ def build_policy(
     foveated_scale: FoveatedScaleConfig,
     generator: torch.Generator,
     encode_model: Any | None = None,
+    scorer_input_norm: str = "batch",
+    film_cond_dim: int | None = None,
 ) -> JointPolicy:
     """Assemble a :class:`JointPolicy` for any task. ``encode_model`` defaults to
     ``SimpleNamespace(canvit=canvit)`` (the distill case); pass the task wrapper
     (``seg``/``clf``) so probe-aware feature groups can read its head. ``feature_groups``
-    comes from the task (INTRINSIC vs the probe-entropy set)."""
+    comes from the task (INTRINSIC vs the probe-entropy set).
+
+    ``scorer_input_norm`` and ``film_cond_dim`` are set by the TASK, not by the user: the
+    scorer's input BatchNorm (``'none'`` drops it; it only equalises the handcrafted
+    feature groups) and the width of the target embedding the scorer is FiLM-conditioned
+    on (visual search). The defaults reproduce every existing task's scorer exactly."""
     if encode_model is None:
         encode_model = SimpleNamespace(canvit=canvit)
 
@@ -89,7 +96,25 @@ def build_policy(
             value_bias_init=rl.vpg_value_bias_init,
         )
     else:
-        obj = PG(entropy_bonus=rl.entropy_bonus, entropy_target=rl.entropy_target, alpha_lr=rl.alpha_lr)
+        obj = PG(entropy_bonus=rl.entropy_bonus, entropy_target=rl.entropy_target, alpha_lr=rl.alpha_lr,
+                 alpha_init=rl.entropy_alpha_init, alpha_min=rl.entropy_alpha_min,
+                 alpha_max=rl.entropy_alpha_max, entropy_update=rl.entropy_update)
+
+    # The entropy dual-ascent knobs only mean something for PG with a target; refuse them
+    # elsewhere rather than accept a setting that silently does nothing.
+    dual_knobs = {k: v for k, v in (("entropy_alpha_init", rl.entropy_alpha_init),
+                                    ("entropy_alpha_min", rl.entropy_alpha_min),
+                                    ("entropy_alpha_max", rl.entropy_alpha_max)) if v is not None}
+    if rl.entropy_update != "per_glimpse":
+        dual_knobs["entropy_update"] = rl.entropy_update
+    if dual_knobs and not (isinstance(obj, PG) and obj.entropy_target is not None):
+        raise ValueError(
+            f"{sorted(dual_knobs)} configure PG's entropy dual ascent, which only exists for "
+            f"objective='pg' with an entropy_target (got objective={rl.objective!r}, "
+            f"entropy_target={rl.entropy_target!r}).")
+
+    # Reward kind + centring + scaling; refuses what the objective cannot honour.
+    reward = resolve_reward(objective=obj, reward=rl.reward, center=rl.reward_center, scale=rl.reward_scale)
 
     # VPG is defined for the FOVEATED action space (autoreg_tryout only ever ran a foveated
     # model). It runs on uniform and is internally consistent there, but it is not the same
@@ -117,6 +142,20 @@ def build_policy(
     # so the biased combination was what a plain `--rl.objective vpg` GOT, and a log line
     # is not enough to stop someone acting on the run's numbers. Opting in is one explicit
     # flag; there is no legitimate reason to want the biased gradient.
+    # PG samples its action too (mode='sample'), so the same off-policy bias applies to it
+    # whenever the scorer has its BatchNorm. Without the BatchNorm (scorer_input_norm='none')
+    # the eval- and train-mode forwards are the same computation and nothing is biased.
+    if isinstance(obj, PG) and rl.select_bn_eval and scorer_input_norm == "batch":
+        raise ValueError(
+            "objective='pg' requires --rl.no-select-bn-eval when the scorer has its input "
+            "BatchNorm. PG SAMPLES its glimpse; with select_bn_eval=True the sample comes from "
+            "an eval-mode BN forward while log pi is differentiated from the TRAIN-mode scores, "
+            "so the REINFORCE gradient is off-policy and biased, exactly as for VPG below.")
+    if isinstance(obj, VPG) and film_cond_dim is not None:
+        raise ValueError(
+            "objective='vpg' with a FiLM-conditioned scorer: VPG's value head V(s) reads the "
+            "pooled, UNCONDITIONED input features, so its baseline cannot depend on the target. "
+            "Use objective='pg' (or 'qreg').")
     if isinstance(obj, VPG) and rl.select_bn_eval:
         raise ValueError(
             "objective='vpg' requires --rl.no-select-bn-eval. With select_bn_eval=True the "
@@ -134,6 +173,7 @@ def build_policy(
         canvas_dim=canvit.cfg.canvas_dim, width=rl.width, n_scale=n_scale, scales=scales,
         centers_per_axis=rl.centers_per_axis, block_layers=rl.block_layers, groups=feature_groups,
         dueling=dueling, action_space=action_space, readout=rl.policy_readout,
+        input_norm=scorer_input_norm, film_cond_dim=film_cond_dim,  # type: ignore[arg-type]
     ).to(device)
     if isinstance(obj, VPG) and obj.value_bias_init is not None:
         assert scorer.vhead is not None
@@ -157,9 +197,11 @@ def build_policy(
         rl_weight=rl.rl_weight, keep_random_branch=rl.keep_random_branch,
         target_momentum=rl.target_momentum, device=device,
         prime_target=rl.prime_on_policy, prime_warmup=rl.policy_warmup_steps,
+        reward=reward,
     )
     if isinstance(obj, PG) and obj.entropy_target is not None:
-        jp.log_alpha = torch.tensor(math.log(obj.entropy_bonus), device=device)
+        alpha0 = obj.entropy_bonus if obj.alpha_init is None else obj.alpha_init
+        jp.log_alpha = torch.tensor(math.log(alpha0), device=device)
     return jp
 
 

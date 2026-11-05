@@ -91,21 +91,109 @@ class _TokenMLP(nn.Module):
         return x + self.net(self.norm(x))
 
 
+class FiLMGen(nn.Module):
+    """Target embedding ``[B, cond_dim]`` -> FiLM ``(gamma, beta)``, each ``[B, ch, 1, 1]``.
+
+    Haoze's ``FiLMGenMLP`` (autoregressive_detection, haoze-wip): Linear -> ReLU -> Linear,
+    hidden width ``max(128, 2 * cond_dim)``, the last layer ZERO-initialised so the
+    modulation starts as the identity."""
+
+    def __init__(self, cond_dim: int, ch: int):
+        super().__init__()
+        hidden = max(128, 2 * cond_dim)
+        self.net = nn.Sequential(nn.Linear(cond_dim, hidden), nn.ReLU(), nn.Linear(hidden, 2 * ch))
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, cond: Tensor) -> tuple[Tensor, Tensor]:
+        gamma, beta = self.net(cond).chunk(2, dim=-1)
+        return gamma[:, :, None, None], beta[:, :, None, None]
+
+
+class FiLM(nn.Module):
+    """One conditioned stage output: ``(1 + gamma) * GroupNorm(x) + beta`` — Haoze's
+    ``apply_generic_film`` with his ``GroupNorm(min(8, ch), ch)``. GroupNorm is per sample,
+    so this adds no train/eval difference."""
+
+    def __init__(self, cond_dim: int, ch: int):
+        super().__init__()
+        self.norm = nn.GroupNorm(min(8, ch), ch)
+        self.gen = FiLMGen(cond_dim, ch)
+
+    def forward(self, x: Tensor, cond: Tensor) -> Tensor:
+        gamma, beta = self.gen(cond)
+        return (1 + gamma) * self.norm(x) + beta
+
+
+N_UNET_ENC, N_UNET_DEC = 6, 5  # 32,16,8,4,2,1 down; ->2,4,8,16,32 up
+
+
+def build_unet(width: int, block_layers: int) -> tuple[nn.ModuleList, nn.ModuleList]:
+    """The scorer's ConvNeXt-V2 U-Net body: ``N_UNET_ENC`` encoder stages at ``width``
+    (average-pooled 2x between them, 32 -> 1) and ``N_UNET_DEC`` decoder stages, each
+    taking ``[upsampled, skip]`` (2*width) back to width."""
+    enc = nn.ModuleList([_stage(width, width, block_layers) for _ in range(N_UNET_ENC)])
+    dec = nn.ModuleList([_stage(2 * width, width, block_layers) for _ in range(N_UNET_DEC)])
+    return enc, dec
+
+
+def build_unet_film(cond_dim: int, width: int) -> tuple[nn.ModuleList, nn.ModuleList]:
+    """One :class:`FiLM` per encoder and per decoder stage of :func:`build_unet`."""
+    return (nn.ModuleList([FiLM(cond_dim, width) for _ in range(N_UNET_ENC)]),
+            nn.ModuleList([FiLM(cond_dim, width) for _ in range(N_UNET_DEC)]))
+
+
+def unet_forward(
+    h: Tensor, enc: nn.ModuleList, dec: nn.ModuleList, *,
+    film: tuple[nn.ModuleList, nn.ModuleList] | None = None, cond: Tensor | None = None,
+) -> Tensor:
+    """Run the U-Net body on ``h`` [B, width, 32, 32] -> [B, width, 32, 32].
+
+    With ``film=None`` this is exactly the scorer's historical forward (same ops, same
+    order). With ``film=(film_enc, film_dec)`` each stage output is FiLM-modulated by
+    ``cond`` before it is pooled / skipped / upsampled."""
+    assert (film is None) == (cond is None), "pass film and cond together"
+    skips = []
+    for i, stage in enumerate(enc):
+        h = stage(h)
+        if film is not None:
+            h = film[0][i](h, cond)
+        skips.append(h)
+        if i < len(enc) - 1:
+            h = F.avg_pool2d(h, 2)
+    d = skips[-1]  # 1x1 global bottleneck
+    for j, stage in enumerate(dec):
+        d = stage(torch.cat([F.interpolate(d, scale_factor=2, mode="nearest"), skips[len(enc) - 2 - j]], dim=1))
+        if film is not None:
+            d = film[1][j](d, cond)
+    return d
+
+
+InputNorm = Literal["batch", "none"]
+
+
 class Frontend(nn.Module):
     """Fuse the derived feature groups into [B, width, 32, 32]: per-channel BatchNorm
     (scale-equalize the heterogeneous inputs) -> each group its OWN 1x1 conv to width
     -> per-group LayerNorm2d (affine, so it reweights per-channel importance) -> x
     per-group gate -> sum -> pre-norm token-MLP -> 1x1. (A plain per-group-proj sum
-    WITHOUT the LN equals one shared proj; the LN is what makes it non-trivial.)"""
+    WITHOUT the LN equals one shared proj; the LN is what makes it non-trivial.)
+
+    ``input_norm='none'`` drops the BatchNorm. It exists to equalise the scales of the
+    handcrafted groups (cos/ent maps at ~1e-3 next to the 768 canvas channels); a scorer
+    that reads only ``ln_feat`` (already LayerNorm'd per token) does not need it, and
+    without it the scorer has no train/eval difference at all (visual search, 2026-11-05)."""
 
     sizes: list[int]
     groups: tuple[str, ...]
 
-    def __init__(self, canvas_dim: int, width: int, *, groups: tuple[str, ...] = FEATURE_GROUPS):
+    def __init__(self, canvas_dim: int, width: int, *, groups: tuple[str, ...] = FEATURE_GROUPS,
+                 input_norm: InputNorm = "batch"):
         super().__init__()
         self.groups = groups
         self.sizes = group_sizes(canvas_dim, groups)
-        self.bn = nn.BatchNorm2d(sum(self.sizes))
+        assert input_norm in ("batch", "none"), f"unknown input_norm {input_norm!r}"
+        self.bn = nn.BatchNorm2d(sum(self.sizes)) if input_norm == "batch" else nn.Identity()
         self.proj = nn.ModuleList([nn.Conv2d(sz, width, 1) for sz in self.sizes])
         self.norm = nn.ModuleList([LayerNorm2d(width) for _ in self.sizes])
         self.gate = nn.Parameter(torch.ones(len(self.sizes)))
@@ -176,18 +264,19 @@ class ViewpointScorer(  # pyright: ignore[reportIncompatibleMethodOverride]  # S
         dueling: bool = False,
         action_space: ActionSpace = "safebox",
         readout: Readout = "unet",
+        input_norm: InputNorm = "batch",
+        film_cond_dim: int | None = None,
     ):
         super().__init__()
         scales, groups = tuple(scales), tuple(groups)  # config.json round-trips tuples as lists
         assert len(scales) == n_scale, "need one entry in `scales` per scale channel"
         self.action_space: ActionSpace = action_space
         self.readout: Readout = readout
-        self.frontend = Frontend(canvas_dim, width, groups=groups)
+        self.frontend = Frontend(canvas_dim, width, groups=groups, input_norm=input_norm)
         # 'local' skips the U-Net entirely -- do not INSTANTIATE it either, or the unused
         # params would ride in the optimizer and the published state_dict.
         if readout == "unet":
-            self.enc = nn.ModuleList([_stage(width, width, block_layers) for _ in range(6)])  # 32,16,8,4,2,1
-            self.dec = nn.ModuleList([_stage(2 * width, width, block_layers) for _ in range(5)])  # ->2,4,8,16,32
+            self.enc, self.dec = build_unet(width, block_layers)
         else:
             self.enc = self.dec = None
         if action_space == "fixation":
@@ -208,21 +297,35 @@ class ViewpointScorer(  # pyright: ignore[reportIncompatibleMethodOverride]  # S
         # conditioning is fine); the map becomes a mean-zero advantage. Argmax — hence deploy — is unchanged.
         ch = feature_channels(canvas_dim, groups)
         self.vhead = nn.Sequential(nn.Linear(ch, 64), nn.GELU(), nn.Linear(64, 1)) if dueling else None
+        # Target conditioning (visual search): FiLM after the Frontend and after every U-Net
+        # stage. Built LAST and only when asked, so an unconditioned scorer consumes the same
+        # init RNG, has the same state_dict and computes the same thing as before.
+        self.film_cond_dim = film_cond_dim
+        if film_cond_dim is not None:
+            assert readout == "unet", "FiLM conditioning needs readout='unet' (it modulates the U-Net stages)"
+            self.film_in = FiLM(film_cond_dim, width)
+            self.film_enc, self.film_dec = build_unet_film(film_cond_dim, width)
+        else:
+            self.film_in = self.film_enc = self.film_dec = None
 
-    def forward(self, feats: Tensor) -> Tensor:
+    def forward(self, feats: Tensor, cond: Tensor | None = None) -> Tensor:
+        """``cond`` [B, film_cond_dim]: the target embedding; required iff the scorer was
+        built with ``film_cond_dim``."""
+        if (cond is None) != (self.film_cond_dim is None):
+            raise ValueError(
+                f"ViewpointScorer(film_cond_dim={self.film_cond_dim}) called with "
+                f"cond={'None' if cond is None else tuple(cond.shape)}: a conditioned scorer "
+                "needs the target embedding, an unconditioned one must not get one.")
         h = self.frontend(feats)
+        if cond is not None:
+            assert self.film_in is not None and self.film_enc is not None and self.film_dec is not None
+            h = self.film_in(h, cond)
         if self.enc is None:  # readout='local': the Frontend map IS the score map
             d = h
         else:
-            skips = []
-            for i, enc in enumerate(self.enc):
-                h = enc(h)
-                skips.append(h)
-                if i < 5:
-                    h = F.avg_pool2d(h, 2)
-            d = skips[5]  # 1x1 global bottleneck
-            for j in range(len(self.dec)):
-                d = self.dec[j](torch.cat([F.interpolate(d, scale_factor=2, mode="nearest"), skips[4 - j]], dim=1))
+            assert self.dec is not None
+            film = None if cond is None else (self.film_enc, self.film_dec)
+            d = unet_forward(h, self.enc, self.dec, film=film, cond=cond)  # type: ignore[arg-type]
         b = d.shape[0]
         vals = [
             self.head(F.grid_sample(d, self.sb_grids[k].expand(b, -1, -1, -1), align_corners=False) + self.scale_emb[k])

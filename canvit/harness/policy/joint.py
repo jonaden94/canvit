@@ -32,14 +32,17 @@ from canvit.core.policy import (
     ViewpointScorer,
 )
 from canvit.harness.policy.rl import (
+    ALPHA_MAX,
     PG,
     VPG,
     Objective,
     QReg,
+    RewardSpec,
     RunningNorm,
     entropy_floor_step,
     pg_loss,
     qreg_loss,
+    standardize_reward,
     vpg_loss,
 )
 from canvit.harness.rollout.selector import PolicySelector, RandomSelector
@@ -66,6 +69,10 @@ class JointPolicy:
     running: dict[int, RunningNorm] = field(default_factory=dict)
     log_alpha: Tensor | None = None
     last_step: dict = field(default_factory=dict)  # detached per-step policy metrics for logging
+    reward: RewardSpec = field(default_factory=lambda: RewardSpec("fractional", "running_mean", "running_std"))
+    """The resolved reward (``rl.resolve_reward``). The default is the historical QReg/PG one."""
+    ema_abs: dict[int, Tensor] = field(default_factory=dict)  # per-depth state of reward_scale='ema_abs'
+    _rollout_entropies: list = field(default_factory=list)  # entropy_update='per_rollout' accumulator
 
     def branch_selector(self, t0_type: ViewpointType) -> tuple[object, bool]:
         """(selector, is_policy_branch) for a branch with this t0 type. Policy
@@ -100,11 +107,14 @@ class JointPolicy:
         """Policy training state for the checkpoint sidecar (scorer + reward
         standardizers + PG dual variable). The optimizer/scheduler state — including
         the policy param group — rides in the main checkpoint."""
-        return {
+        sd = {
             "scorer": self.scorer.state_dict(),
             "running": {d: (rn.mean, rn.sq, rn.count) for d, rn in self.running.items()},
             "log_alpha": None if self.log_alpha is None else self.log_alpha.detach().cpu(),
         }
+        if self.ema_abs:  # only reward_scale='ema_abs' has this state; absent key = historical sidecar
+            sd["ema_abs"] = {d: v.detach().cpu() for d, v in self.ema_abs.items()}
+        return sd
 
     def load_state_dict(self, sd: dict) -> None:
         self.scorer.load_state_dict(sd["scorer"])
@@ -113,6 +123,7 @@ class JointPolicy:
             rn.mean, rn.sq, rn.count = mean.to(self.device), sq.to(self.device), count
         if sd.get("log_alpha") is not None and self.log_alpha is not None:
             self.log_alpha = sd["log_alpha"].to(self.device)
+        self.ema_abs = {int(d): v.to(self.device) for d, v in sd.get("ema_abs", {}).items()}
 
     def _norm(self, depth: int) -> RunningNorm:
         rn = self.running.get(depth)
@@ -125,8 +136,51 @@ class JointPolicy:
     def defers_credit(self) -> bool:
         """True => the reward is TERMINAL, so ``run_rollout`` must buffer the per-step
         policy aux and call :meth:`trajectory_loss` once at rollout end instead of
-        :meth:`glimpse_loss` inside the loop (VPG). False => the historical inline path."""
+        :meth:`glimpse_loss` inside the loop (VPG, or PG with ``reward='terminal'``).
+        False => the historical inline path."""
+        return isinstance(self.objective, VPG) or self.reward.kind == "terminal"
+
+    @property
+    def needs_value(self) -> bool:
+        """Whether the deferred path needs ``V(s_t)`` per step (VPG's learned baseline)."""
         return isinstance(self.objective, VPG)
+
+    def inline_reward(self, prev_loss: Tensor, cur_loss: Tensor) -> Tensor:
+        """The raw per-glimpse reward [B] for the glimpse that moved the per-image task loss
+        from ``prev_loss`` to ``cur_loss`` (both detached). ``fractional`` is the historical
+        expression, unchanged."""
+        if self.reward.kind == "fractional":
+            return (prev_loss - cur_loss) / prev_loss.clamp_min(1e-4)
+        assert self.reward.kind == "difference", f"no inline reward for kind={self.reward.kind!r}"
+        return prev_loss - cur_loss
+
+    def _standardize(self, depth: int, reward: Tensor) -> Tensor:
+        out, self_ema = standardize_reward(
+            reward, spec=self.reward, running=self._norm(depth), ema_abs=self.ema_abs.get(depth))
+        if self_ema is not None:
+            self.ema_abs[depth] = self_ema
+        return out.detach()
+
+    def _alpha(self, obj: PG) -> Tensor | float:
+        return obj.entropy_bonus if self.log_alpha is None else self.log_alpha.exp()
+
+    def _entropy_step(self, obj: PG, entropy: Tensor) -> None:
+        assert self.log_alpha is not None and obj.entropy_target is not None
+        entropy_floor_step(
+            log_alpha=self.log_alpha, entropy=entropy.detach(),
+            target=obj.entropy_target, alpha_lr=obj.alpha_lr,
+            alpha_min=obj.entropy_bonus if obj.alpha_min is None else obj.alpha_min,
+            alpha_max=ALPHA_MAX if obj.alpha_max is None else obj.alpha_max,
+        )
+
+    def end_rollout(self) -> None:
+        """Called by ``run_rollout`` after each policy branch. Takes the ``per_rollout``
+        entropy dual step on the inline path; a no-op otherwise."""
+        if self._rollout_entropies:
+            obj = self.objective
+            assert isinstance(obj, PG)
+            self._entropy_step(obj, torch.stack(self._rollout_entropies).mean())
+            self._rollout_entropies = []
 
     def state_value(self, feats: Tensor) -> Tensor:
         """``V(s)`` [B] for the VPG baseline, read from the scorer's dueling value head.
@@ -141,21 +195,45 @@ class JointPolicy:
         )
         return self.scorer.vhead(feats.float().mean(dim=(2, 3))).squeeze(-1)
 
-    def trajectory_loss(self, *, scores: Tensor, flat_idx: Tensor, values: Tensor, reward: Tensor) -> Tensor:
-        """The weighted policy loss for a WHOLE trajectory (VPG only). ``scores``
-        [B, T, A] / ``values`` [B, T] carry grad; ``reward`` [B] is the detached terminal
-        reward. Unlike :meth:`glimpse_loss` this is NOT per-depth, so there is no
-        ``RunningNorm`` — VPG standardizes the ADVANTAGE per timestep over the batch
-        instead of the reward stream over time (see :class:`VPG`)."""
+    def trajectory_loss(self, *, scores: Tensor, flat_idx: Tensor, values: Tensor | None,
+                        reward: Tensor) -> Tensor:
+        """The weighted policy loss for a WHOLE trajectory (the deferred, terminal-reward
+        path). ``scores`` [B, T, A] carries grad; ``reward`` [B] is the detached terminal
+        reward, given to every one of the T actions.
+
+        VPG (``values`` [B, T], with grad): unchanged — not per-depth, no ``RunningNorm``;
+        VPG standardizes the ADVANTAGE per timestep over the batch (see :class:`VPG`).
+
+        PG (``values=None``): per action step t, the reward is centred/scaled under the
+        resolved ``RewardSpec`` (depth t+1, the depth the inline path would use) and fed to
+        :func:`pg_loss`; the result is the MEAN over the T steps, the same scale as the
+        inline path's mean over depths."""
         obj = self.objective
-        assert isinstance(obj, VPG)
-        loss, metrics = vpg_loss(
-            scores, flat_idx, values, reward,
-            entropy_bonus=obj.entropy_bonus, reinforce_weight=obj.reinforce_weight,
-            baseline_weight=obj.baseline_weight, normalize_advantage=obj.normalize_advantage,
-        )
-        self.last_step = metrics
-        return self.rl_weight * loss
+        if isinstance(obj, VPG):
+            assert values is not None
+            loss, metrics = vpg_loss(
+                scores, flat_idx, values, reward,
+                entropy_bonus=obj.entropy_bonus, reinforce_weight=obj.reinforce_weight,
+                baseline_weight=obj.baseline_weight, normalize_advantage=obj.normalize_advantage,
+            )
+            self.last_step = metrics
+            return self.rl_weight * loss
+        assert isinstance(obj, PG), f"trajectory_loss: unsupported objective {type(obj).__name__}"
+        n_steps = scores.shape[1]
+        losses, entropies = [], []
+        for t in range(n_steps):
+            target = self._standardize(t + 1, reward)
+            loss_t, ent_t, _ = pg_loss(scores[:, t], flat_idx[:, t], target, alpha=self._alpha(obj), crit_all=None)
+            losses.append(loss_t)
+            entropies.append(ent_t.detach())
+            if self.log_alpha is not None and obj.entropy_update == "per_glimpse":
+                self._entropy_step(obj, ent_t)
+        if self.log_alpha is not None and obj.entropy_update == "per_rollout":
+            self._entropy_step(obj, torch.stack(entropies).mean())
+        ent_mean = torch.stack(entropies).mean()
+        self.last_step = {"policy_entropy": ent_mean,
+                          "alpha": torch.as_tensor(self._alpha(obj)).detach().float()}
+        return self.rl_weight * torch.stack(losses).mean()
 
     def glimpse_loss(self, *, depth: int, scores: Tensor, flat_idx: Tensor, reward: Tensor) -> Tensor:
         """The weighted policy loss for ONE glimpse. ``scores`` [B, A] carries grad
@@ -163,16 +241,16 @@ class JointPolicy:
         ``reward`` [B] is the raw fractional distill-MSE reduction (detached)."""
         obj = self.objective
         if isinstance(obj, PG):
-            target = self._norm(depth).normalize(reward, subtract_only=obj.z_subtract_only).detach()
-            alpha = obj.entropy_bonus if self.log_alpha is None else self.log_alpha.exp()
-            loss, entropy, _ = pg_loss(scores, flat_idx, target, alpha=alpha, crit_all=None)
+            # Historical default (fractional, running_mean + running_std / z_subtract_only)
+            # resolves to exactly `self._norm(depth).normalize(reward, subtract_only=...)`.
+            target = self._standardize(depth, reward)
+            loss, entropy, _ = pg_loss(scores, flat_idx, target, alpha=self._alpha(obj), crit_all=None)
             if self.log_alpha is not None:
-                assert obj.entropy_target is not None
-                entropy_floor_step(
-                    log_alpha=self.log_alpha, entropy=entropy.detach(),
-                    target=obj.entropy_target, alpha_lr=obj.alpha_lr, alpha_min=obj.entropy_bonus,
-                )
+                if obj.entropy_update == "per_glimpse":
+                    self._entropy_step(obj, entropy)
+                else:  # per_rollout: one step on the rollout's mean entropy, in end_rollout()
+                    self._rollout_entropies.append(entropy.detach())
         else:
-            target = self._norm(depth).normalize(reward).detach()
+            target = self._standardize(depth, reward)
             loss, _ = qreg_loss(scores, flat_idx, target)
         return self.rl_weight * loss

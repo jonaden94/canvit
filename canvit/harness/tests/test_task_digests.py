@@ -83,6 +83,8 @@ _EXPECTED = {
     # had no numeric guard at all. Each verified to be sensitive to the thing it guards:
     # scaling the policy loss by 0.8 (the bug that once sat in the harness for weeks)
     # moves the policy digests, and fov 35 -> 34 moves the foveated ones.
+    # CORRECTION 2026-11-05: re-measured, the 0.8 scaling moves `policy_qreg_uniform` but
+    # NOT `policy_qreg_foveated`; `policy_qreg_foveated_scorer` below closes that gap.
     # The three foveated digests were re-recorded 2026-11-05 against fovi 27b1bde, which
     # ports upstream's minimum full-coverage KNN k and planar field geometry (k 46 -> 47
     # here). Under fovi c399d3b they were 15c1fd86283f05cf / 4e3314c856be78a1 /

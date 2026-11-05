@@ -351,8 +351,12 @@ def deploy_rollout_viewpoints(
     batch_size: int,
     device: torch.device,
     n: int,
+    cond: Any = None,
 ) -> list[Viewpoint]:
     """Run the closed-loop deploy rollout, returning the viewpoints it actually took.
+
+    ``cond`` (visual search): a zero-argument callable returning the target embedding for
+    a FiLM-conditioned scorer; None for every unconditioned policy.
 
     ``advance(viewpoint, state, t) -> RecurrentState`` is the task's own single-glimpse
     step (called with ``state=None`` at t0, so it owns its own state init); this function
@@ -377,6 +381,8 @@ def deploy_rollout_viewpoints(
     try:
         with torch.no_grad():
             ctx = sel.start_rollout(t0_type=t0_type, batch_size=batch_size, device=device)
+            if cond is not None:
+                ctx.cond = cond
             state, taken = None, []
             for t in range(n):
                 vp_type = t0_type if t == 0 else ViewpointType.RANDOM
