@@ -36,10 +36,17 @@ not group-writable), the two service logins, and the venv
 (`UV_PROJECT_ENVIRONMENT=.venv-cu126 uv sync --no-group cuda --group cu126`). `README.md`
 § *First-time setup for a new member of project `nib00021`* covers the first two. The
 launcher pins `TRAIN_COMMIT` / `PYTORCH_COMMIT` /
-`FOVI_COMMIT` and so needs `canvit/`, `fovi/` and `CanViT-PyTorch/` cloned as siblings;
-current code runs this recipe too (verified 2026-09-09 — a short foreground run from these
-two checkpoints reproduced `miou_t0` = 0.3768 exactly), so dropping the pins is fine if you
-would rather not clone the third.
+`FOVI_COMMIT` and so needs `canvit/`, `fovi/` and `CanViT-PyTorch/` cloned as siblings.
+On 2026-09-09 current code ran this recipe too (a short foreground run from these two
+checkpoints reproduced `miou_t0` = 0.3768 exactly), so the pins could be dropped then.
+
+**Keep the fovi pin (`FOVI_COMMIT=c399d3b`) with the two checkpoints below.** From fovi
+`27b1bde` (2026-11-05) on, fovi builds its foveated patches differently. It now uses the
+original fovi repository's (nblauch/fovi) rule for how many samples each patch gets, and a
+corrected geometry for flat images. Both checkpoints were trained on the old patches. The
+backbone still loads on newer fovi (checked: the weight shapes are unchanged), but each patch
+now sees slightly different input. Expect slightly different results, probably somewhat worse
+(not measured). Models trained on fovi `27b1bde` or later don't have this problem.
 
 ## The two checkpoints it uses
 
