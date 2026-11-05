@@ -18,6 +18,7 @@ tree is the long form those rules were derived from.
 |---|---|
 | [`unification/`](unification/) | the five-repo merge: design docs, per-phase notes, the gate/parity instruments, and the equivalence audits. **Finished** — `21-core-merge.md` closed it, `22-april-equivalence-audit.md` verified pretraining was unchanged by it. Read newer docs over older ones; they are chronological and later ones correct earlier ones in place (see `21` §10.2). |
 | [`dataloading/`](dataloading/) | the original data-loading and DDP design notes (April 2026), from before the unification. `canvit/harness/infra/dist.py` and `unification/ddp_transport_probe.py` both cite them. |
+| [`search/`](search/) | the visual-search task (COCO-Search18), started 2026-11-05: design notes, and under `external_info_provided_by_jonathan/` the material the owner handed over. **In progress.** |
 | [`papers/`](papers/) | material handed to Claude to read. Notes (`*.md`) are tracked; the sources are not — see its `.gitignore`. |
 
 ## Conventions
