@@ -91,6 +91,14 @@ _EXPECTED = {
     "ade20k_probe_foveated": "c495ad71872f2f7d",
     "policy_qreg_uniform": "1b2ae61d6c9075ae",
     "policy_qreg_foveated": "93e815bf99e65370",
+    # Recorded 2026-11-05 on aa78fad (fovi 27b1bde), before the search-v1 engine changes.
+    # These three also hash the scorer's weights (`also_hash`); each was checked to move
+    # under a small change of what it guards (PG entropy_bonus 0.01 -> 0.02 and rl_weight
+    # 0.8, VPG baseline weight 0.5, QReg rl_weight 0.8). PG is the inline per-glimpse
+    # credit path, VPG the deferred terminal-reward path; neither had a digest before.
+    "policy_qreg_foveated_scorer": "964fda302528c40e",
+    "policy_pg_foveated": "51fa46fe6bbc664c",
+    "policy_vpg_foveated": "625ccbd492174ac8",
 }
 
 
@@ -119,12 +127,19 @@ def _param_fingerprint(model: torch.nn.Module) -> str:
 
 def _run_digest(*, model, make_task, bptt: BpttSpec, trainable, seed: int,
                 selector: RandomSelector | None = None, joint=None,
-                task_weight: float = 1.0) -> str:
+                task_weight: float = 1.0, also_hash: torch.nn.Module | None = None) -> str:
     """N seeded steps of ``run_rollout`` + ``opt.step()``; hash the loss stream and the
     resulting weights together.
 
     ``selector=None`` and ``joint=None`` reproduce the original uniform, policy-free path
-    exactly, so the four digests recorded on 8554c1f are unaffected by these parameters."""
+    exactly, so the four digests recorded on 8554c1f are unaffected by these parameters.
+
+    ``also_hash`` adds a module that is not part of ``model`` to the weight fingerprint.
+    The policy digests need it for the scorer: ``model`` is the task wrapper, so without it
+    the scorer's weights enter only through the viewpoints they choose, and a few small
+    optimizer steps rarely change a sampled fixation. Measured 2026-11-05: without it, the
+    PG digest did not move when ``entropy_bonus`` went 0.01 -> 0.02. ``None`` leaves the
+    existing digests' hash input unchanged."""
     torch.use_deterministic_algorithms(True)
     opt = torch.optim.AdamW(trainable, lr=1e-4)
     selector = selector if selector is not None else _selector()
@@ -145,8 +160,9 @@ def _run_digest(*, model, make_task, bptt: BpttSpec, trainable, seed: int,
         assert torch.isfinite(result.total_loss), "digest is meaningless on a NaN stream"
         losses.append(result.total_loss.item().hex())
 
+    extra = "" if also_hash is None else _param_fingerprint(also_hash)
     return hashlib.sha256(
-        ("".join(losses) + _param_fingerprint(model)).encode()
+        ("".join(losses) + _param_fingerprint(model) + extra).encode()
     ).hexdigest()[:16]
 
 
@@ -261,14 +277,16 @@ def _distill_model() -> CanViTForPretraining:
     ).to(_DEVICE)
 
 
-def _joint(*, canvit, groups, encode_model, foveated: bool):
-    """A QReg scorer, the objective every policy campaign here has used."""
+def _joint(*, canvit, groups, encode_model, foveated: bool, rl: JointPolicyConfig | None = None):
+    """A QReg scorer by default, the objective every policy campaign here has used.
+    ``rl`` swaps in another objective (the PG / VPG digests)."""
     gen = torch.Generator(device=_DEVICE)
     gen.manual_seed(0)
     scale = (FoveatedScaleConfig(mode="fixed", fixed_scale=_FIXED_SCALE) if foveated
              else FoveatedScaleConfig())
     return build_policy(
-        canvit=canvit, rl=JointPolicyConfig(objective="qreg"), feature_groups=groups,
+        canvit=canvit, rl=rl if rl is not None else JointPolicyConfig(objective="qreg"),
+        feature_groups=groups,
         device=_DEVICE, canvas_grid=_G, min_viewpoint_scale=0.1, foveated_scale=scale,
         generator=gen, encode_model=encode_model,
     )
@@ -345,6 +363,49 @@ def policy_qreg_foveated_digest() -> str:
     )
 
 
+def _policy_foveated_digest(rl: JointPolicyConfig, seed: int) -> str:
+    """``policy_qreg_foveated``'s setup with another objective: frozen foveated backbone
+    and head, scorer trained, ``task_weight=0.0``."""
+    seg = _fov_seg()
+    seg.canvit.requires_grad_(False)
+    seg.canvit.eval()
+    seg.head.requires_grad_(False)
+    joint = _joint(canvit=seg.canvit, groups=ADE20K_GROUPS, encode_model=seg, foveated=True, rl=rl)
+    return _run_digest(
+        model=seg,
+        make_task=lambda: BoundAde20kTask(seg=seg, masks=_seg_masks(), canvas_grid=_G),
+        bptt=BpttSpec(mode="none", horizon=_HORIZON),
+        trainable=list(joint.scorer.parameters()),
+        seed=seed,
+        joint=joint,
+        selector=_selector(foveated=True),
+        task_weight=0.0,
+        also_hash=joint.scorer,
+    )
+
+
+def policy_qreg_foveated_scorer_digest() -> str:
+    """``policy_qreg_foveated`` with the scorer's weights hashed too. That digest does NOT
+    move when the policy loss is scaled by 0.8 (measured 2026-11-05: over its 6 steps the
+    argmax fixations, and so the task losses, never change), so on its own it does not
+    guard the foveated QReg policy loss. Kept alongside rather than re-recorded, so the
+    original pin stays as it was."""
+    return _policy_foveated_digest(JointPolicyConfig(objective="qreg"), seed=304)
+
+
+def policy_pg_foveated_digest() -> str:
+    """PG: on-policy sampling, the INLINE per-glimpse fractional reward, RunningNorm, and
+    the entropy dual step. ``select_bn_eval=False``, the on-policy setting (with it on, PG
+    samples from an eval-mode forward but differentiates the train-mode one)."""
+    return _policy_foveated_digest(JointPolicyConfig(objective="pg", select_bn_eval=False), seed=305)
+
+
+def policy_vpg_foveated_digest() -> str:
+    """VPG: the DEFERRED terminal reward, the learned value head, per-step advantage
+    normalisation. ``select_bn_eval=False`` is required for VPG (build_policy refuses True)."""
+    return _policy_foveated_digest(JointPolicyConfig(objective="vpg", select_bn_eval=False), seed=306)
+
+
 DIGESTS = {
     "ade20k_probe": ade20k_probe_digest,
     "ade20k_finetune": ade20k_finetune_digest,
@@ -354,6 +415,9 @@ DIGESTS = {
     "ade20k_probe_foveated": ade20k_probe_foveated_digest,
     "policy_qreg_uniform": policy_qreg_uniform_digest,
     "policy_qreg_foveated": policy_qreg_foveated_digest,
+    "policy_qreg_foveated_scorer": policy_qreg_foveated_scorer_digest,
+    "policy_pg_foveated": policy_pg_foveated_digest,
+    "policy_vpg_foveated": policy_vpg_foveated_digest,
 }
 
 
@@ -392,6 +456,18 @@ def test_policy_qreg_uniform_digest():
 
 def test_policy_qreg_foveated_digest():
     assert policy_qreg_foveated_digest() == _EXPECTED["policy_qreg_foveated"]
+
+
+def test_policy_qreg_foveated_scorer_digest():
+    assert policy_qreg_foveated_scorer_digest() == _EXPECTED["policy_qreg_foveated_scorer"]
+
+
+def test_policy_pg_foveated_digest():
+    assert policy_pg_foveated_digest() == _EXPECTED["policy_pg_foveated"]
+
+
+def test_policy_vpg_foveated_digest():
+    assert policy_vpg_foveated_digest() == _EXPECTED["policy_vpg_foveated"]
 
 
 if __name__ == "__main__":  # record / re-check the digests
