@@ -92,9 +92,11 @@ ade20k wrapper), `head` (§3.3) and the embeddings (§3.2). The scorer belongs t
   and the policy loss both train it. With `detach_policy_embedding: true` the policy reads a
   detached copy, so only the task loss trains it.
 
-The policy embedding lives in the search wrapper, not in the scorer, so that `shared` is a
-single module. `trainable_param_groups` puts it in the `policy` optimizer group under
-`separate`, and in the `head` group under `shared`.
+*As implemented:* the task embedding is `SearchHead.embed`. Under `separate` the policy's
+embedding is attached to the scorer module as `scorer.target_embed`, so the harness treats it
+as policy parameters everywhere (requires_grad, gradient clipping, DDP sync, the policy
+checkpoint) with no extra plumbing. Under `shared` the policy reads `head.embed` (detached if
+`detach_policy_embedding`), and the head's optimizer group steps it.
 
 ### 3.3 Task head
 
@@ -114,7 +116,9 @@ becomes canvit's native **32×32, one logit per canvas token**.
 **FiLM**, as in Haoze (`FiLMGenMLP`, `apply_generic_film`): per stage, an MLP
 (Linear → ReLU → Linear, hidden width max(128, 2·cond_dim)) maps the embedding to γ and β, and
 the stage output becomes `(1 + γ)·GroupNorm(x) + β`, with GroupNorm over min(8, channels)
-groups. The MLP's last layer is zero-initialised, so conditioning starts as the identity.
+groups. The MLP's last layer is zero-initialised, so at init each FiLM stage outputs
+`GroupNorm(x)` whatever the target: the conditioning starts out independent of the target
+(it is not the identity, because the GroupNorm is always applied).
 
 **Shared code, not shared weights.** The U-Net forward is factored into a helper in
 `core/policy/net.py`, used by both `ViewpointScorer` and `SearchHead`. The scorer keeps its
@@ -242,10 +246,11 @@ update as FoAViS Appendix J, written in log space. New knobs, all `None` = today
 
 The bound search task exposes `policy_cond() -> [B, cond_dim]`, the policy embedding of this
 batch's targets. It is recomputed on each call, so no graph is reused across a chunk boundary.
-The engine passes `cond_fn=getattr(task, "policy_cond", None)` into `Selector.start_rollout`,
-`RolloutCtx` carries it, and `PolicySelector.select` calls `self.net(feats, cond=ctx.cond_fn())`
-when present. With `None` the calls are the current ones, so no RNG and no arithmetic changes.
-The deploy and eval rollouts in `eval_viewpoints.py` get the same argument.
+*As implemented:* `RolloutCtx` has a field `cond` (default None). The engine sets
+`ctx.cond = task.policy_cond` after `start_rollout` when the task has the hook, and
+`PolicySelector.select` calls `self.net(feats, cond=ctx.cond())` when it is set. No selector's
+`start_rollout` signature changed. `deploy_rollout_viewpoints` takes `cond=` and sets it the
+same way. With no hook the scorer calls are the historical ones.
 
 ### 5.5 BatchNorm and sampling
 
@@ -301,9 +306,9 @@ side 0.1·scene (64 px at 640) around the heatmap argmax intersects a target box
 
 ## 9. Files
 
-New: `canvit/search/{__init__,config,data,head,model,task,metrics}.py` and
+New: `canvit/search/{__init__,config,data,head,model,task,loss}.py` and
 `canvit/search/tests/`; a `SearchCmd` in `harness/cli.py`; a `SearchEval` in
-`harness/evaluate.py`.
+`harness/evaluate.py` (not yet written, see §10b).
 
 Changed (shared code, all behind `None`/`default` values that reproduce today):
 `core/policy/net.py` (FiLM option, `input_norm` option, shared U-Net helper), `harness/config.py`
@@ -332,6 +337,25 @@ knobs, refusals), `harness/rollout/{engine,selector,eval_viewpoints}.py` (reward
 4. **End to end.** A 2-step CPU run on a synthetic search dataset built by the real adapter
    path. Then a short 1-GPU smoke run on COCO-Search18, checking that train loss falls and
    that `hit_t` is logged for all three eval policies.
+
+## 10b. Implementation status (2026-11-05, branch `search-v1`)
+
+Implemented and tested on CPU: everything in §2–§8 except the standalone eval command
+(`SearchEval` in `harness/evaluate.py`, not written; training-time validation works). Files:
+`canvit/search/{config,data,loss,head,model,task}.py`, `SearchCmd` in `harness/cli.py`.
+
+- **Checks.** Full suite green. All digests unchanged at defaults, including three new
+  policy digests recorded on the unmodified tree (`f35585a`): PG, VPG, and QReg with the
+  scorer hashed. The old foveated QReg digest did not move when the policy loss was scaled
+  by 0.8. New tests: `harness/tests/test_reward_options.py` and `search/tests/`.
+- **End to end.** Joint training runs through `harness.run` with both embedding modes, and
+  evaluation runs under random, greedy and policy fixations. Both use a tiny foveated ViT-S on
+  a synthetic dataset in the real file format.
+- **Real data.** 2163 / 326 pairs and no missing image files. Loading takes about 21 ms per
+  sample with the default augmentation, 52 ms with all of them.
+- **Bug found while testing.** The Gaussian target underflowed to all zeros at small σ, which
+  gave a silent zero loss. It is now normalised in log space (a softmax over the grid).
+- **Not yet run:** anything on a GPU or with a real pretrained backbone.
 
 ## 11. Findings and open points
 

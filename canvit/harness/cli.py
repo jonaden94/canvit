@@ -38,6 +38,7 @@ from canvit.harness.config import JointPolicyConfig
 from canvit.harness.run import RunSettings, run
 from canvit.harness.spec import BpttSpec, GroupOptim, ScheduleSpec, TrainSpec, fixed_horizon_bptt
 from canvit.in1k.config import In1kConfig
+from canvit.search.config import SearchConfig, search_policy_config
 
 log = logging.getLogger(__name__)
 
@@ -433,10 +434,42 @@ def _apply_overrides(task: Any, spec: TrainSpec, over: dict, *, lr: float, wd: f
     return replace(spec, optim=optim)
 
 
+@dataclass
+class SearchCmd:
+    """Class-cued visual search (COCO-Search18) on a frozen foveated CanViT: a
+    target-conditioned task head and policy, trained jointly by default."""
+
+    cfg: SearchConfig = field(default_factory=SearchConfig)
+    preset: PresetName = "default"
+    spec: SpecOverrides = field(default_factory=SpecOverrides)
+    rl: JointPolicyConfig = field(default_factory=search_policy_config)
+    """The search policy defaults (`search_policy_config`), NOT the generic JointPolicyConfig ones."""
+    opts: HarnessOpts = field(default_factory=HarnessOpts)
+
+    def build(self) -> tuple[Any, RunSettings]:
+        from canvit.search.task import SearchRunTask
+
+        settings = RunSettings(
+            n_steps=self.opts.n_steps if self.opts.n_steps is not None else self.cfg.max_steps,
+            eval_every=self.opts.eval_every if self.opts.eval_every is not None else self.cfg.val_every,
+            log_every=self.cfg.log_every, grad_clip=self.cfg.grad_clip, amp=self.cfg.amp,
+            seed=self.opts.seed if self.opts.seed is not None else self.cfg.seed,
+            device=self.cfg.device,
+            resume=self.opts.resume if self.opts.resume is not None else False,
+            **_identity(self.cfg, self.opts, prefix="search"),
+            **{**_common(self.opts), "viz_every": self.opts.viz_every or self.cfg.viz_every},
+        )
+        return SearchRunTask(self.cfg, rl=self.rl), settings
+
+    def lr_wd(self) -> tuple[float, float]:
+        return self.cfg.peak_lr, self.cfg.weight_decay
+
+
 Command = (
     Annotated[DistillCmd, tyro.conf.subcommand(name="distill")]
     | Annotated[Ade20kCmd, tyro.conf.subcommand(name="ade20k")]
     | Annotated[In1kCmd, tyro.conf.subcommand(name="in1k")]
+    | Annotated[SearchCmd, tyro.conf.subcommand(name="search")]
 )
 
 
@@ -457,4 +490,4 @@ def main(argv: list[str] | None = None) -> dict:
     return run(task=task, spec=spec, settings=settings)
 
 
-__all__ = ["Ade20kCmd", "DistillCmd", "HarnessOpts", "In1kCmd", "main", "resolve_spec"]
+__all__ = ["Ade20kCmd", "DistillCmd", "HarnessOpts", "In1kCmd", "SearchCmd", "main", "resolve_spec"]
