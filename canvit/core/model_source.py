@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from canvit.core.checkpoint_schema import extract_pretrain_view_scale, normalize_schema
+from canvit.core.checkpoints import hub_revision
 
 log = logging.getLogger(__name__)
 
@@ -77,7 +78,8 @@ def load_segmentation_probe(source: str | Path, *, dropout: float = 0.1):
 
     if is_checkpoint(source):
         return SegmentationProbe.from_checkpoint(source, dropout=dropout)
-    return SegmentationProbe.from_pretrained(str(source))
+    # SegmentationProbe has no SafeHubMixin, so it does not pin the revision itself.
+    return SegmentationProbe.from_pretrained(str(source), revision=hub_revision(str(source)))
 
 
 def load_segmentation(source: str | Path, *, map_location: str = "cpu"):
@@ -120,7 +122,7 @@ def read_backbone_name(source: str | Path) -> str | None:
     if not cfg.is_file():
         from huggingface_hub import hf_hub_download
 
-        cfg = Path(hf_hub_download(str(source), "config.json"))
+        cfg = Path(hf_hub_download(str(source), "config.json", revision=hub_revision(str(source))))
     return json.loads(cfg.read_text()).get("backbone_name")
 
 
@@ -149,7 +151,7 @@ def read_pretrain_metadata(source: str | Path) -> dict[str, Any]:
         if not cfg.is_file():
             from huggingface_hub import hf_hub_download
 
-            cfg = Path(hf_hub_download(str(source), "config.json"))
+            cfg = Path(hf_hub_download(str(source), "config.json", revision=hub_revision(str(source))))
         return json.loads(cfg.read_text()).get("metadata") or {}
     except FileNotFoundError:
         raise

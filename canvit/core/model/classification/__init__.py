@@ -10,6 +10,7 @@ from safetensors.torch import load_file
 from torch import Tensor, nn
 
 from canvit.core.backbone import BackboneName, create_backbone
+from canvit.core.checkpoints import hub_revision
 from canvit.core.model.hub_mixin import SafeHubMixin
 from canvit.core.model.base.config import (
     rebuild_canvit_config,
@@ -171,7 +172,8 @@ class CanViTForImageClassification(
 
         log.info("Loading probe from %s", probe_repo)
         probe_path = Path(probe_repo)
-        probe_st = probe_path / "model.safetensors" if probe_path.is_dir() else hf_hub_download(probe_repo, "model.safetensors")
+        probe_st = (probe_path / "model.safetensors" if probe_path.is_dir()
+                    else hf_hub_download(probe_repo, "model.safetensors", revision=hub_revision(probe_repo)))
         probe_sd = load_file(probe_st)
 
         # Validate probe/projection compatibility — the probe consumes the

@@ -16,7 +16,19 @@ class SafeHubMixin:
 
     Must appear BEFORE PyTorchModelHubMixin in the MRO so that this
     _load_as_safetensor is found first.
+
+    Also pins ``canvit/*`` Hub repos to the revision in the format this code reads
+    (see :func:`canvit.core.checkpoints.hub_revision`) unless the caller passes one.
     """
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, *, revision: str | None = None, **kwargs):
+        from canvit.core.checkpoints import hub_revision
+
+        if revision is None:
+            revision = hub_revision(str(pretrained_model_name_or_path))
+        return super().from_pretrained(  # type: ignore[misc]  # resolves to PyTorchModelHubMixin via the MRO
+            pretrained_model_name_or_path, revision=revision, **kwargs)
 
     @classmethod
     def _load_as_safetensor(cls, model: nn.Module, model_file: str, map_location: str, strict: bool) -> nn.Module:
