@@ -20,7 +20,7 @@ export TORCH_COMPILE_CACHE_DIR="$HOME/.cache/torch_compile"
 # Datasets (SHARED — readable project-wide)
 # export WEBDATASET_DIR="/mnt/vast-nhr/projects/nib00021/jonathan/datasets/webdataset-imagenet-1k"  # vast NFS copy; superseded by lustre below to avoid NFS contention
 # export WEBDATASET_DIR="/mnt/lustre-rzg/workspaces/ws/nib00021/u25995-canvit-data/webdataset-imagenet-1k"  # in1k with precomputed features; superseded by in21k below (2026-07-10)
-export WEBDATASET_DIR="/mnt/lustre-rzg/workspaces/ws/nib00021/u25995-inet21k-feat/webdataset-imagenet-21k-with-features"  # in21k, 13.15M imgs, precomputed dinov3_vitb16 features; training only; must contain train-shuffled/
+export WEBDATASET_DIR="/mnt/lustre-rzg/workspaces/ws/nib00021/u25995-inet21k-feat2/webdataset-imagenet-21k-with-features"  # in21k, 13.15M imgs, precomputed dinov3_vitb16 features; training only; must contain train-shuffled/
 # Validation always reads this raw ImageNet-1k val ImageFolder (synset-named class subfolders), independent of WEBDATASET_DIR.
 export VAL_DIR="/mnt/vast-nhr/projects/nib00021/jonathan/datasets/imagenet1k-val"
 # ADE20K. The `:-` form lets a run script's own `export ADE20K_ROOT=...` win, since

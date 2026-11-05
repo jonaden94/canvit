@@ -43,7 +43,8 @@ canvit/
 ├── core/        THE MODEL — canvas ViT, patchers, HF-hub classes, probes, teacher,
 │                standardizers, viewpoint, rope. Imports nothing from the layers below.
 ├── harness/     entry point + shared primitives
-│                run evaluate cli loop spec config flat; rollout/ policy/ optim/ infra/ viz/
+│                six flat files: run evaluate cli loop spec config;
+│                subpackages: rollout/ policy/ optim/ infra/ viz/
 ├── distill/     DINOv3 latent distillation: loss, model, probe, data/, viz/
 ├── ade20k/      ADE20K segmentation: data, metrics, rollout, viz
 ├── in1k/        ImageNet-1k: data, metrics, model, eval, rollout
