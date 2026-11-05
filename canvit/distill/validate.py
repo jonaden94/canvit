@@ -258,7 +258,11 @@ def validate(
                 images, size=(probe_res, probe_res), mode="bilinear", align_corners=False
             )
             teacher_cls = teacher.forward_norm_features(images_at_probe_res).cls
-            teacher_acc = compute_in1k_top1(probe(teacher_cls), labels)
+            # Probe outside autocast: bf16 puts the 1000-class head at the noise floor
+            # (~0.4% top-1 flips; upstream d525656). Same as in1k/ade20k heads.
+            with torch.autocast(device_type=teacher_cls.device.type, enabled=False):
+                teacher_logits = probe(teacher_cls.float())
+            teacher_acc = compute_in1k_top1(teacher_logits, labels)
 
         def init_fn(state: RecurrentState) -> ValAccumulator:
             acc = ValAccumulator()
@@ -294,7 +298,8 @@ def validate(
 
                 if has_probe:
                     assert probe is not None and labels is not None
-                    logits = probe(cls_pred_raw)
+                    with torch.autocast(device_type=cls_pred_raw.device.type, enabled=False):
+                        logits = probe(cls_pred_raw.float())
                     acc.in1k_accs.append(compute_in1k_top1(logits, labels))
 
                     if want_viz:

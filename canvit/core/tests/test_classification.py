@@ -191,3 +191,19 @@ def test_glimpse_grid_size_reaches_the_inner_canvit():
     assert clf.canvit.glimpse_grid_size == grid, (
         "wrapper did not propagate the grid to the inner CanViT; eval would fall back to 8"
     )
+
+
+def test_forward_keeps_head_in_fp32_under_autocast():
+    """forward() must return fp32 logits under an outer bf16 autocast (upstream 78bd323).
+
+    A bare ``.float()`` before the head is undone by the Linear/LayerNorm autocast
+    policies, so the head ran at the bf16 noise floor (~0.4% top-1 flip rate). Silent,
+    so this assertion is the only signal. Built locally: the hub fixtures above fail.
+    """
+    clf = CanViTForImageClassification(backbone_name="vits16", model_config={}, n_classes=10).eval()
+    vp = Viewpoint.full_scene(batch_size=B, device=torch.device("cpu"))
+    glimpse = torch.randn(B, 3, 128, 128)
+    state = clf.init_state(batch_size=B, canvas_grid_size=4)
+    with torch.inference_mode(), torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        logits, _ = clf(glimpse=glimpse, state=state, viewpoint=vp)
+    assert logits.dtype == torch.float32, f"expected fp32, got {logits.dtype}"
