@@ -27,3 +27,23 @@ def test_unchanged_and_non_hub_sources_stay_on_main(tmp_path):
     local.mkdir(parents=True)
     assert hub_revision(str(local)) is None          # absolute local dir
     assert hub_revision("canvit") is None            # no repo name
+
+
+def test_hub_load_with_mismatched_weights_raises(tmp_path):
+    """A Hub file whose weight names do not match the model must fail, not leave the missing
+    weights at random init behind a warning (upstream's strict loading, 0.2)."""
+    import pytest
+    import torch
+    from safetensors.torch import save_file
+
+    from canvit.core import CanViTForImageClassification
+
+    model = CanViTForImageClassification(backbone_name="vits16", model_config={}, n_classes=10)
+    model.save_pretrained(tmp_path)
+    sd = {k: v.detach().clone().contiguous() for k, v in model.state_dict().items()}
+    del sd[sorted(sd)[0]]
+    sd["renamed.weight"] = torch.zeros(1)
+    save_file(sd, str(tmp_path / "model.safetensors"))
+    with pytest.raises(RuntimeError, match="do not match"):
+        CanViTForImageClassification.from_pretrained(str(tmp_path))  # strict by default
+    CanViTForImageClassification.from_pretrained(str(tmp_path), strict=False)  # explicit opt-out: warns only

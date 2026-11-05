@@ -22,13 +22,16 @@ class SafeHubMixin:
     """
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, *, revision: str | None = None, **kwargs):
+    def from_pretrained(cls, pretrained_model_name_or_path, *, revision: str | None = None,
+                        strict: bool = True, **kwargs):
+        """``strict`` defaults to True here (HF's default is False): mismatched weights
+        raise. Pass ``strict=False`` to load a known-incomplete file with a warning."""
         from canvit.core.checkpoints import hub_revision
 
         if revision is None:
             revision = hub_revision(str(pretrained_model_name_or_path))
         return super().from_pretrained(  # type: ignore[misc]  # resolves to PyTorchModelHubMixin via the MRO
-            pretrained_model_name_or_path, revision=revision, **kwargs)
+            pretrained_model_name_or_path, revision=revision, strict=strict, **kwargs)
 
     @classmethod
     def _load_as_safetensor(cls, model: nn.Module, model_file: str, map_location: str, strict: bool) -> nn.Module:
@@ -36,33 +39,15 @@ class SafeHubMixin:
         missing, unexpected = safetensors.torch.load_model(model, model_file, strict=False, device=map_location)
         if missing or unexpected:
             msg = (
-                "\n"
-                "╔══════════════════════════════════════════════════════════════╗\n"
-                "║  WARNING: Checkpoint key mismatch during model loading!     ║\n"
-                "╚══════════════════════════════════════════════════════════════╝\n"
+                f"Weights in {model_file} do not match {type(model).__name__}: "
+                f"{len(missing)} missing, e.g. {sorted(missing)[:5]}; "
+                f"{len(unexpected)} unexpected, e.g. {sorted(unexpected)[:5]}. "
+                "For a canvit/* Hub repo this usually means the wrong revision: see "
+                "canvit.core.checkpoints.hub_revision."
             )
-            if missing:
-                msg += (
-                    f"\n  {len(missing)} model keys not found in checkpoint:\n"
-                    f"    {sorted(missing)[:5]}\n"
-                    "  → These parameters are left at random initialization.\n"
-                    "    The model will produce garbage outputs.\n"
-                )
-            if unexpected:
-                msg += (
-                    f"\n  {len(unexpected)} checkpoint keys not found in model:\n"
-                    f"    {sorted(unexpected)[:5]}\n"
-                    "  → These weights were silently dropped.\n"
-                )
-            msg += (
-                "\n  This usually means your canvit version doesn't match\n"
-                "  the checkpoint. Update with:\n"
-                "\n"
-                '    uv lock --upgrade-package canvit && uv sync\n'
-                "\n"
-                "  or:\n"
-                "\n"
-                '    uv add "canvit @ git+https://github.com/m2b3/CanViT-PyTorch.git"\n'
-            )
-            log.warning(msg)
+            # An error by default: missing weights stay at random init and the model still
+            # runs, so a warning lets a wrong checkpoint produce garbage silently.
+            if strict:
+                raise RuntimeError(msg)
+            log.warning("%s Missing weights are left at random init.", msg)
         return model
