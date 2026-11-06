@@ -128,7 +128,10 @@ def test_eval_writes_every_metric_to_jsonl_and_an_overview_to_the_tracker(fake_c
                 assert full[f"hit_t{t}_{p}"] >= full[f"hit_t{t - 1}_{p}"]
         assert full[f"hit_t0_{p}"] == full["hit_t0_random"]  # t0 is the same centre for all
     ov = {k.removeprefix("overview/"): v for k, v in tr.logged.items()}
-    assert all(k.startswith("overview/") for k in tr.logged) and len(ov) == 20
+    assert all(k.startswith("overview/") for k in tr.logged) and len(ov) == 20 + 2 * 3  # + t0, t1 of 3 series
+    for t in range(2):
+        for k in (f"found_t{t}_policy", f"found_t{t}_random", f"hit_t{t}_policy"):
+            assert ov[k] == full[k], k
     assert ov["found_gain_t2_policy_vs_random"] == pytest.approx(full["found_t2_policy"] - full["found_t2_random"])
     for k in ("found_t2_greedy", "hit_10_percent_t2_policy", "correct_found_t2_random",
               "presence_acc_t2_policy", "loss_t2_policy"):

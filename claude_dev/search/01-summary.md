@@ -91,10 +91,11 @@ policy) → 1×1 conv to one logit per cell. Presence: mean-pool the last featur
   - `{run_dir}/eval.jsonl`: every metric at every glimpse, one line per validation.
   - W&B `eval/`: `loss`, `found`, `hit`, `correct_found`, `presence_acc` at every glimpse;
     the rest at the last glimpse only.
-  - W&B `overview/` (20 panels, last glimpse, same names as in `eval/`): `found` and
-    `hit` and their X % versions for all three rules, `correct_found` (+ X %) for random
+  - W&B `overview/` (29 panels, same names as in `eval/`). At the last glimpse: `found`
+    and `hit` and their X % versions for all three rules, `correct_found` (+ X %) for random
     and policy, `presence_acc` and `loss` for the policy, and `found_gain_…_policy_vs_random`
-    (+ X %).
+    (+ X %). The development over the earlier glimpses: `found` (policy, random) and `hit`
+    (policy).
 - **Best checkpoint:** `found` at the last glimpse under the policy (`found_t3_policy`).
 
 ## Figures (every 500 steps, `viz.py`)

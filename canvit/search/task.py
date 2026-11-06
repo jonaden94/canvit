@@ -582,28 +582,45 @@ class SearchRunTask:
         if run_dir is not None:
             import json
             from pathlib import Path
+            Path(run_dir).mkdir(parents=True, exist_ok=True)  # an empty tmp dir can vanish (tests)
             with open(Path(run_dir) / "eval.jsonl", "a") as f:
                 f.write(json.dumps({"step": step, **full}) + "\n")
         if tracker is not None:
             tracker.log_metrics({f"overview/{k}": v for k, v in self._overview(full, T, pct).items()}, step=step)
         per_glimpse = {"loss", "found", "hit", "correct_found", "presence_acc"}
+        # ordered by metric, then fixation rule, then glimpse (W&B shows panels in log order)
         return {f"{k}_t{t}_{p}": full[f"{k}_t{t}_{p}"]
-                for p in policies for k in names for t in range(T) if k in per_glimpse or t == T - 1}
+                for k in names for p in policies for t in range(T) if k in per_glimpse or t == T - 1}
 
     @staticmethod
     def _overview(full: dict[str, float], T: int, pct: str) -> dict[str, float]:
-        """The short W&B section: last-glimpse values under the same names as in ``eval/``,
-        plus the policy-minus-random gain of ``found`` / ``found_X_percent``. Keys whose
-        policy or metric this run lacks are left out."""
+        """The short W&B section, under the same names as in ``eval/``: last-glimpse values,
+        the policy-minus-random gain of ``found`` / ``found_X_percent``, and the development
+        over glimpses of three curated series (``found`` under the policy and under random
+        fixations, ``hit`` under the policy). Keys whose policy or metric this run lacks are
+        left out."""
         L = T - 1
-        rules = ("random", "greedy", "policy")
-        wanted = ([f"{c}_t{L}_{p}" for c in ("found", f"found_{pct}", "hit", f"hit_{pct}") for p in rules]
-                  + [f"{c}_t{L}_{p}" for c in ("correct_found", f"correct_found_{pct}") for p in ("random", "policy")]
-                  + [f"presence_acc_t{L}_policy", f"loss_t{L}_policy"])
-        ov = {k: full[k] for k in wanted if k in full}
-        for c in ("found", f"found_{pct}"):
-            if f"{c}_t{L}_policy" in full and f"{c}_t{L}_random" in full:
-                ov[f"{c}_gain_t{L}_policy_vs_random"] = full[f"{c}_t{L}_policy"] - full[f"{c}_t{L}_random"]
+        last = [f"t{L}_{p}" for p in ("policy", "random", "greedy")]
+        every = [f"t{t}_policy" for t in range(T)] + [f"t{t}_random" for t in range(T)]
+        # in display order: metric by metric, each in glimpse order (W&B shows panels in log order)
+        wanted: list[str] = []
+        for c in ("found", "hit"):
+            wanted += [f"{c}_{s}" for s in every if c == "found" or s.endswith("policy")]
+            wanted += [f"{c}_{s}" for s in last]
+            wanted.append(f"{c}_gain")
+        for c in (f"found_{pct}", f"hit_{pct}"):
+            wanted += [f"{c}_{s}" for s in last] + [f"{c}_gain"]
+        for c in ("correct_found", f"correct_found_{pct}"):
+            wanted += [f"{c}_t{L}_policy", f"{c}_t{L}_random"]
+        wanted += [f"presence_acc_t{L}_policy", f"loss_t{L}_policy"]
+        ov: dict[str, float] = {}
+        for k in wanted:
+            if k.endswith("_gain"):  # policy minus random, found and found_X_percent only
+                c = k.removesuffix("_gain")
+                if c.startswith("found") and f"{c}_t{L}_policy" in full and f"{c}_t{L}_random" in full:
+                    ov[f"{c}_gain_t{L}_policy_vs_random"] = full[f"{c}_t{L}_policy"] - full[f"{c}_t{L}_random"]
+            elif k in full and k not in ov:
+                ov[k] = full[k]
         return ov
 
     # --- checkpoint ----------------------------------------------------------
