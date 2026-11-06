@@ -227,7 +227,15 @@ case "$TASK" in
             exit 1
         fi
         ;;
-    *) log "ERROR: TASK must be distill|ade20k|in1k, got '$TASK'"; exit 1 ;;
+    search)
+        # Single-GPU only, like ade20k (its loader does not shard by rank). The data root
+        # comes from COCO_SEARCH18_ROOT or the SearchConfig default.
+        if [ "${NGPU:-1}" -gt 1 ]; then
+            log "ERROR: TASK=search does not support DDP (NGPU=$NGPU) — use NGPU=1"
+            exit 1
+        fi
+        ;;
+    *) log "ERROR: TASK must be distill|ade20k|in1k|search, got '$TASK'"; exit 1 ;;
 esac
 if [ -n "${WANDB_ENTITY:-}" ]; then _TASK_ARGS+=(--cfg.wandb-entity "$WANDB_ENTITY"); fi
 if [ -n "${WANDB_DIR:-}" ]; then _TASK_ARGS+=(--cfg.wandb-dir "$WANDB_DIR"); fi
