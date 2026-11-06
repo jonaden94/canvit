@@ -93,10 +93,18 @@ def test_box_inside_fraction():
 
 
 def test_collate_pads_boxes_with_nan():
-    a = {"image": torch.zeros(3, 4, 4), "target": torch.tensor(1), "boxes": torch.zeros(1, 4)}
-    b = {"image": torch.zeros(3, 4, 4), "target": torch.tensor(2), "boxes": torch.ones(2, 4)}
+    a = {"image": torch.zeros(3, 4, 4), "target": torch.tensor(1), "boxes": torch.zeros(1, 4),
+         "present": torch.tensor(True)}
+    b = {"image": torch.zeros(3, 4, 4), "target": torch.tensor(2), "boxes": torch.ones(2, 4),
+         "present": torch.tensor(True)}
     out = collate_search([a, b])
     assert out["boxes"].shape == (2, 2, 4) and torch.isnan(out["boxes"][0, 1]).all()
+    # an all-absent batch still has one (NaN) box row per sample
+    c = {"image": torch.zeros(3, 4, 4), "target": torch.tensor(0), "boxes": torch.zeros(0, 4),
+         "present": torch.tensor(False)}
+    out = collate_search([c, c])
+    assert out["boxes"].shape == (2, 1, 4) and torch.isnan(out["boxes"]).all()
+    assert out["present"].tolist() == [False, False]
 
 
 # --------------------------------------------------------------------------- #
@@ -152,3 +160,46 @@ def test_hit_criterion():
     assert not hit(far, boxes, box_frac=0.1).item()
     c = argmax_centres(logits)[0]
     assert abs(c[0] - 0.5) < 2 / G and abs(c[1] - 0.5) < 2 / G
+
+
+# --------------------------------------------------------------------------- #
+# target-absent trials
+# --------------------------------------------------------------------------- #
+def test_target_absent_records_and_samples(fake_cs18):
+    from canvit.search.config import SearchConfig
+    from canvit.search.data import load_records
+    root, _ = fake_cs18
+    classes = coco_search18_classes(root)
+    both = load_records(SearchConfig(data_root=root, condition="both"), "train", classes)
+    tp = load_records(SearchConfig(data_root=root, condition="tp"), "train", classes)
+    ta = [r for r in both if r.bbox_xywh is None]
+    assert len(tp) == 6 and len(ta) == 6 and len(both) == 12  # 3 subjects deduplicated
+    assert all("coco_search18_images_TA" in str(r.path) for r in ta)
+    assert [r.bbox_xywh is None for r in both[:4]] == [False, True, False, True]  # interleaved
+    ds = SearchDataset(ta, scene_size=S, aug=SearchAugConfig(crop=True))
+    s = ds[0]
+    assert s["present"].item() is False and s["boxes"].shape == (0, 4) and s["image"].shape == (3, S, S)
+    with pytest.raises(ValueError, match="split1"):
+        load_records(SearchConfig(data_root=root, condition="both", split=2), "train", classes)
+
+
+def test_target_absent_row_has_zero_target_and_zero_kl():
+    boxes = torch.cat([_box(0.2, -0.3), torch.full((1, 1, 4), math.nan)])
+    tm = target_map(boxes, grid=G, kind="kl_gaussian", sigma=2.5 / 64)
+    assert tm[0].sum().item() == pytest.approx(1.0) and tm[1].abs().sum().item() == 0.0
+    kl = per_image_loss(torch.randn(2, G, G), tm)
+    assert kl[1].item() == 0.0 and kl[0].item() > 0
+    assert not hit(torch.randn(2, G, G), boxes, box_frac=0.1)[1]
+
+
+def test_presence_loss_matches_haozes_two_way_ce_and_focal():
+    import torch.nn.functional as F
+
+    from canvit.search.loss import presence_loss
+    logit = torch.tensor([2.0, -1.0, 0.3, -0.5])
+    present = torch.tensor([True, True, False, False])
+    two_way = torch.stack([torch.zeros(4), logit], 1)  # [absent, present] logits, difference = logit
+    ce2 = F.cross_entropy(two_way, present.long(), reduction="none")
+    assert torch.allclose(presence_loss(logit, present, kind="ce", gamma=2.0), ce2, atol=1e-6)
+    pt = torch.exp(-ce2)
+    assert torch.allclose(presence_loss(logit, present, kind="focal", gamma=2.0), (1 - pt) ** 2 * ce2, atol=1e-6)

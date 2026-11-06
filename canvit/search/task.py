@@ -25,7 +25,7 @@ from canvit.harness.rollout.selector import RandomSelector
 from canvit.harness.rollout.viewpoint import ViewpointType
 
 from .config import SearchConfig, search_policy_config
-from .loss import hit, per_image_loss, target_map
+from .loss import box_centres, hit, per_image_loss, presence_loss, target_map
 
 log = logging.getLogger(__name__)
 
@@ -40,16 +40,27 @@ def _canvas_hidden(model: Any, state: RecurrentState, canvas_grid: int) -> Tenso
 class BoundSearchTask:
     """Per-batch :class:`RolloutTask`: binds this batch's targets and boxes.
 
-    Optional engine hooks, present only when they apply: ``step_weight`` (``supervise='last'``)
-    and ``policy_cond`` (a policy is trained)."""
+    Optional engine hooks, present only when they apply: ``step_weight`` (``supervise='last'``),
+    ``policy_cond`` (a policy is trained) and ``reward_mask`` (``condition='both'``: only the
+    target-present trials carry a policy reward, Haoze's ``valid_mask``).
+
+    Losses (Haoze's, with ``condition='both'``): the heatmap KL averaged over the
+    target-present trials only, plus ``presence_weight`` x the presence loss over all trials."""
 
     def __init__(self, *, model: Any, targets: Tensor, boxes: Tensor, canvas_grid: int,
-                 cfg: SearchConfig, policy_embed: Callable[[Tensor], Tensor] | None = None):
+                 cfg: SearchConfig, policy_embed: Callable[[Tensor], Tensor] | None = None,
+                 present: Tensor | None = None):
         self.model = model
+        self.cfg = cfg
         self.targets = targets
         self.boxes = boxes
         self.canvas_grid = canvas_grid
         self.target = target_map(boxes, grid=canvas_grid, kind=cfg.loss, sigma=cfg.target_sigma)
+        has_box = box_centres(boxes)[1].any(-1)
+        self.present = has_box if present is None else present.bool()
+        assert torch.equal(self.present, has_box), "present/absent flags disagree with the boxes"
+        if cfg.condition == "both":
+            self.reward_mask = self.present
         if cfg.supervise == "last":
             self.step_weight = self._last_only
         if policy_embed is not None:
@@ -71,14 +82,26 @@ class BoundSearchTask:
         return GlimpseOut(readout=hidden, state=out.state, vpe=out.vpe)
 
     def logits(self, readout: Tensor) -> Tensor:
-        return self.model.head(readout.float(), self.targets)
+        return self.model.head(readout.float(), self.targets)[0]
 
     def per_image_loss(self, readout: Tensor) -> Tensor:
-        """Per-sample KL to the target map [B] -- also the policy reward's raw material."""
+        """Per-sample heatmap KL to the target map [B] -- also the policy reward's raw
+        material. 0 on target-absent trials (no target map; masked out of the reward)."""
         return per_image_loss(self.logits(readout), self.target)
 
     def step_loss(self, readout: Tensor) -> TaskLoss:
-        return TaskLoss(combined=self.per_image_loss(readout).mean())
+        heat, pres = self.model.head(readout.float(), self.targets)
+        kl = per_image_loss(heat, self.target)
+        tp = self.present
+        if bool(tp.all()):
+            loss = kl.mean()  # target-present only: the expression from before the TA option
+        else:
+            loss = kl[tp].mean() if bool(tp.any()) else kl.sum() * 0.0
+        if pres is not None:
+            c = self.cfg
+            pl = presence_loss(pres, tp, kind=c.presence_loss, gamma=c.presence_focal_gamma)
+            loss = loss + c.presence_weight * pl.mean()
+        return TaskLoss(combined=loss)
 
 
 class SearchRunTask:
@@ -90,6 +113,7 @@ class SearchRunTask:
         self.cfg = cfg
         self.rl = rl if rl is not None else search_policy_config()
         self._joint = None
+        self._bound: BoundSearchTask | None = None
         self.classes: list[str] | None = None
 
     @property
@@ -143,6 +167,7 @@ class SearchRunTask:
         model = CanViTForVisualSearch.from_pretrained_backbone(
             c.model_repo, n_classes=len(self._classes()), cond_dim=c.cond_dim, kind=c.head,
             width=c.head_width, block_layers=c.head_block_layers, dropout=c.dropout,
+            presence=c.condition == "both",
         ).to(device)
         if not consumes_full_image(model):
             raise ValueError(f"the search task supports FOVEATED backbones only; {c.model_repo} has patcher "
@@ -238,17 +263,94 @@ class SearchRunTask:
         return batch["image"].to(device, non_blocking=True)
 
     def bind(self, batch, device, *, model, head):
-        return BoundSearchTask(
+        bound = BoundSearchTask(
             model=getattr(model, "module", model), targets=batch["target"].to(device),
             boxes=batch["boxes"].to(device), canvas_grid=self.canvas_grid(model), cfg=self.cfg,
-            policy_embed=self._policy_embed(model))
+            policy_embed=self._policy_embed(model), present=batch["present"].to(device))
+        self._bound = bound  # this step's targets, for viz_frame
+        return bound
+
+    # --- visualization (canvit/search/viz.py) ------------------------------
+    def _policy_logits(self, model, joint, state: RecurrentState, targets: Tensor) -> Tensor:
+        """[n, Gp, Gp] scorer logits on ``state`` for the first ``n = len(targets)`` samples:
+        the distribution the policy draws the NEXT fixation from. The scorer is deterministic
+        (no BatchNorm, no dropout), so this equals the selector's own forward. The encoder's
+        rolling reference is restored, so a mid-rollout call cannot shift later features."""
+        n = targets.shape[0]
+        st = RecurrentState(canvas=state.canvas[:n], recurrent_cls=state.recurrent_cls[:n])
+        enc = joint.policy_selector.encoder
+        prev = enc.prev
+        try:
+            with torch.no_grad():
+                embed = self._policy_embed(model)
+                assert embed is not None
+                scores = joint.scorer(enc(st).float(), cond=embed(targets))
+        finally:
+            enc.prev = prev
+        g = int(round(scores[0].numel() ** 0.5))
+        return scores.reshape(n, g, g).float()
+
+    def _viz_capture(self, model, *, hidden, logits, presence, state, centers, targets, joint) -> dict:
+        """One glimpse of the figure for the first ``viz_samples`` samples, on CPU."""
+        n = min(self.cfg.viz_samples, hidden.shape[0])
+        return {"center": centers[:n].detach().float().cpu(),
+                "logits": logits[:n].detach().float().cpu(),
+                "presence": presence[:n].detach().float().cpu() if presence is not None else None,
+                "canvas": hidden[:n].detach().float().cpu(),
+                "policy_next": (self._policy_logits(model, joint, state, targets[:n]).cpu()
+                                if joint is not None else None)}
+
+    def _episode(self, frames: list[dict], *, images, boxes, targets, present):
+        from .viz import SearchEpisode
+        n = frames[0]["center"].shape[0]
+        policy = None
+        if frames[0]["policy_next"] is not None:
+            nxt = torch.stack([f["policy_next"] for f in frames])  # nxt[t] chose fixation t+1
+            policy = torch.cat([torch.full_like(nxt[:1], float("nan")), nxt[:-1]])
+        names = self._classes()
+        return SearchEpisode(
+            images=images[:n].cpu(), boxes=boxes[:n].cpu(), targets=[names[int(k)] for k in targets[:n]],
+            centers=torch.stack([f["center"] for f in frames]), logits=torch.stack([f["logits"] for f in frames]),
+            canvas=torch.stack([f["canvas"] for f in frames]), policy=policy,
+            present=present[:n].cpu().bool(),
+            presence=(torch.stack([f["presence"] for f in frames]) if frames[0]["presence"] is not None
+                      else None),
+            hit_box_frac=self.cfg.hit_box_frac, loss_kind=self.cfg.loss, sigma=self.cfg.target_sigma)
+
+    def _save_episode(self, frames, *, batch, run_dir, subdir, step, title) -> None:
+        from canvit.harness.viz.disk import save_figure
+
+        from .viz import make_search_figure
+        ep = self._episode(frames, images=batch["image"], boxes=batch["boxes"], targets=batch["target"],
+                           present=batch["present"])
+        save_figure(make_search_figure(ep, title=title), run_dir, subdir, step)
+
+    def viz_frame(self, *, model, images, gout, viewpoint, loss):
+        """Branch-0 capture of the TRAINING rollout (sampled fixations, augmented images)."""
+        core = getattr(model, "module", model)
+        bound = self._bound
+        n = min(self.cfg.viz_samples, images.shape[0])
+        with torch.no_grad():
+            logits, pres = core.head(gout.readout[:n].float(), bound.targets[:n])
+        return self._viz_capture(core, hidden=gout.readout, logits=logits, presence=pres, state=gout.state,
+                                 centers=viewpoint.centers, targets=bound.targets, joint=self._joint)
+
+    def render_viz(self, viz, *, batch, run_dir, step):
+        """Training-rollout figure -> ``{run_dir}/visualization/search_train/``."""
+        if not viz.frames:
+            return
+        self._save_episode(viz.frames, batch=batch, run_dir=run_dir, subdir="search_train", step=step,
+                           title=f"train step {step} (sampled fixations)")
 
     # --- evaluation --------------------------------------------------------
-    def _rollout_metrics(self, *, model, images, targets, boxes, T, cg, amp, choose=None, joint=None):
+    def _rollout_metrics(self, *, model, images, targets, boxes, T, cg, amp, choose=None, joint=None,
+                         record: list | None = None):
         """One closed-loop episode of ``T`` glimpses; returns per-timestep (loss [B], hit [B]).
 
         t0 is the centred fixation. Later fixations come from ``choose(t, logits, visited)``
-        (random / greedy) or, with ``joint``, from the learned scorer's argmax."""
+        (random / greedy) or, with ``joint``, from the learned scorer's argmax. ``record``
+        (a list) collects the figure's per-glimpse frames. Returns per-timestep lists of the
+        heatmap KL [B], the hit [B] and the presence logit [B] (None without a presence head)."""
         from canvit.harness.rollout.eval_viewpoints import deploy_rollout_viewpoints
         from canvit.harness.rollout.engine import _to_vp
 
@@ -256,6 +358,7 @@ class SearchRunTask:
         tmap = target_map(boxes, grid=cg, kind=self.cfg.loss, sigma=self.cfg.target_sigma)
         losses: list[Tensor] = []
         hits: list[Tensor] = []
+        presences: list[Tensor | None] = []
         visited = torch.zeros(B, cg * cg, dtype=torch.bool, device=images.device)
         last_logits: list[Tensor] = []
 
@@ -270,9 +373,16 @@ class SearchRunTask:
                 state = model.init_state(batch_size=B, canvas_grid_size=cg)
             with amp:
                 out = model.canvit(image=images, state=state, viewpoint=vp)
-            logits = model.head(_canvas_hidden(model, out.state, cg).float(), targets).float()
+            hidden = _canvas_hidden(model, out.state, cg)
+            logits, pres = model.head(hidden.float(), targets)
+            logits = logits.float()
             losses.append(per_image_loss(logits, tmap))
             hits.append(hit(logits, boxes, box_frac=self.cfg.hit_box_frac))
+            presences.append(pres)
+            if record is not None:
+                record.append(self._viz_capture(model, hidden=hidden, logits=logits, presence=pres,
+                                                state=out.state,
+                                                centers=vp.centers, targets=targets, joint=joint))
             mark(vp)
             last_logits[:] = [logits]
             return out.state
@@ -293,7 +403,7 @@ class SearchRunTask:
                 state = advance(vp, state, t)
                 if t < T - 1:
                     vp = choose(sel, ctx, last_logits[0], visited)
-        return losses, hits
+        return losses, hits, presences
 
     def _greedy(self, cg: int):
         """Fixate the current heatmap's argmax among cells not yet visited."""
@@ -315,14 +425,24 @@ class SearchRunTask:
 
     @torch.no_grad()
     def evaluate(self, *, model, head, val_loader, device, step, tracker=None, run_dir=None, joint=None):
-        """Per-timestep KL and hit rate on the val set under each of ``cfg.eval_policies``."""
+        """Per-timestep metrics on the val set under each of ``cfg.eval_policies``.
+
+        ``loss`` (heatmap KL) and ``hit`` average over the target-present trials only (Haoze's
+        accuracy). With a presence head: ``presence_acc`` / ``recall`` (target-present trials
+        judged present) / ``specificity`` (target-absent judged absent) / ``precision`` / ``f1``
+        at p(present) > 0.5, and ``correct``: a hit AND "present" on a target-present trial,
+        "absent" on a target-absent one."""
         T = self.cfg.n_timesteps
         cg = self.canvas_grid(model)
         amp = torch.autocast("cuda", dtype=torch.bfloat16) if device.type == "cuda" else nullcontext()
         was_training = model.head.training
         model.head.eval()
         policies = [p for p in self.cfg.eval_policies if p != "policy" or joint is not None]
-        sums = {p: ([0.0] * T, [0.0] * T) for p in policies}
+        keys = ("kl", "hit", "tpos", "tneg", "fpos", "correct")
+        sums = {p: {k: [0.0] * T for k in keys} for p in policies}
+        n_tp = n_ta = 0
+        has_presence = False
+        do_viz = run_dir is not None and bool(self.cfg.viz_every) and step % self.cfg.viz_every == 0
         n = 0
         # Random fixations draw from the global torch RNG: fork it, so eval is seeded and
         # cannot perturb the training stream.
@@ -333,29 +453,65 @@ class SearchRunTask:
                     break
                 images = batch["image"].to(device)
                 targets, boxes = batch["target"].to(device), batch["boxes"].to(device)
+                present = batch["present"].to(device)
+                n_tp += int(present.sum())
+                n_ta += int((~present).sum())
                 for p in policies:
-                    kw = dict(model=model, images=images, targets=targets, boxes=boxes, T=T, cg=cg, amp=amp)
+                    record = [] if (do_viz and vb == 0) else None
+                    kw = dict(model=model, images=images, targets=targets, boxes=boxes, T=T, cg=cg, amp=amp,
+                              record=record)
                     if p == "policy":
-                        losses, hits = self._rollout_metrics(**kw, joint=joint)
+                        losses, hits, pres = self._rollout_metrics(**kw, joint=joint)
                     elif p == "greedy":
-                        losses, hits = self._rollout_metrics(**kw, choose=self._greedy(cg))
+                        losses, hits, pres = self._rollout_metrics(**kw, choose=self._greedy(cg))
                     elif p == "random":
-                        losses, hits = self._rollout_metrics(**kw, choose=self._random)
+                        losses, hits, pres = self._rollout_metrics(**kw, choose=self._random)
                     else:
                         raise ValueError(f"unknown eval policy {p!r}")
+                    s = sums[p]
                     for t in range(T):
-                        sums[p][0][t] += losses[t].sum().item()
-                        sums[p][1][t] += hits[t].float().sum().item()
+                        h = hits[t] & present
+                        s["kl"][t] += losses[t][present].sum().item()
+                        s["hit"][t] += h.float().sum().item()
+                        if pres[t] is None:
+                            s["correct"][t] += h.float().sum().item()
+                            continue
+                        has_presence = True
+                        said = pres[t] > 0  # p(present) > 0.5
+                        s["tpos"][t] += (said & present).float().sum().item()
+                        s["tneg"][t] += (~said & ~present).float().sum().item()
+                        s["fpos"][t] += (said & ~present).float().sum().item()
+                        s["correct"][t] += ((h & said) | (~said & ~present)).float().sum().item()
+                    if record:
+                        try:  # a diagnostic: a plotting failure must never abort validation
+                            self._save_episode(record, batch=batch, run_dir=run_dir,
+                                               subdir=f"search_val_{p}", step=step,
+                                               title=f"val step {step}, fixations: {p}")
+                        except Exception:
+                            log.exception("search val viz failed at step %d (validation continues)", step)
                 n += images.shape[0]
         if was_training:
             model.head.train()
         out: dict[str, float] = {}
         for p in policies:
+            s = sums[p]
+            names = ["loss", "hit", "correct"]
             for t in range(T):
-                out[f"loss_t{t}_{p}"] = sums[p][0][t] / max(n, 1)
-                out[f"hit_t{t}_{p}"] = sums[p][1][t] / max(n, 1)
-            out[f"loss_final_{p}"] = out[f"loss_t{T - 1}_{p}"]
-            out[f"hit_final_{p}"] = out[f"hit_t{T - 1}_{p}"]
+                out[f"loss_t{t}_{p}"] = s["kl"][t] / max(n_tp, 1)
+                out[f"hit_t{t}_{p}"] = s["hit"][t] / max(n_tp, 1)
+                out[f"correct_t{t}_{p}"] = s["correct"][t] / max(n, 1)
+                if has_presence:
+                    tpos, tneg, fpos = s["tpos"][t], s["tneg"][t], s["fpos"][t]
+                    rec, prec = tpos / max(n_tp, 1), tpos / max(tpos + fpos, 1)
+                    out[f"presence_acc_t{t}_{p}"] = (tpos + tneg) / max(n, 1)
+                    out[f"recall_t{t}_{p}"] = rec
+                    out[f"specificity_t{t}_{p}"] = tneg / max(n_ta, 1)
+                    out[f"precision_t{t}_{p}"] = prec
+                    out[f"f1_t{t}_{p}"] = 2 * prec * rec / (prec + rec) if prec + rec > 0 else 0.0
+            if has_presence:
+                names += ["presence_acc", "recall", "specificity", "precision", "f1"]
+            for k in names:
+                out[f"{k}_final_{p}"] = out[f"{k}_t{T - 1}_{p}"]
         return out
 
     # --- checkpoint ----------------------------------------------------------

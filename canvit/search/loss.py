@@ -32,9 +32,11 @@ def target_map(boxes: Tensor, *, grid: int, kind: str, sigma: float) -> Tensor:
     centre, each normalised over the grid, summed and renormalised. ``sigma`` is a fraction
     of the scene side, so it is ``2 * sigma`` in [-1, 1] units. ``nll_point``: all mass on
     the cell holding each box centre (uniform over the boxes' cells) -- the sigma -> 0 limit.
+
+    A sample without a box (target absent) gets an all-zero row, so its KL is exactly 0;
+    the task masks those rows out of the heatmap loss and the policy reward anyway.
     """
     centres, valid = box_centres(boxes)  # [B, N, 2], [B, N]
-    assert bool(valid.any(-1).all()), "every sample needs at least one target box"
     c = cell_centres(grid, boxes.device)
     if kind == "kl_gaussian":
         # Normalised in LOG space (a softmax over the grid): the same distribution as
@@ -61,6 +63,20 @@ def per_image_loss(logits: Tensor, target: Tensor) -> Tensor:
     ``target`` [B, G*G]. For a one-hot target this is exactly the NLL of that cell."""
     logp = F.log_softmax(logits.float().flatten(1), dim=-1)
     return F.kl_div(logp, target, reduction="none").sum(-1)
+
+
+def presence_loss(logit: Tensor, present: Tensor, *, kind: str, gamma: float) -> Tensor:
+    """Per-sample loss [B] of the present/absent logit (log p(present) - log p(absent)).
+
+    ``ce``: binary cross-entropy, identical to Haoze's 2-way cross-entropy. ``focal``: his
+    ``focal_loss`` with alpha left out (it is a uniform weight; see ``presence_weight``):
+    ``(1 - p_t) ** gamma * CE``, with p_t the probability of the true class."""
+    ce = F.binary_cross_entropy_with_logits(logit.float(), present.float(), reduction="none")
+    if kind == "ce":
+        return ce
+    if kind == "focal":
+        return (1.0 - torch.exp(-ce)) ** gamma * ce
+    raise ValueError(f"unknown presence loss {kind!r}")
 
 
 def argmax_centres(logits: Tensor) -> Tensor:

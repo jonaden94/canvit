@@ -15,18 +15,24 @@ from canvit.core.policy.net import FiLM, N_UNET_ENC, _stage, build_unet, build_u
 
 
 class SearchHead(nn.Module):
-    """``[B, G, G, D]`` canvas tokens + ``[B]`` target class -> ``[B, G, G]`` logits.
+    """``[B, G, G, D]`` canvas tokens + ``[B]`` target class -> ``([B, G, G] heatmap logits,
+    [B] presence logit or None)``.
 
     ``unet``: LayerNorm -> 1x1 conv D->width -> FiLM -> U-Net (FiLM after every encoder and
     decoder stage) -> one more ConvNeXt stage -> 1x1 conv to one logit per cell.
     ``linear``: LayerNorm -> 1x1 conv D->width -> FiLM -> 1x1 conv (the sanity baseline).
+
+    ``presence=True`` adds Haoze's present/absent readout: the last target-conditioned
+    feature map (the one the output conv reads) mean-pooled, then a Linear to ONE logit,
+    log p(present) - log p(absent) (his two-way softmax, written as a sigmoid). No LSTM: the
+    canvas already carries the evidence across glimpses.
 
     ``embed`` is the task's target embedding; with ``embedding='shared'`` the policy reads it
     too (``policy_embedding``)."""
 
     def __init__(self, *, canvas_dim: int, n_classes: int, cond_dim: int = 64,
                  kind: Literal["unet", "linear"] = "unet", width: int = 64, block_layers: int = 2,
-                 dropout: float = 0.0):
+                 dropout: float = 0.0, presence: bool = False):
         super().__init__()
         self.kind = kind
         self.embed = nn.Embedding(n_classes, cond_dim)
@@ -41,8 +47,9 @@ class SearchHead(nn.Module):
             raise ValueError(f"unknown search head {kind!r}")
         self.dropout = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
         self.out = nn.Conv2d(width, 1, 1)
+        self.presence = nn.Linear(width, 1) if presence else None
 
-    def forward(self, x: Tensor, target: Tensor) -> Tensor:
+    def forward(self, x: Tensor, target: Tensor) -> tuple[Tensor, Tensor | None]:
         b, g, g2, _ = x.shape
         assert g == g2, f"square canvas expected, got {g}x{g2}"
         if self.kind == "unet":
@@ -55,7 +62,8 @@ class SearchHead(nn.Module):
         if self.kind == "unet":
             h = unet_forward(h, self.enc, self.dec, film=(self.film_enc, self.film_dec), cond=cond)
             h = self.post(h)
-        return self.out(self.dropout(h))[:, 0]
+        pres = self.presence(h.mean(dim=(2, 3)))[:, 0] if self.presence is not None else None
+        return self.out(self.dropout(h))[:, 0], pres
 
     def policy_embedding(self, target: Tensor, *, detach: bool) -> Tensor:
         """The SHARED target embedding as the policy reads it."""

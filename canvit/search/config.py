@@ -72,6 +72,10 @@ class SearchConfig:
     """COCO-Search18 root: ``images/<category>/<name>.jpg`` + the fixation JSONs."""
     split: Literal[1, 2] = 1
     """The dataset's ``split1`` (the paper's) or ``split2`` train/valid assignment."""
+    condition: Literal["tp", "both"] = "both"
+    """``both`` (Haoze's default): every target-present AND every target-absent (image, cue)
+    pair, about 50/50; adds the presence readout and its loss. ``tp``: target-present only.
+    The target-absent images live in ``coco_search18_images_TA/<category>/`` under ``data_root``."""
     scene_size: int = 512
     """Square scene side in px; the 1680x1050 images are letterboxed into it."""
     aug: SearchAugConfig = field(default_factory=SearchAugConfig)
@@ -105,7 +109,15 @@ class SearchConfig:
     target_sigma: float = 2.5 / 64
     """Gaussian sigma as a fraction of the scene side (Haoze: 2.5 cells on a 64x64 heatmap)."""
     supervise: Literal["last", "every"] = "last"
-    """``last`` (Haoze): only the last glimpse's loss trains the head. ``every``: all glimpses."""
+    """``last`` (Haoze): only the last glimpse's loss trains the head. ``every``: all glimpses.
+    Applies to the heatmap loss AND the presence loss (Haoze: both last)."""
+    presence_loss: Literal["focal", "ce"] = "focal"
+    """``condition='both'`` only. Loss of the present/absent readout: Haoze's focal loss
+    (gamma ``presence_focal_gamma``) or plain binary cross-entropy."""
+    presence_focal_gamma: float = 2.0
+    presence_weight: float = 0.75
+    """Weight of the presence loss. 0.75 reproduces Haoze's focal alpha 0.75, which in his
+    implementation scales every sample alike (it is not class balancing)."""
 
     # --- rollout / eval ----------------------------------------------------------------
     n_timesteps: int = 4
@@ -138,7 +150,10 @@ class SearchConfig:
     logs_dir: Path = Path("logs")
     log_every: int = 20
     val_every: int = 500
-    viz_every: int = 0
+    viz_every: int = 500
+    """Figures (``viz.py``) of a training rollout every N steps, and of the first val batch
+    under each eval policy at validations that fall on a multiple of N. 0 = off."""
+    viz_samples: int = 4
     device: str = "cuda"
     amp: bool = True
     seed: int = 0

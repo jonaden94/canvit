@@ -3,8 +3,9 @@
 Every sample is a dict:
 
     image:   float [3, S, S]  ImageNet-normalised, letterboxed into the square scene
-    target:  long  []         class index into ``classes``
-    boxes:   float [N, 4]     target boxes, scene-normalised [-1, 1] xyxy (N >= 1)
+    target:  long  []         class index into ``classes`` (the cue)
+    boxes:   float [N, 4]     target boxes, scene-normalised [-1, 1] xyxy
+    present: bool  []         target present (N >= 1) or absent (N == 0)
 
 A new search dataset needs only an adapter that produces this; nothing downstream (head,
 loss, policy, eval) reads anything dataset-specific.
@@ -12,7 +13,11 @@ loss, policy, eval) reads anything dataset-specific.
 COCO-Search18 facts this relies on (checked 2026-11-05, see claude_dev/search/00-design.md):
 the TP fixation JSONs hold one record per (subject, trial), 10 subjects per
 (image, target) pair, with the same target bbox ``[x, y, w, h]`` (1680x1050 px) for every
-subject -- so the records are deduplicated on ``(name, task)``. TA images are not on disk.
+subject -- so the records are deduplicated on ``(name, task)``. The target-absent (TA)
+trials are ``coco_search18_fixations_TA_trainval.json`` (no bbox; a ``split`` field with the
+same 2163 train / 326 valid pairs as TP split1) and their images are a separate download,
+``COCOSearch18-images-TA.zip``, extracted to ``coco_search18_images_TA/<category>/``
+(checked 2026-11-06: all 2489 train/valid TA pairs present, 1680x1050 like TP).
 """
 
 from __future__ import annotations
@@ -42,7 +47,7 @@ log = logging.getLogger(__name__)
 class SearchRecord:
     path: Path
     target: int
-    bbox_xywh: tuple[float, float, float, float]  # in the image's own pixels
+    bbox_xywh: tuple[float, float, float, float] | None  # image pixels; None = target absent
 
 
 def coco_search18_classes(root: Path) -> list[str]:
@@ -71,6 +76,47 @@ def load_coco_search18(root: Path, *, split: int, part: str, classes: list[str])
     log.info("COCO-Search18 split%d %s: %d trials -> %d (image, target) pairs",
              split, part, len(trials), len(records))
     return records
+
+
+TA_IMAGE_DIR = "coco_search18_images_TA"
+
+
+def load_coco_search18_ta(root: Path, *, split: int, part: str, classes: list[str]) -> list[SearchRecord]:
+    """The unique target-absent (image, cue) pairs of ``part`` ('train' / 'valid').
+
+    The TA fixation file has no split1/split2 variants: its ``split`` field matches TP
+    split1 (2163 / 326 pairs), so split2 is refused rather than silently mixed."""
+    if split != 1:
+        raise ValueError("the target-absent trials come with split1's train/valid assignment only; "
+                         "use --cfg.split 1 or --cfg.condition tp")
+    path = root / "coco_search18_fixations_TA_trainval.json"
+    trials = [tr for tr in json.loads(path.read_text()) if tr["split"] == part]
+    cls_idx = {c: i for i, c in enumerate(classes)}
+    pairs = sorted({(tr["name"], tr["task"]) for tr in trials})
+    records = [SearchRecord(path=root / TA_IMAGE_DIR / task / name, target=cls_idx[task], bbox_xywh=None)
+               for name, task in pairs]
+    missing = [r.path for r in records if not r.path.exists()]
+    if missing:
+        raise FileNotFoundError(f"{len(missing)} target-absent images missing, e.g. {missing[0]} -- extract "
+                                f"COCOSearch18-images-TA.zip into {root}")
+    log.info("COCO-Search18 TA %s: %d trials -> %d (image, target) pairs", part, len(trials), len(records))
+    return records
+
+
+def load_records(cfg: SearchConfig, part: str, classes: list[str]) -> list[SearchRecord]:
+    """TP pairs, plus the TA pairs when ``cfg.condition == 'both'``."""
+    if cfg.condition == "both" and cfg.split != 1:  # refuse before reading anything
+        raise ValueError("the target-absent trials come with split1's train/valid assignment only; "
+                         "use --cfg.split 1 or --cfg.condition tp")
+    recs = load_coco_search18(cfg.data_root, split=cfg.split, part=part, classes=classes)
+    if cfg.condition == "both":
+        ta = load_coco_search18_ta(cfg.data_root, split=cfg.split, part=part, classes=classes)
+        # Interleave TP and TA, so the (unshuffled) first val batch -- the one the val figure
+        # draws -- holds both kinds of trial. Metrics do not depend on the order.
+        mixed = [r for pair in zip(recs, ta) for r in pair]
+        n = min(len(recs), len(ta))
+        recs = mixed + recs[n:] + ta[n:]
+    return recs
 
 
 def _photometric(aug: SearchAugConfig) -> list:
@@ -131,8 +177,9 @@ class SearchDataset(Dataset):
     def _load(self, rec: SearchRecord) -> tuple[tv_tensors.Image, tv_tensors.BoundingBoxes]:
         img = tv_tensors.Image(decode_image(read_file(str(rec.path)), mode=ImageReadMode.RGB))
         h, w = img.shape[-2:]
+        xywh = [rec.bbox_xywh] if rec.bbox_xywh is not None else []
         boxes = tv_tensors.BoundingBoxes(
-            torch.tensor([rec.bbox_xywh], dtype=torch.float32), format="XYWH",
+            torch.tensor(xywh, dtype=torch.float32).reshape(-1, 4), format="XYWH",
             canvas_size=(h, w), clamping_mode=None)  # unclamped, so retention can be measured
         return img, TF.convert_bounding_box_format(boxes, new_format=tv_tensors.BoundingBoxFormat.XYXY)
 
@@ -142,6 +189,7 @@ class SearchDataset(Dataset):
         if self.aug is None:
             return v2.Resize(content, antialias=True)(img, boxes)
         geo = v2.Compose(_geometric(self.aug, content))
+        # No box (target absent) => the first draw is kept: any crop is valid.
         for _ in range(max(1, self.aug.max_tries)):
             gi, gb = geo(img, boxes)
             if bool((box_inside_fraction(gb.as_subclass(Tensor), content) >= self.aug.min_box_fraction).all()):
@@ -167,25 +215,25 @@ class SearchDataset(Dataset):
         image = TF.normalize(TF.to_dtype(img, torch.float32, scale=True),
                              mean=list(IMAGENET_DEFAULT_MEAN), std=list(IMAGENET_DEFAULT_STD))
         return {"image": image.as_subclass(Tensor), "target": torch.tensor(rec.target, dtype=torch.long),
-                "boxes": b}
+                "boxes": b, "present": torch.tensor(rec.bbox_xywh is not None)}
 
 
 def collate_search(batch: list[dict]) -> dict:
-    """Stack images/targets; pad ``boxes`` to the batch max with NaN rows."""
-    n = max(s["boxes"].shape[0] for s in batch)
+    """Stack images/targets/present; pad ``boxes`` to the batch max with NaN rows (at least
+    one row, so an all-absent batch still has a ``[B, 1, 4]`` tensor)."""
+    n = max(1, max(s["boxes"].shape[0] for s in batch))
     boxes = torch.full((len(batch), n, 4), math.nan)
     for i, s in enumerate(batch):
         boxes[i, : s["boxes"].shape[0]] = s["boxes"]
     return {"image": torch.stack([s["image"] for s in batch]),
-            "target": torch.stack([s["target"] for s in batch]), "boxes": boxes}
+            "target": torch.stack([s["target"] for s in batch]), "boxes": boxes,
+            "present": torch.stack([s["present"] for s in batch])}
 
 
 def make_search_loaders(cfg: SearchConfig) -> tuple[DataLoader, DataLoader, list[str]]:
     classes = coco_search18_classes(cfg.data_root)
-    train = SearchDataset(load_coco_search18(cfg.data_root, split=cfg.split, part="train", classes=classes),
-                          scene_size=cfg.scene_size, aug=cfg.aug)
-    val = SearchDataset(load_coco_search18(cfg.data_root, split=cfg.split, part="valid", classes=classes),
-                        scene_size=cfg.scene_size, aug=None)
+    train = SearchDataset(load_records(cfg, "train", classes), scene_size=cfg.scene_size, aug=cfg.aug)
+    val = SearchDataset(load_records(cfg, "valid", classes), scene_size=cfg.scene_size, aug=None)
     kw = dict(num_workers=cfg.num_workers, pin_memory=True, collate_fn=collate_search,
               persistent_workers=cfg.num_workers > 0)
     return (DataLoader(train, batch_size=cfg.batch_size, shuffle=True, drop_last=True, **kw),
@@ -195,7 +243,6 @@ def make_search_loaders(cfg: SearchConfig) -> tuple[DataLoader, DataLoader, list
 
 def make_search_val_loader(cfg: SearchConfig) -> tuple[DataLoader, list[str]]:
     classes = coco_search18_classes(cfg.data_root)
-    val = SearchDataset(load_coco_search18(cfg.data_root, split=cfg.split, part="valid", classes=classes),
-                        scene_size=cfg.scene_size, aug=None)
+    val = SearchDataset(load_records(cfg, "valid", classes), scene_size=cfg.scene_size, aug=None)
     return (DataLoader(val, batch_size=cfg.eval_batch_size, shuffle=False, num_workers=cfg.num_workers,
                        pin_memory=True, collate_fn=collate_search), classes)
