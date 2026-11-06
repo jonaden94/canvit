@@ -17,7 +17,8 @@
 # (--cfg.no-amp). For an A100: PARTITION=grete:shared GPU=A100 and drop --cfg.no-amp.
 #
 # ONE JOB, NOT AN ARRAY: resume is not tested for the search task, so the run must fit the
-# walltime. TIME is set from the V100 smoke run's step time (exp38). Checkpoints every 2000
+# walltime. TIME is set from the V100 smoke run (exp38, job 17131243: 0.63 s/step in fp32,
+# 54 s per validation). Checkpoints every 2000
 # steps keep a crashed run's progress on disk; best.pt follows hit_final_policy.
 #
 # Later variants (not this run): --cfg.supervise every; --rl.reward difference (needs
@@ -28,7 +29,7 @@ set -euo pipefail
 RUN_GROUP=jon_exp39_search
 SEED="${SEED:-0}"
 RUN_NAME=search-v1-haozeaug-s$SEED
-TIME="${TIME:?set TIME from the step time of the exp38 V100 smoke run}"
+TIME="${TIME:-0-05:00:00}"  # exp38 V100 smoke: 0.63 s/step + 54 s per val => ~4.1 h, +20 %
 MEM=64G
 NGPU=1                       # search is single-GPU only (supports_ddp=False)
 GPU="${GPU:-V100}"

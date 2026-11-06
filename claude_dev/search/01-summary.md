@@ -13,7 +13,7 @@ SLURM, both on a V100 (`jupyter` partition), in fp32 because V100 has no bfloat1
 
 - `slurm/runs/exp38_search_smoke/search-smoke.sh`: 300-step smoke run.
 - `slurm/runs/exp39_search/search-v1-s0.sh`: the first training run, the defaults plus Haoze's
-  augmentations. Needs `TIME=` and `TRAIN_COMMIT=`.
+  augmentations, 5 h. Needs `TRAIN_COMMIT=`.
 
 ## What the task does
 
@@ -171,6 +171,7 @@ for search.
   run had 586 passed and 2 failures in a new test; those were fixed and re-run on their own.
   The real backbone loads and evaluates on CPU.
 - **GPU smoke run:** job 17122634 (A100) crashed at the first validation (the figure sliced the
-  batch but not the policy's stored canvas); fixed and re-submitted on a V100.
+  batch but not the policy's stored canvas); fixed. Re-run on a V100 (job 17131243) passed: 300 steps
+  in 8 min, hit_final_policy 0.10 -> 0.64 by step 200, figures written.
 - **Not built:** `null_cell` (one softmax over cells + "absent"); a policy reward on
   target-absent trials; a sampled-policy eval rule; the standalone `SearchEval`; DDP.
