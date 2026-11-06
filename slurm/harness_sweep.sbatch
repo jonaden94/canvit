@@ -43,7 +43,9 @@ while IFS= read -r line; do
     out="logs/$RUN_GROUP/$name/log/job-${SLURM_JOB_ID}.log"
     log "--- run $name: ${args:-<no extra args>}  (log: $out)"
     t0=$(date +%s)
-    RUN_NAME="$name" EXTRA_ARGS="$_BASE_EXTRA ${args:-}" bash "$_HARNESS" > "$out" 2>&1
+    # stdin from /dev/null: srun reads stdin and would otherwise swallow the rest of SWEEP_SPEC
+    # (the loop's input), ending the sweep after the first run (job 17138202)
+    RUN_NAME="$name" EXTRA_ARGS="$_BASE_EXTRA ${args:-}" bash "$_HARNESS" > "$out" 2>&1 < /dev/null
     rc=$?
     mins=$(( ($(date +%s) - t0) / 60 ))
     log "--- run $name: exit $rc after ${mins} min"
