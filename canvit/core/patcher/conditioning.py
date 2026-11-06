@@ -118,9 +118,11 @@ class PatchConditioner(nn.Module):
     def transform_sensor(self, sensor: Tensor) -> Tensor:
         return sensor
 
-    def modulate_kpe_output(self, h: Tensor, scale: Tensor | None = None) -> Tensor:
+    def modulate_kpe_output(self, h: Tensor, scale: Tensor | None = None,
+                            retina: Tensor | None = None) -> Tensor:
         # ``scale`` ([B] per-sample view scale) is consumed only by scale-aware
-        # FiLM; every other conditioner ignores it (identity hook here).
+        # FiLM, ``retina`` ([B] retina index, multi-retina patcher) only by
+        # retina-conditioned FiLM; every other conditioner ignores both (identity).
         return h
 
     def after_kpe_built(self, kpe: nn.Module) -> None:
@@ -135,7 +137,13 @@ class NoConditioning(PatchConditioner):
 class FiLMConditioner(PatchConditioner):
     """Per-patch FiLM (``h <- gamma * h + beta``) on ``kpe``'s output,
     conditioned on an encoding (Fourier or sinusoidal) of the fovea-centric
-    ``(x, y, r)``."""
+    ``(x, y, r)``.
+
+    Multi-retina patcher (``patch_xyr`` of shape ``[R, N, 3]``, one layout per retina):
+    ``(gamma, beta)`` depend on the retina as well. A learned vector per retina
+    (``retina_embed``, ``[R, mlp_hidden[0]]``) is added to the pre-activation of the
+    MLP's first hidden layer, which equals appending a one-hot retina code to the MLP
+    input. The zero-initialized last layer keeps FiLM a no-op at init."""
 
     cond_input: Tensor
 
@@ -151,7 +159,7 @@ class FiLMConditioner(PatchConditioner):
         # shape-identical with/without scale; for sinusoidal the encoder output
         # (hence the MLP's first Linear) grows by 2*num_freqs. Either way no FiLM
         # hyperparameter changes between scale-on and scale-off runs.
-        in_dim = patch_xyr.shape[1] + (1 if cfg.encode_scale else 0)
+        in_dim = patch_xyr.shape[-1] + (1 if cfg.encode_scale else 0)  # [-1]: also [R, N, 3]
         if cfg.encoding == "sinusoidal":
             self.encoder = SinusoidalEncoder(in_dim, cfg.sinusoidal.num_freqs)
         else:
@@ -174,8 +182,16 @@ class FiLMConditioner(PatchConditioner):
         assert isinstance(out_layer, nn.Linear)
         nn.init.zeros_(out_layer.weight)
         nn.init.zeros_(out_layer.bias)
+        # Multi-retina: one learned vector per retina into the first hidden layer. Small
+        # random init (not zeros) so the retinas differ as soon as the last layer moves.
+        self.n_retinas = int(patch_xyr.shape[0]) if patch_xyr.ndim == 3 else 0
+        if self.n_retinas:
+            assert cfg.mlp_hidden, "retina conditioning needs a hidden layer (film.mlp_hidden)"
+            self.retina_embed = nn.Parameter(torch.randn(self.n_retinas, cfg.mlp_hidden[0]) * 0.02)
 
-    def _gamma_beta(self, scale: Tensor | None) -> tuple[Tensor, Tensor]:
+    def _gamma_beta(self, scale: Tensor | None, retina: Tensor | None = None) -> tuple[Tensor, Tensor]:
+        if self.n_retinas:
+            return self._gamma_beta_multi(scale, retina)
         if self.encode_scale:
             assert scale is not None, "encode_scale=True FiLM requires a per-sample view scale"
             b = scale.shape[0]
@@ -190,8 +206,24 @@ class FiLMConditioner(PatchConditioner):
         gamma = 1.0 + d_gamma
         return gamma, beta
 
-    def modulate_kpe_output(self, h: Tensor, scale: Tensor | None = None) -> Tensor:
-        gamma, beta = self._gamma_beta(scale)  # [N, kpe_out] or [B, N, kpe_out]
+    def _gamma_beta_multi(self, scale: Tensor | None, retina: Tensor | None) -> tuple[Tensor, Tensor]:
+        """Per-sample ``(gamma, beta)``, ``[B, N, kpe_out]``: each sample's retina's patch
+        positions, plus its retina vector in the first hidden layer."""
+        assert retina is not None, "multi-retina FiLM needs each sample's retina"
+        feats = self.cond_input[retina]  # [B, N, 3]
+        if self.encode_scale:
+            assert scale is not None, "encode_scale=True FiLM requires a per-sample view scale"
+            s = scale.to(feats.dtype).view(-1, 1, 1).expand(-1, feats.shape[1], 1)
+            feats = torch.cat([feats, s], dim=-1)  # [B, N, 4]
+        first = self.mlp[0]
+        h = first(self.encoder(feats)) + self.retina_embed[retina].unsqueeze(1)  # [B, N, hidden]
+        out = self.mlp[1:](h)  # [B, N, 2*kpe_out]
+        d_gamma, beta = out[..., : self.kpe_out], out[..., self.kpe_out :]
+        return 1.0 + d_gamma, beta
+
+    def modulate_kpe_output(self, h: Tensor, scale: Tensor | None = None,
+                            retina: Tensor | None = None) -> Tensor:
+        gamma, beta = self._gamma_beta(scale, retina)  # [N, kpe_out] or [B, N, kpe_out]
         return h * gamma + beta  # broadcast over [B, N, kpe_out]
 
 
@@ -246,9 +278,10 @@ class CompositeConditioner(PatchConditioner):
             sensor = c.transform_sensor(sensor)
         return sensor
 
-    def modulate_kpe_output(self, h: Tensor, scale: Tensor | None = None) -> Tensor:
+    def modulate_kpe_output(self, h: Tensor, scale: Tensor | None = None,
+                            retina: Tensor | None = None) -> Tensor:
         for c in self.conditioners:
-            h = c.modulate_kpe_output(h, scale=scale)
+            h = c.modulate_kpe_output(h, scale=scale, retina=retina)
         return h
 
     def after_kpe_built(self, kpe: nn.Module) -> None:
@@ -283,6 +316,10 @@ def create_conditioner(
     """
     if cfg.mode == "none":
         return NoConditioning()
+    if patch_xy.ndim == 3:  # multi-retina patcher: [R, N, 2], one layout per retina
+        assert cfg.mode == "film", f"multiple retinas need conditioning mode 'film', got {cfg.mode!r}"
+        patch_xyr = torch.stack([build_coord_features(p, ["x", "y", "r"]) for p in patch_xy])
+        return FiLMConditioner(cfg.film, kpe_out=kpe_out, patch_xyr=patch_xyr)
     if cfg.mode == "film":
         patch_xyr = build_coord_features(patch_xy, ["x", "y", "r"])
         return FiLMConditioner(cfg.film, kpe_out=kpe_out, patch_xyr=patch_xyr)

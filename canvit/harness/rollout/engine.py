@@ -128,6 +128,13 @@ class RolloutResult:
     viz: RolloutViz | None = None               # only when collect_viz=True
 
 
+def _patcher_of(model: Any) -> Any:
+    """The patcher of a pretraining model (``model.patcher``) or of a task wrapper
+    (``model.canvit.patcher``); None if there is none."""
+    patcher = getattr(model, "patcher", None)
+    return patcher if patcher is not None else getattr(getattr(model, "canvit", None), "patcher", None)
+
+
 def _to_vp(vp: NamedViewpoint) -> Viewpoint:
     return Viewpoint(centers=vp.centers, scales=vp.scales)
 
@@ -182,6 +189,14 @@ def run_rollout(
 
     core_model = getattr(model, "module", model)
     state_init = core_model.init_state(batch_size=B, canvas_grid_size=canvas_grid_size)
+
+    # Multi-retina patcher: each sample's retina, drawn uniformly and held for all its
+    # glimpses (every branch of this step sees the same images with the same retinas).
+    # torch's global CPU RNG, seeded per rank. A single-retina patcher draws nothing.
+    patcher = _patcher_of(core_model)
+    n_retinas = getattr(patcher, "n_retinas", 1)
+    if n_retinas > 1:
+        patcher.set_retinas(torch.randint(n_retinas, (B,)))
 
     n_glimpses = sample_n_glimpses(bptt, rng=rng)
     # DDP: each rank samples independently; broadcast so all ranks call backward()
@@ -411,6 +426,8 @@ def run_rollout(
         # scale (~-0.7 for the ade20k probe, not ~+0.03).
         policy_metrics.update(joint.last_step)
 
+    if n_retinas > 1:
+        patcher.set_retinas(None)  # a later forward must choose its retinas explicitly
     return RolloutResult(
         total_loss=total_loss, branches=results, n_glimpses=n_glimpses,
         policy_metrics=policy_metrics, viz=viz,
