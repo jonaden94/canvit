@@ -237,9 +237,16 @@ def pg_loss(
     *,
     alpha: Tensor | float,
     crit_all: Tensor | None = None,
+    mask: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
     """Score-function credit on the on-policy taken cell (+ optional exact Q-Prop).
-    Returns (loss, entropy, metrics). crit_all [N, A] (grad — its MSE is included)."""
+    Returns (loss, entropy, metrics). crit_all [N, A] (grad — its MSE is included).
+
+    ``mask`` [N] bool (optional, not combined with ``crit_all``): rows that carry a reward
+    (visual search: the target-present trials). The score-function term is the mean over
+    those rows only -- Haoze's ``valid_mask``, divided by the number of valid rows -- while
+    the entropy term still covers every row. Masked-out ``target`` values are ignored.
+    None => the historical expression, unchanged."""
     logp_all = F.log_softmax(pred_all, dim=1)
     pred_sel = logp_all.gather(1, flat_idx[:, None]).squeeze(1)
     entropy = -(logp_all.exp() * logp_all).sum(dim=1).mean()
@@ -250,6 +257,11 @@ def pg_loss(
         analytic = (logp_all.exp() * crit_all.detach()).sum(dim=1).mean()
         loss = -((target - crit_sel.detach()) * pred_sel).mean() - analytic - alpha * entropy + critic_loss
         metrics |= {"critic_loss": critic_loss, "resid_std": (target - crit_sel.detach()).std()}
+    elif mask is not None:
+        assert mask.dtype == torch.bool and mask.shape == target.shape
+        pg = -(target * pred_sel)[mask].mean() if bool(mask.any()) else pred_sel.sum() * 0.0
+        loss = pg - alpha * entropy
+        metrics["adv_std"] = target[mask].std() if int(mask.sum()) > 1 else target.new_zeros(())
     else:
         loss = -(target * pred_sel).mean() - alpha * entropy
     return loss, entropy, metrics

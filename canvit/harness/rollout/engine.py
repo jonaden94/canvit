@@ -128,6 +128,14 @@ class RolloutResult:
     viz: RolloutViz | None = None               # only when collect_viz=True
 
 
+def _masked_mean(x: Tensor, mask: Tensor | None) -> Tensor:
+    """``x.mean()`` (the historical expression) without a mask; else the mean over the
+    masked-in rows, 0 when there are none."""
+    if mask is None:
+        return x.mean()
+    return x[mask].mean() if bool(mask.any()) else x.new_zeros(())
+
+
 def _to_vp(vp: NamedViewpoint) -> Viewpoint:
     return Viewpoint(centers=vp.centers, scales=vp.scales)
 
@@ -216,6 +224,10 @@ def run_rollout(
     # Optional per-glimpse task-loss weight (visual search's `supervise='last'`). Absent
     # (every other task) => weight 1.0 and the identical expression as before.
     sw_hook = getattr(task, "step_weight", None)
+    # Optional per-trial reward mask [B] bool (visual search: target-absent trials carry no
+    # policy reward). Absent (every other task) => the policy calls below are unchanged.
+    rmask: Tensor | None = getattr(task, "reward_mask", None)
+    mask_kw = {} if rmask is None else {"mask": rmask}
 
     def _tw_loss(L: Any, t: int) -> Tensor:
         """The per-glimpse task loss scaled by ``task_weight`` (design §4). The
@@ -321,7 +333,8 @@ def run_rollout(
                 cur_pi = task.per_image_loss(gout.readout).detach()
                 reward = joint.inline_reward(prev_pi_loss, cur_pi)
                 prev_pi_loss = cur_pi
-                ploss = joint.glimpse_loss(depth=t, scores=aux["scores"], flat_idx=aux["flat_idx"], reward=reward)
+                ploss = joint.glimpse_loss(depth=t, scores=aux["scores"], flat_idx=aux["flat_idx"], reward=reward,
+                                           **mask_kw)
                 # chunk_loss is divided by n_glimpses below, but there are only
                 # n_glimpses-1 POLICY glimpses (t0 is the anchor and carries no policy
                 # loss). Undo that division and re-normalize by the policy count, so the
@@ -341,7 +354,7 @@ def run_rollout(
                 # as earlier harness runs and as rl_train's logged `train_loss`.
                 chunk_loss = chunk_loss + ploss * (n_glimpses / (n_glimpses - 1))
                 pol_acc["loss"] = pol_acc["loss"] + ploss.detach()
-                pol_acc["reward"] = pol_acc["reward"] + reward.mean().detach()
+                pol_acc["reward"] = pol_acc["reward"] + _masked_mean(reward, rmask).detach()
                 pol_acc["n"] += 1
 
             if defer and traj and t == n_glimpses - 1:
@@ -361,11 +374,11 @@ def run_rollout(
                     scores=torch.stack([a["scores"] for a in traj], dim=1),
                     flat_idx=torch.stack([a["flat_idx"] for a in traj], dim=1),
                     values=torch.stack([a["value"] for a in traj], dim=1) if joint.needs_value else None,
-                    reward=reward,
+                    reward=reward, **mask_kw,
                 ) * n_glimpses
                 chunk_loss = chunk_loss + ploss
                 pol_acc["loss"] = pol_acc["loss"] + ploss.detach() / n_glimpses
-                pol_acc["reward"] = pol_acc["reward"] + reward.mean()
+                pol_acc["reward"] = pol_acc["reward"] + _masked_mean(reward, rmask)
                 pol_acc["n"] += 1
 
             total_detached = total_detached + L.combined.detach().float()

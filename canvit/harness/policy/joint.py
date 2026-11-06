@@ -154,12 +154,25 @@ class JointPolicy:
         assert self.reward.kind == "difference", f"no inline reward for kind={self.reward.kind!r}"
         return prev_loss - cur_loss
 
-    def _standardize(self, depth: int, reward: Tensor) -> Tensor:
+    def _standardize(self, depth: int, reward: Tensor, mask: Tensor | None = None) -> Tensor:
+        """Centre/scale one depth's reward. With ``mask``, only the masked-in rows enter the
+        statistics (batch or running); the other rows come back as 0."""
+        if mask is not None:
+            out = torch.zeros_like(reward)
+            if bool(mask.any()):
+                out[mask] = self._standardize(depth, reward[mask])
+            return out
         out, self_ema = standardize_reward(
             reward, spec=self.reward, running=self._norm(depth), ema_abs=self.ema_abs.get(depth))
         if self_ema is not None:
             self.ema_abs[depth] = self_ema
         return out.detach()
+
+    def _require_pg_for_mask(self, mask: Tensor | None) -> None:
+        if mask is not None and not isinstance(self.objective, PG):
+            raise NotImplementedError(
+                f"a per-trial reward mask is implemented for objective='pg' only, not "
+                f"{type(self.objective).__name__}")
 
     def _alpha(self, obj: PG) -> Tensor | float:
         return obj.entropy_bonus if self.log_alpha is None else self.log_alpha.exp()
@@ -196,10 +209,11 @@ class JointPolicy:
         return self.scorer.vhead(feats.float().mean(dim=(2, 3))).squeeze(-1)
 
     def trajectory_loss(self, *, scores: Tensor, flat_idx: Tensor, values: Tensor | None,
-                        reward: Tensor) -> Tensor:
+                        reward: Tensor, mask: Tensor | None = None) -> Tensor:
         """The weighted policy loss for a WHOLE trajectory (the deferred, terminal-reward
         path). ``scores`` [B, T, A] carries grad; ``reward`` [B] is the detached terminal
-        reward, given to every one of the T actions.
+        reward, given to every one of the T actions. ``mask`` [B] (PG only): the trials that
+        carry a reward; the others get only the entropy term (see ``pg_loss``).
 
         VPG (``values`` [B, T], with grad): unchanged — not per-depth, no ``RunningNorm``;
         VPG standardizes the ADVANTAGE per timestep over the batch (see :class:`VPG`).
@@ -209,6 +223,7 @@ class JointPolicy:
         :func:`pg_loss`; the result is the MEAN over the T steps, the same scale as the
         inline path's mean over depths."""
         obj = self.objective
+        self._require_pg_for_mask(mask)
         if isinstance(obj, VPG):
             assert values is not None
             loss, metrics = vpg_loss(
@@ -222,8 +237,13 @@ class JointPolicy:
         n_steps = scores.shape[1]
         losses, entropies = [], []
         for t in range(n_steps):
-            target = self._standardize(t + 1, reward)
-            loss_t, ent_t, _ = pg_loss(scores[:, t], flat_idx[:, t], target, alpha=self._alpha(obj), crit_all=None)
+            target = self._standardize(t + 1, reward, mask)
+            if mask is None:
+                loss_t, ent_t, _ = pg_loss(scores[:, t], flat_idx[:, t], target, alpha=self._alpha(obj),
+                                           crit_all=None)
+            else:
+                loss_t, ent_t, _ = pg_loss(scores[:, t], flat_idx[:, t], target, alpha=self._alpha(obj),
+                                           crit_all=None, mask=mask)
             losses.append(loss_t)
             entropies.append(ent_t.detach())
             if self.log_alpha is not None and obj.entropy_update == "per_glimpse":
@@ -235,16 +255,23 @@ class JointPolicy:
                           "alpha": torch.as_tensor(self._alpha(obj)).detach().float()}
         return self.rl_weight * torch.stack(losses).mean()
 
-    def glimpse_loss(self, *, depth: int, scores: Tensor, flat_idx: Tensor, reward: Tensor) -> Tensor:
+    def glimpse_loss(self, *, depth: int, scores: Tensor, flat_idx: Tensor, reward: Tensor,
+                     mask: Tensor | None = None) -> Tensor:
         """The weighted policy loss for ONE glimpse. ``scores`` [B, A] carries grad
         (the train-mode scorer forward); ``flat_idx`` [B] is the taken candidate;
-        ``reward`` [B] is the raw fractional distill-MSE reduction (detached)."""
+        ``reward`` [B] is the raw fractional distill-MSE reduction (detached). ``mask``: as
+        in :meth:`trajectory_loss` (PG only)."""
         obj = self.objective
+        self._require_pg_for_mask(mask)
         if isinstance(obj, PG):
             # Historical default (fractional, running_mean + running_std / z_subtract_only)
             # resolves to exactly `self._norm(depth).normalize(reward, subtract_only=...)`.
-            target = self._standardize(depth, reward)
-            loss, entropy, _ = pg_loss(scores, flat_idx, target, alpha=self._alpha(obj), crit_all=None)
+            target = self._standardize(depth, reward, mask)
+            if mask is None:
+                loss, entropy, _ = pg_loss(scores, flat_idx, target, alpha=self._alpha(obj), crit_all=None)
+            else:
+                loss, entropy, _ = pg_loss(scores, flat_idx, target, alpha=self._alpha(obj), crit_all=None,
+                                           mask=mask)
             if self.log_alpha is not None:
                 if obj.entropy_update == "per_glimpse":
                     self._entropy_step(obj, entropy)

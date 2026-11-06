@@ -318,3 +318,81 @@ def test_policy_cond_reaches_a_film_scorer(seg):
     assert task.cond_calls == 2, "one call per policy glimpse (horizon 3 => 2)"
     with pytest.raises(ValueError, match="needs the target embedding"):
         _rollout(seg, jp, _Task(seg))  # a conditioned scorer without the hook fails loudly
+
+
+# --------------------------------------------------------------------------- #
+# The per-trial reward mask (visual search: target-absent trials carry no reward)
+# --------------------------------------------------------------------------- #
+def test_pg_loss_mask_restricts_only_the_score_function_term():
+    from canvit.harness.policy.rl import pg_loss
+    torch.manual_seed(0)
+    scores, idx, target = torch.randn(4, 10), torch.randint(0, 10, (4,)), torch.randn(4)
+    full, ent, _ = pg_loss(scores, idx, target, alpha=0.1)
+    same, _, _ = pg_loss(scores, idx, target, alpha=0.1, mask=torch.ones(4, dtype=torch.bool))
+    assert torch.equal(full, same)
+    none, ent2, _ = pg_loss(scores, idx, target, alpha=0.1, mask=torch.zeros(4, dtype=torch.bool))
+    assert torch.allclose(none, -0.1 * ent2) and torch.equal(ent, ent2)  # entropy still over all rows
+    m = torch.tensor([True, False, True, False])
+    a, _, _ = pg_loss(scores, idx, target, alpha=0.0, mask=m)
+    b, _, _ = pg_loss(scores, idx, torch.where(m, target, 99.0), alpha=0.0, mask=m)
+    logp = torch.log_softmax(scores, 1).gather(1, idx[:, None])[:, 0]
+    assert torch.equal(a, b) and torch.allclose(a, -(target * logp)[m].mean())
+
+
+class _MaskedTask(_Task):
+    """``_Task`` with a reward mask and a SYNTHETIC per-image loss: a fixed per-row value that
+    shrinks with each call (so the inline ``difference`` reward is non-zero), times ``bump``.
+    Synthetic because the ade20k per-image CE is not bit-reproducible run to run on this CPU
+    path (measured 2026-11-06: two identical rollouts with an uncentred reward differ at ~4e-4
+    relative), which would make ``torch.equal`` fail for reasons unrelated to the mask."""
+
+    def __init__(self, seg, *, mask, bump):
+        super().__init__(seg)
+        self.reward_mask = mask
+        self.bump = bump
+        self.calls = 0
+
+    def per_image_loss(self, readout):
+        self.calls += 1
+        base = torch.linspace(0.5, 1.5, readout.shape[0])
+        return base * (1.0 - 0.1 * self.calls) * self.bump
+
+
+@pytest.mark.parametrize("reward", ["terminal", "difference"])
+def test_reward_mask_hides_masked_trials_from_the_policy_gradient(seg, reward):
+    from canvit.harness.tests.test_task_digests import _B
+    # No centring/scaling: the digest batch has _B = 2 trials, so the mask leaves ONE, and a
+    # batch-centred single reward is always 0 -- the control below would then be vacuous.
+    # (The masked statistics themselves are covered by the batch_* paths in the search task.)
+    rl = JointPolicyConfig(objective="pg", select_bn_eval=False, reward=reward, reward_center="none",
+                           reward_scale="none", width=16, block_layers=1, centers_per_axis=32)
+
+    def grads(task):
+        torch.manual_seed(1)
+        jp = _build(seg, rl, scorer_input_norm="none")
+        _rollout(seg, jp, task)
+        return torch.cat([p.grad.flatten() for p in jp.scorer.parameters() if p.grad is not None])
+
+    mask = torch.arange(_B) % 2 == 0
+    ones = torch.ones(_B)
+    base = grads(_MaskedTask(seg, mask=mask, bump=ones))
+    # the masked-out trials' rewards do not matter ...
+    assert torch.equal(base, grads(_MaskedTask(seg, mask=mask, bump=torch.where(mask, 1.0, 3.0))))
+    # ... the masked-in trials' do (so the check above is not vacuous)
+    assert not torch.equal(base, grads(_MaskedTask(seg, mask=mask, bump=torch.where(mask, 3.0, 1.0))))
+    # an all-true mask is the unmasked computation, bit for bit
+    unmasked = _MaskedTask(seg, mask=None, bump=ones)
+    del unmasked.reward_mask  # no attribute at all = the engine's historical call
+    assert torch.equal(grads(_MaskedTask(seg, mask=torch.ones(_B, dtype=torch.bool), bump=ones)),
+                       grads(unmasked))
+
+
+def test_masked_standardisation_uses_only_the_masked_in_rows(seg):
+    rl = JointPolicyConfig(objective="pg", select_bn_eval=False, reward="terminal", reward_center="batch_mean",
+                           reward_scale="batch_std", width=16, block_layers=1, centers_per_axis=32)
+    jp = _build(seg, rl, scorer_input_norm="none")
+    r = torch.tensor([1.0, 100.0, 3.0, -50.0, 5.0])
+    m = torch.tensor([True, False, True, False, True])
+    out = jp._standardize(1, r, m)
+    v = r[m]
+    assert torch.allclose(out[m], (v - v.mean()) / v.std(unbiased=False)) and torch.equal(out[~m], torch.zeros(2))
