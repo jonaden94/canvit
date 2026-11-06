@@ -9,7 +9,11 @@ reasoning behind each choice, are in `00-design.md`; this file only says what ex
 python -m canvit.harness.run search --cfg.model-repo <foveated CanViT .pt / HF dir> --cfg.run-group <group>
 ```
 
-SLURM: `slurm/runs/exp38_search_smoke/search-smoke.sh` (300-step smoke run, `TASK=search`).
+SLURM, both on a V100 (`jupyter` partition), in fp32 because V100 has no bfloat16:
+
+- `slurm/runs/exp38_search_smoke/search-smoke.sh`: 300-step smoke run.
+- `slurm/runs/exp39_search/search-v1-s0.sh`: the first training run, the defaults plus Haoze's
+  augmentations. Needs `TIME=` and `TRAIN_COMMIT=`.
 
 ## What the task does
 
@@ -116,7 +120,7 @@ Task config, `--cfg.<name>` (dashes, e.g. `--cfg.presence-loss ce`):
 | `hit_box_frac` | 0.1 | hit square side as a fraction of the scene |
 | `eval_policies` | random, greedy, policy | |
 | `batch_size` / `eval_batch_size` | 16 / 32 | |
-| `peak_lr` / `weight_decay` / `warmup_steps` | 1e-4 / 0.05 / 500 | task head, warmup + cosine |
+| `peak_lr` / `weight_decay` / `warmup_steps` | 1e-4 / 0.01 / 500 | task head, warmup + cosine (Haoze: one AdamW for everything, lr 1e-4, wd 0.01, cosine over 200 epochs, no warmup) |
 | `max_steps` / `val_every` / `viz_every` / `viz_samples` | 20000 / 500 / 500 / 4 | |
 
 Augmentation, `--cfg.aug.<name>`:
@@ -166,6 +170,7 @@ for search.
 - **Tests:** CPU only (tiny model, synthetic data in the real file format). The last full-suite
   run had 586 passed and 2 failures in a new test; those were fixed and re-run on their own.
   The real backbone loads and evaluates on CPU.
-- **GPU smoke run:** job 17122634 (exp38), queued; not yet run.
+- **GPU smoke run:** job 17122634 (A100) crashed at the first validation (the figure sliced the
+  batch but not the policy's stored canvas); fixed and re-submitted on a V100.
 - **Not built:** `null_cell` (one softmax over cells + "absent"); a policy reward on
   target-absent trials; a sampled-policy eval rule; the standalone `SearchEval`; DDP.

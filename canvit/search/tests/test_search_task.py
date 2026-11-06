@@ -142,7 +142,8 @@ def test_cli_builds_search_with_its_own_policy_defaults(fake_cs18):
 
 def test_viz_figures_are_written_for_training_and_every_eval_policy(fake_cs18, tmp_path):
     root, _ = fake_cs18
-    task = _TinyTask(_cfg(root, viz_every=2, viz_samples=2), rl=_rl())
+    # viz_samples < batch size: the figure slices the batch (job 17122634 crashed on that)
+    task = _TinyTask(replace(_cfg(root, viz_every=2, viz_samples=2), eval_batch_size=4), rl=_rl())
     settings = RunSettings(n_steps=2, eval_every=2, log_every=1, grad_clip=1.0, amp=False, seed=0,
                            device="cpu", tracker="none", viz_every=2, run_dir=tmp_path)
     run(task=task, spec=task.default_spec(), settings=settings)

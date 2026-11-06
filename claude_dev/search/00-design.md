@@ -278,7 +278,7 @@ fixations) and `policy_only` (frozen head) work through the existing spec machin
 |---|---|---|
 | scene / canvas | 512 px / 32×32 | canvit native |
 | batch size | 16 | ade20k's; 2163 samples ≈ 135 steps/epoch |
-| head optimiser | AdamW lr 1e-4, wd 0.05, warmup_cosine | Haoze's lr/wd |
+| head optimiser | AdamW lr 1e-4, wd 0.01, warmup_cosine | Haoze's lr/wd (his search config; 0.05 was his COCO-pretraining config, corrected 2026-11-06) |
 | policy optimiser | `JointPolicyConfig` defaults (lr 2e-4, wd 1e-2, betas 0.9/0.95) | existing recipe |
 | max steps / val every | 20000 / 500 | about 150 epochs; Haoze's search config sets 200 |
 | dropout | 0.0 (flag) | owner: not by default |

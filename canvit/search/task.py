@@ -280,6 +280,8 @@ class SearchRunTask:
         st = RecurrentState(canvas=state.canvas[:n], recurrent_cls=state.recurrent_cls[:n])
         enc = joint.policy_selector.encoder
         prev = enc.prev
+        # the encoder's rolling reference holds the whole batch; slice it to the n samples
+        enc.prev = (prev[0][:n], prev[1][:n] if prev[1] is not None else None)
         try:
             with torch.no_grad():
                 embed = self._policy_embed(model)
@@ -434,7 +436,10 @@ class SearchRunTask:
         "absent" on a target-absent one."""
         T = self.cfg.n_timesteps
         cg = self.canvas_grid(model)
-        amp = torch.autocast("cuda", dtype=torch.bfloat16) if device.type == "cuda" else nullcontext()
+        amp: Any = nullcontext()
+        if device.type == "cuda" and self.cfg.amp:  # the training loop's rule (harness/run.py)
+            dt = torch.bfloat16 if torch.cuda.get_device_capability(device) >= (8, 0) else torch.float16
+            amp = torch.autocast("cuda", dtype=dt)
         was_training = model.head.training
         model.head.eval()
         policies = [p for p in self.cfg.eval_policies if p != "policy" or joint is not None]

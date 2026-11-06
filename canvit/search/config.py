@@ -138,8 +138,8 @@ class SearchConfig:
     num_workers: int = 4
     peak_lr: float = 1e-4
     """Task head (Haoze: AdamW lr 1e-4)."""
-    weight_decay: float = 0.05
-    """Task head (Haoze: 0.05)."""
+    weight_decay: float = 0.01
+    """Task head (Haoze's search config: 0.01; his 0.05 is the COCO-pretraining config's)."""
     warmup_steps: int = 500
     max_steps: int = 20000
     grad_clip: float = 1.0
