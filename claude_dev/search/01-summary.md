@@ -31,10 +31,13 @@ SLURM, both on a V100 (`jupyter` partition), in fp32 because V100 has no bfloat1
 
 ## Data (`data.py`)
 
-- **Target-present:** `images/<cat>/`, boxes from `coco_search18_fixations_TP_*_split{1,2}.json`,
+- **Dataset:** the padded release (Haoze's setting) at `datasets/coco_search18`, in its
+  restructured layout of 2026-11-06 (the only one supported): all images in a flat `images/`,
+  the JSONs in `fixations/`. The 18 classes are a fixed list (`COCO_SEARCH18_CLASSES`).
+- **Target-present:** boxes from `fixations/coco_search18_fixations_TP_*_split{1,2}.json`,
   deduplicated over the 10 subjects: 2163 train / 326 val pairs.
-- **Target-absent:** `coco_search18_images_TA/<cat>/` + `coco_search18_fixations_TA_trainval.json`:
-  2163 / 326 pairs. Only for split 1.
+- **Target-absent:** `fixations/coco_search18_fixations_TA_trainval.json`: 2163 / 326 pairs.
+  Only for split 1.
 - **Batches:** a batch dict holds `image`, `target` (cue), `boxes` (xyxy in [-1, 1], NaN padded)
   and `present`.
 - **Augmentation:** default is h-flip plus a random crop that always keeps the whole target

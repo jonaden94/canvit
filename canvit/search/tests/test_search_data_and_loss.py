@@ -48,7 +48,7 @@ def test_conflicting_boxes_are_refused(fake_cs18, tmp_path):
     root, _ = fake_cs18
     bad = tmp_path / "cs18"
     shutil.copytree(root, bad)
-    path = bad / "coco_search18_fixations_TP_train_split1.json"
+    path = bad / "fixations" / "coco_search18_fixations_TP_train_split1.json"
     recs = json.loads(path.read_text())
     recs[1]["bbox"] = [1.0, 2.0, 3.0, 4.0]  # subject 2 of pair 0 disagrees
     path.write_text(json.dumps(recs))
@@ -191,7 +191,7 @@ def test_target_absent_records_and_samples(fake_cs18):
     tp = load_records(SearchConfig(data_root=root, condition="tp"), "train", classes)
     ta = [r for r in both if r.bbox_xywh is None]
     assert len(tp) == 6 and len(ta) == 6 and len(both) == 12  # 3 subjects deduplicated
-    assert all("coco_search18_images_TA" in str(r.path) for r in ta)
+    assert all(r.path.parent == root / "images" and r.path.name.startswith("ta_") for r in ta)
     assert [r.bbox_xywh is None for r in both[:4]] == [False, True, False, True]  # interleaved
     ds = SearchDataset(ta, scene_size=S, aug=SearchAugConfig(crop=True))
     s = ds[0]
@@ -221,3 +221,11 @@ def test_presence_loss_matches_haozes_two_way_ce_and_focal():
     assert torch.allclose(presence_loss(logit, present, kind="ce", gamma=2.0), ce2, atol=1e-6)
     pt = torch.exp(-ce2)
     assert torch.allclose(presence_loss(logit, present, kind="focal", gamma=2.0), (1 - pt) ** 2 * ce2, atol=1e-6)
+
+
+def test_the_original_release_layout_is_refused(tmp_path):
+    """Only the restructured layout (flat images/, fixations/) is supported; a root in the
+    release's original layout (per-task image folders, JSONs in the root) fails by name."""
+    (tmp_path / "images" / "bottle").mkdir(parents=True)
+    with pytest.raises(FileNotFoundError, match="ORIGINAL release layout"):
+        coco_search18_classes(tmp_path)

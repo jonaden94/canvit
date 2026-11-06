@@ -69,13 +69,14 @@ class SearchAugConfig:
 class SearchConfig:
     # --- data ------------------------------------------------------------------
     data_root: Path = field(default_factory=_default_data_root)
-    """COCO-Search18 root: ``images/<category>/<name>.jpg`` + the fixation JSONs."""
+    """COCO-Search18 root in the restructured layout: ``images/<name>.jpg`` (flat) +
+    ``fixations/*.json`` (``data.py``). The padded release (Haoze's setting), not ``_nopadding``."""
     split: Literal[1, 2] = 1
     """The dataset's ``split1`` (the paper's) or ``split2`` train/valid assignment."""
     condition: Literal["tp", "both"] = "both"
     """``both`` (Haoze's default): every target-present AND every target-absent (image, cue)
     pair, about 50/50; adds the presence readout and its loss. ``tp``: target-present only.
-    The target-absent images live in ``coco_search18_images_TA/<category>/`` under ``data_root``."""
+    All images live in ``data_root/images/`` (the restructured layout, see ``data.py``)."""
     scene_size: int = 512
     """Square scene side in px; the 1680x1050 images are letterboxed into it."""
     aug: SearchAugConfig = field(default_factory=SearchAugConfig)

@@ -15,9 +15,18 @@ the TP fixation JSONs hold one record per (subject, trial), 10 subjects per
 (image, target) pair, with the same target bbox ``[x, y, w, h]`` (1680x1050 px) for every
 subject -- so the records are deduplicated on ``(name, task)``. The target-absent (TA)
 trials are ``coco_search18_fixations_TA_trainval.json`` (no bbox; a ``split`` field with the
-same 2163 train / 326 valid pairs as TP split1) and their images are a separate download,
-``COCOSearch18-images-TA.zip``, extracted to ``coco_search18_images_TA/<category>/``
+same 2163 train / 326 valid pairs as TP split1) and their images are a separate download
 (checked 2026-11-06: all 2489 train/valid TA pairs present, 1680x1050 like TP).
+
+ON-DISK LAYOUT (only this one is supported): the RESTRUCTURED release of 2026-11-06 (see
+``README.md`` in the dataset root):
+
+    images/<name>.jpg      all 5317 padded 1680x1050 images, TP and TA, one flat folder
+    fixations/coco_search18_fixations_{TP_{train,valid}_split{1,2},TA_trainval}.json
+
+The release's per-task folders (``images/<task>/``, ``coco_search18_images_TA/<task>/``)
+held byte-identical copies under the same names, so a name identifies the image; whether
+it is target-present depends on the (image, task) pair, which the fixation files give.
 """
 
 from __future__ import annotations
@@ -50,17 +59,38 @@ class SearchRecord:
     bbox_xywh: tuple[float, float, float, float] | None  # image pixels; None = target absent
 
 
+COCO_SEARCH18_CLASSES = (
+    "bottle", "bowl", "car", "chair", "clock", "cup", "fork", "keyboard", "knife", "laptop",
+    "microwave", "mouse", "oven", "potted plant", "sink", "stop sign", "toilet", "tv",
+)
+"""The 18 target categories, sorted: a class's index is its position. Fixed by the dataset;
+the same order the release's per-task folders sorted to, so indices are unchanged."""
+
+
 def coco_search18_classes(root: Path) -> list[str]:
-    """The 18 target categories, sorted (= the ``images/`` subfolders)."""
-    classes = sorted(p.name for p in (root / "images").iterdir() if p.is_dir())
-    assert len(classes) == 18, f"expected 18 COCO-Search18 categories under {root}/images, got {classes}"
-    return classes
+    """The 18 target categories (``COCO_SEARCH18_CLASSES``), after checking that ``root`` has
+    the restructured layout -- the release's original layout is refused by name."""
+    if not (root / "fixations").is_dir():
+        hint = (" It looks like the ORIGINAL release layout (per-task image folders, JSONs in "
+                "the root), which is no longer supported." if (root / "images" / "bottle").is_dir() else "")
+        raise FileNotFoundError(f"{root}/fixations/ not found: expected the restructured COCO-Search18 "
+                                f"layout (flat images/, fixations/; see the dataset's README.md).{hint}")
+    return list(COCO_SEARCH18_CLASSES)
+
+
+def _image_paths(root: Path, pairs, kind: str) -> list[Path]:
+    """``images/<name>`` for each (name, task); refuses missing files up front."""
+    paths = [root / "images" / name for name, _ in pairs]
+    missing = [p for p in paths if not p.exists()]
+    if missing:
+        raise FileNotFoundError(f"{len(missing)} {kind} images missing from {root}/images/, e.g. {missing[0]}")
+    return paths
 
 
 def load_coco_search18(root: Path, *, split: int, part: str, classes: list[str]) -> list[SearchRecord]:
     """The unique (image, target) pairs of ``coco_search18_fixations_TP_{part}_split{split}.json``.
     Refuses a pair whose bbox differs between subjects (it would make the target ambiguous)."""
-    path = root / f"coco_search18_fixations_TP_{part}_split{split}.json"
+    path = root / "fixations" / f"coco_search18_fixations_TP_{part}_split{split}.json"
     trials = json.loads(path.read_text())
     cls_idx = {c: i for i, c in enumerate(classes)}
     by_pair: dict[tuple[str, str], tuple[float, ...]] = {}
@@ -70,15 +100,13 @@ def load_coco_search18(root: Path, *, split: int, part: str, classes: list[str])
         prev = by_pair.setdefault(key, bbox)
         if prev != bbox:
             raise ValueError(f"{path.name}: {key} has two different target boxes {prev} vs {bbox}")
-    records = [SearchRecord(path=root / "images" / task / name, target=cls_idx[task],
-                            bbox_xywh=bbox)  # type: ignore[arg-type]
-               for (name, task), bbox in sorted(by_pair.items())]
+    pairs = sorted(by_pair.items())
+    paths = _image_paths(root, [k for k, _ in pairs], "target-present")
+    records = [SearchRecord(path=path, target=cls_idx[task], bbox_xywh=bbox)  # type: ignore[arg-type]
+               for path, ((_, task), bbox) in zip(paths, pairs)]
     log.info("COCO-Search18 split%d %s: %d trials -> %d (image, target) pairs",
              split, part, len(trials), len(records))
     return records
-
-
-TA_IMAGE_DIR = "coco_search18_images_TA"
 
 
 def load_coco_search18_ta(root: Path, *, split: int, part: str, classes: list[str]) -> list[SearchRecord]:
@@ -89,16 +117,13 @@ def load_coco_search18_ta(root: Path, *, split: int, part: str, classes: list[st
     if split != 1:
         raise ValueError("the target-absent trials come with split1's train/valid assignment only; "
                          "use --cfg.split 1 or --cfg.condition tp")
-    path = root / "coco_search18_fixations_TA_trainval.json"
+    path = root / "fixations" / "coco_search18_fixations_TA_trainval.json"
     trials = [tr for tr in json.loads(path.read_text()) if tr["split"] == part]
     cls_idx = {c: i for i, c in enumerate(classes)}
     pairs = sorted({(tr["name"], tr["task"]) for tr in trials})
-    records = [SearchRecord(path=root / TA_IMAGE_DIR / task / name, target=cls_idx[task], bbox_xywh=None)
-               for name, task in pairs]
-    missing = [r.path for r in records if not r.path.exists()]
-    if missing:
-        raise FileNotFoundError(f"{len(missing)} target-absent images missing, e.g. {missing[0]} -- extract "
-                                f"COCOSearch18-images-TA.zip into {root}")
+    paths = _image_paths(root, pairs, "target-absent")
+    records = [SearchRecord(path=path, target=cls_idx[task], bbox_xywh=None)
+               for path, (_, task) in zip(paths, pairs)]
     log.info("COCO-Search18 TA %s: %d trials -> %d (image, target) pairs", part, len(trials), len(records))
     return records
 
