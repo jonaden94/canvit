@@ -72,26 +72,42 @@ policy) → 1×1 conv to one logit per cell. Presence: mean-pool the last featur
   - `random`: seeded random fixations.
   - `greedy`: the heatmap argmax, never revisiting a cell.
   - `policy`: the learned policy's argmax.
-- **Metrics,** per glimpse t (`…_t{t}_{rule}`) and at the last glimpse (`…_final_{rule}`):
+- **Metrics,** keyed `<metric>_t<t>_<rule>` (X = `overlap_box_frac` × 100, default 10):
 
 | metric | over | meaning |
 |---|---|---|
+| `found` | target-present | the task head's argmax after glimpse t lies inside the target box |
+| `found_X_percent` | target-present | a square of side X % of the scene around that argmax overlaps the box (GVSM's fixation box; Haoze's old rule) |
+| `hit` | target-present | some fixation 0..t (t0, the centre, included) lies inside the box |
+| `hit_X_percent` | target-present | some fixation 0..t has its X % square overlapping the box |
+| `correct_<one of the four>` | all | present: located by that criterion and judged "present"; absent: judged "absent" |
 | `loss` | target-present | heatmap KL |
-| `hit` | target-present | square of 10% of the scene side around the heatmap argmax overlaps the box (Haoze) |
-| `presence_acc`, `recall`, `specificity`, `precision`, `f1` | all / present / absent | presence at p > 0.5 |
-| `correct` | all | present: hit and "present"; absent: "absent" |
+| `presence_acc`, `recall`, `specificity`, `precision`, `f1` | all / present / absent / … | presence at p > 0.5 |
 
-- **Best checkpoint:** `hit_final_policy`.
+- **Where they go:**
+  - `{run_dir}/eval.jsonl`: every metric at every glimpse, one line per validation.
+  - W&B `eval/`: `loss`, `found`, `hit`, `correct_found`, `presence_acc` at every glimpse;
+    the rest at the last glimpse only.
+  - W&B `overview/` (20 panels, last glimpse, same names as in `eval/`): `found` and
+    `hit` and their X % versions for all three rules, `correct_found` (+ X %) for random
+    and policy, `presence_acc` and `loss` for the policy, and `found_gain_…_policy_vs_random`
+    (+ X %).
+- **Best checkpoint:** `found` at the last glimpse under the policy (`found_t3_policy`).
 
 ## Figures (every 500 steps, `viz.py`)
 
 - **Where:** `{run_dir}/visualization/search_train/` (a training rollout) and
   `search_val_{random,greedy,policy}/` (the first val batch).
-- **Layout:** for 4 samples, one column per glimpse and these rows:
-  1. fixations so far + the hit square + p(present);
-  2. the policy distribution that chose this fixation;
-  3. the task heatmap;
+- **Layout:** 6 samples as blocks in two rows: 3 target-present on top (green tint), 3
+  target-absent below (orange tint), each titled with its cue. A block has one column per
+  glimpse and these rows, each with the scanpath (white; current fixation = teal dot):
+  1. fixations: the task head's argmax as a cross (green = `found`, yellow = only
+     `found_X_percent`, red = neither, orange = target absent) and p(present);
+  2. the policy distribution that chose this fixation, with its entropy;
+  3. the task heatmap after this glimpse, with its KL;
   4. a PCA of the canvas.
+- Heatmaps are probabilities (softmax over the 32×32 cells), each panel scaled to its own
+  maximum.
 
 ## Options
 
@@ -117,11 +133,11 @@ Task config, `--cfg.<name>` (dashes, e.g. `--cfg.presence-loss ce`):
 | `presence_loss` | `focal` | `ce` |
 | `presence_focal_gamma` | 2.0 | |
 | `presence_weight` | 0.75 | |
-| `hit_box_frac` | 0.1 | hit square side as a fraction of the scene |
+| `overlap_box_frac` | 0.1 | square side (fraction of the scene) of `found_X_percent` / `hit_X_percent`; X follows it |
 | `eval_policies` | random, greedy, policy | |
 | `batch_size` / `eval_batch_size` | 16 / 32 | |
 | `peak_lr` / `weight_decay` / `warmup_steps` | 1e-4 / 0.01 / 500 | task head, warmup + cosine (Haoze: one AdamW for everything, lr 1e-4, wd 0.01, cosine over 200 epochs, no warmup) |
-| `max_steps` / `val_every` / `viz_every` / `viz_samples` | 20000 / 500 / 500 / 4 | |
+| `max_steps` / `val_every` / `viz_every` / `viz_samples` | 20000 / 500 / 500 / 6 | |
 
 Augmentation, `--cfg.aug.<name>`:
 
@@ -172,6 +188,7 @@ for search.
   The real backbone loads and evaluates on CPU.
 - **GPU smoke run:** job 17122634 (A100) crashed at the first validation (the figure sliced the
   batch but not the policy's stored canvas); fixed. Re-run on a V100 (job 17131243) passed: 300 steps
-  in 8 min, hit_final_policy 0.10 -> 0.64 by step 200, figures written.
+  in 8 min, hit_final_policy (now `found_10_percent_t3_policy`) 0.10 -> 0.64 by step 200,
+  figures written.
 - **Not built:** `null_cell` (one softmax over cells + "absent"); a policy reward on
   target-absent trials; a sampled-policy eval rule; the standalone `SearchEval`; DDP.

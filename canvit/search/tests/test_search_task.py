@@ -63,7 +63,7 @@ def test_joint_search_trains_end_to_end(fake_cs18, embedding):
     # the policy actually trained: its FiLM generators left their zero init
     gen = task._joint.scorer.film_in.gen.net[-1].weight
     assert gen.abs().sum() > 0
-    assert task.best_metric == "hit_final_policy"
+    assert task.best_metric == "found_t2_policy"  # n_timesteps 3
 
 
 def test_evaluate_reports_all_policies(fake_cs18):
@@ -75,17 +75,64 @@ def test_evaluate_reports_all_policies(fake_cs18):
     model.canvit.eval()
     val = task.build_val_loader()
     a = task.evaluate(model=model, head=head, val_loader=val, device=torch.device("cpu"), step=0, joint=joint)
+    every = ("loss", "found", "hit", "correct_found", "presence_acc")  # logged at every glimpse
+    last_only = ("found_10_percent", "hit_10_percent", "correct_found_10_percent", "correct_hit",
+                 "correct_hit_10_percent", "recall", "specificity", "precision", "f1")
     for p in ("random", "greedy", "policy"):
         for t in range(3):
-            assert 0.0 <= a[f"hit_t{t}_{p}"] <= 1.0 and a[f"loss_t{t}_{p}"] >= 0.0
-            for k in ("presence_acc", "recall", "specificity", "precision", "f1", "correct"):
-                assert 0.0 <= a[f"{k}_t{t}_{p}"] <= 1.0, k
+            for k in every:
+                assert 0.0 <= a[f"{k}_t{t}_{p}"] <= (1.0 if k != "loss" else float("inf")), k
+            for k in last_only:
+                assert (f"{k}_t{t}_{p}" in a) is (t == 2), (k, t)
+        for k in last_only:
+            assert 0.0 <= a[f"{k}_t2_{p}"] <= 1.0, k
         assert a[f"loss_t0_{p}"] > 0  # averaged over the target-present trials only
+    assert not any("_final" in k or "fixhit" in k for k in a)
     # t0 is the same centred fixation for every policy
     assert a["loss_t0_random"] == pytest.approx(a["loss_t0_greedy"]) == pytest.approx(a["loss_t0_policy"])
     # seeded: a second evaluation reproduces the random policy exactly
     b = task.evaluate(model=model, head=head, val_loader=val, device=torch.device("cpu"), step=0, joint=joint)
-    assert a["loss_final_random"] == b["loss_final_random"]
+    assert a["loss_t2_random"] == b["loss_t2_random"]
+
+
+def test_eval_writes_every_metric_to_jsonl_and_an_overview_to_the_tracker(fake_cs18, tmp_path):
+    import json
+    root, _ = fake_cs18
+    task = _TinyTask(_cfg(root, viz_every=0), rl=_rl())
+    model, head = task.build_model(torch.device("cpu"))
+    joint = task.build_policy(model, device=torch.device("cpu"), canvas_grid=32,
+                              generator=torch.Generator().manual_seed(0))
+    model.canvit.eval()
+
+    class _Tracker:
+        logged: dict = {}
+
+        def log_metrics(self, m, step=None):
+            self.logged.update(m)
+
+    tr = _Tracker()
+    a = task.evaluate(model=model, head=head, val_loader=task.build_val_loader(), device=torch.device("cpu"),
+                      step=7, joint=joint, tracker=tr, run_dir=tmp_path)
+    rows = [json.loads(line) for line in (tmp_path / "eval.jsonl").read_text().splitlines()]
+    assert len(rows) == 1 and rows[0]["step"] == 7
+    full = rows[0]
+    assert all(full[k] == v for k, v in a.items())  # the logged subset is a subset of the file
+    for p in ("random", "greedy", "policy"):
+        for t in range(3):  # every metric, every glimpse
+            for k in ("found_10_percent", "hit_10_percent", "correct_hit", "f1"):
+                assert f"{k}_t{t}_{p}" in full
+            # strict <= lenient; hit accumulates over the fixations (t0 included)
+            assert full[f"found_t{t}_{p}"] <= full[f"found_10_percent_t{t}_{p}"]
+            assert full[f"hit_t{t}_{p}"] <= full[f"hit_10_percent_t{t}_{p}"]
+            if t:
+                assert full[f"hit_t{t}_{p}"] >= full[f"hit_t{t - 1}_{p}"]
+        assert full[f"hit_t0_{p}"] == full["hit_t0_random"]  # t0 is the same centre for all
+    ov = {k.removeprefix("overview/"): v for k, v in tr.logged.items()}
+    assert all(k.startswith("overview/") for k in tr.logged) and len(ov) == 20
+    assert ov["found_gain_t2_policy_vs_random"] == pytest.approx(full["found_t2_policy"] - full["found_t2_random"])
+    for k in ("found_t2_greedy", "hit_10_percent_t2_policy", "correct_found_t2_random",
+              "presence_acc_t2_policy", "loss_t2_policy"):
+        assert ov[k] == full[k], k
 
 
 def test_inline_reward_with_last_only_supervision_is_refused(fake_cs18):
@@ -220,4 +267,4 @@ def test_target_present_only_runs_without_a_presence_head(fake_cs18):
     model.canvit.eval()
     a = task.evaluate(model=model, head=head, val_loader=task.build_val_loader(), device=torch.device("cpu"),
                       step=0, joint=None)
-    assert "presence_acc_final_random" not in a and a["correct_final_random"] == a["hit_final_random"]
+    assert "presence_acc_t2_random" not in a and a["correct_found_t2_random"] == a["found_t2_random"]

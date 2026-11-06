@@ -87,15 +87,33 @@ def argmax_centres(logits: Tensor) -> Tensor:
     return torch.stack([c[idx % g], c[idx // g]], dim=-1)
 
 
-def hit(logits: Tensor, boxes: Tensor, *, box_frac: float) -> Tensor:
-    """[B] bool: does a square of side ``box_frac`` x scene around the heatmap argmax
-    intersect any target box? Haoze's ``check_box_intersection`` with threshold 0 (any
-    overlap counts), with his 64 px box at 640 px expressed as a fraction (0.1)."""
-    p = argmax_centres(logits)  # [B, 2]
-    half = box_frac  # side box_frac * 2 in [-1, 1] units -> half-side box_frac
-    fx0, fy0, fx1, fy1 = p[:, 0] - half, p[:, 1] - half, p[:, 0] + half, p[:, 1] + half
+def percent_label(box_frac: float) -> str:
+    """The metric-name suffix of the lenient criterion: 0.1 -> ``10_percent``."""
+    return f"{box_frac * 100:g}_percent"
+
+
+def inside_box(points: Tensor, boxes: Tensor) -> Tensor:
+    """[B] bool: does each point (x, y) lie inside any of its target boxes (edges count)?
+    The strict criterion (``found`` / ``hit``). Rows whose boxes are all NaN (target
+    absent) are never inside."""
+    x, y = points[:, 0, None], points[:, 1, None]
     valid = ~torch.isnan(boxes).any(-1)
     b = torch.nan_to_num(boxes)
-    ix = (torch.minimum(fx1[:, None], b[..., 2]) - torch.maximum(fx0[:, None], b[..., 0])).clamp_min(0)
-    iy = (torch.minimum(fy1[:, None], b[..., 3]) - torch.maximum(fy0[:, None], b[..., 1])).clamp_min(0)
+    inside = (x >= b[..., 0]) & (x <= b[..., 2]) & (y >= b[..., 1]) & (y <= b[..., 3])
+    return (inside & valid).any(-1)
+
+
+def square_overlaps_box(points: Tensor, boxes: Tensor, *, box_frac: float) -> Tensor:
+    """[B] bool: does a square of side ``box_frac`` x scene centred on each point (x, y)
+    overlap any of its target boxes with positive area? The lenient criterion
+    (``found_X_percent`` / ``hit_X_percent``): Haoze's ``check_box_intersection`` with
+    threshold 0, i.e. GVSM's fixation box (64 px at 640 = 0.1). Rows whose boxes are all
+    NaN (target absent) never overlap."""
+    assert box_frac > 0, "a zero-size square never overlaps with positive area; use inside_box"
+    half = box_frac  # side box_frac * 2 in [-1, 1] units -> half-side box_frac
+    px, py = points[:, 0, None], points[:, 1, None]
+    valid = ~torch.isnan(boxes).any(-1)
+    b = torch.nan_to_num(boxes)
+    ix = (torch.minimum(px + half, b[..., 2]) - torch.maximum(px - half, b[..., 0])).clamp_min(0)
+    iy = (torch.minimum(py + half, b[..., 3]) - torch.maximum(py - half, b[..., 1])).clamp_min(0)
     return ((ix * iy > 0) & valid).any(-1)

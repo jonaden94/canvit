@@ -126,9 +126,12 @@ class SearchConfig:
     """Fixation policies run at every validation. ``random``: seeded random fixations.
     ``greedy``: the argmax of the current task heatmap, never revisiting a cell.
     ``policy``: the learned scorer's argmax (skipped when no policy is trained)."""
-    hit_box_frac: float = 0.1
-    """Haoze's hit criterion: a square box of this fraction of the scene side (64 px at 640)
-    around the heatmap argmax must intersect a target box."""
+    overlap_box_frac: float = 0.1
+    """Side of the square drawn around a point, as a fraction of the scene side, for the
+    lenient metrics ``found_X_percent`` (the task head's argmax) and ``hit_X_percent`` (the
+    fixations): a success if the square overlaps the target box. X follows this value
+    (0.1 -> ``found_10_percent``). 0.1 = GVSM's fixation box / Haoze (64 px at 640). The
+    strict ``found`` / ``hit`` (point inside the box) do not depend on it."""
     eval_seed: int = 1234
     limit_val_batches: int | None = None
 
@@ -153,7 +156,8 @@ class SearchConfig:
     viz_every: int = 500
     """Figures (``viz.py``) of a training rollout every N steps, and of the first val batch
     under each eval policy at validations that fall on a multiple of N. 0 = off."""
-    viz_samples: int = 4
+    viz_samples: int = 6
+    """Samples per figure: half target-present (top row of blocks), half target-absent."""
     device: str = "cuda"
     amp: bool = True
     seed: int = 0

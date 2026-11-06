@@ -15,7 +15,14 @@ from canvit.search.data import (
     letterbox_hw,
     load_coco_search18,
 )
-from canvit.search.loss import argmax_centres, hit, per_image_loss, target_map
+from canvit.search.loss import (
+    argmax_centres,
+    inside_box,
+    per_image_loss,
+    percent_label,
+    square_overlaps_box,
+    target_map,
+)
 
 S = 512
 
@@ -149,17 +156,27 @@ def test_multiple_boxes_share_the_mass():
     assert (t > 0).sum() == 2 and torch.allclose(t[t > 0], torch.tensor([0.5, 0.5]))
 
 
-def test_hit_criterion():
-    boxes = _box(0.5, 0.5, half=0.02)
+def test_localisation_criteria():
+    """``inside_box`` (strict) and ``square_overlaps_box`` (Haoze / GVSM: a square of side
+    box_frac x scene around the point overlaps the box with positive area)."""
+    box = torch.tensor([[[0.0, 0.0, 0.2, 0.2]]])  # one box, [-1, 1] units
+    pt = lambda x, y: torch.tensor([[x, y]])  # noqa: E731
+    assert inside_box(pt(0.1, 0.1), box).item() and inside_box(pt(0.2, 0.0), box).item()  # edges count
+    assert not inside_box(pt(0.25, 0.1), box).item()
+    # square of side 0.1 x scene = half-side 0.1 in [-1, 1] units
+    assert square_overlaps_box(pt(0.25, 0.1), box, box_frac=0.1).item()
+    assert not square_overlaps_box(pt(0.31, 0.1), box, box_frac=0.1).item()
+    assert not square_overlaps_box(pt(0.30, 0.1), box, box_frac=0.1).item()  # touching = zero area
+    with pytest.raises(AssertionError, match="inside_box"):
+        square_overlaps_box(pt(0.1, 0.1), box, box_frac=0.0)
+    assert percent_label(0.1) == "10_percent" and percent_label(0.125) == "12.5_percent"
+    # the task head's argmax: the cell centre of the hottest cell
     logits = torch.full((1, G, G), -10.0)
-    iy, ix = math.floor((0.5 + 1) / 2 * G), math.floor((0.5 + 1) / 2 * G)
+    iy = ix = math.floor((0.1 + 1) / 2 * G)
     logits[0, iy, ix] = 10.0
-    assert hit(logits, boxes, box_frac=0.1).item()
-    far = torch.full((1, G, G), -10.0)
-    far[0, 0, 0] = 10.0
-    assert not hit(far, boxes, box_frac=0.1).item()
-    c = argmax_centres(logits)[0]
-    assert abs(c[0] - 0.5) < 2 / G and abs(c[1] - 0.5) < 2 / G
+    c = argmax_centres(logits)
+    assert inside_box(c, box).item()
+    assert abs(c[0, 0] - 0.1) < 2 / G and abs(c[0, 1] - 0.1) < 2 / G
 
 
 # --------------------------------------------------------------------------- #
@@ -189,7 +206,8 @@ def test_target_absent_row_has_zero_target_and_zero_kl():
     assert tm[0].sum().item() == pytest.approx(1.0) and tm[1].abs().sum().item() == 0.0
     kl = per_image_loss(torch.randn(2, G, G), tm)
     assert kl[1].item() == 0.0 and kl[0].item() > 0
-    assert not hit(torch.randn(2, G, G), boxes, box_frac=0.1)[1]
+    centres = argmax_centres(torch.randn(2, G, G))
+    assert not inside_box(centres, boxes)[1] and not square_overlaps_box(centres, boxes, box_frac=0.1)[1]
 
 
 def test_presence_loss_matches_haozes_two_way_ce_and_focal():

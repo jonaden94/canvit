@@ -8,7 +8,7 @@
 # Everything else is the search defaults: frozen backbone, task head + policy trained
 # jointly, condition=both. Design: claude_dev/search/00-design.md.
 #
-# What to check in the log: train total_loss falls; every validation prints loss_t*/hit_t*
+# What to check in the log: train total_loss falls; every validation prints loss_t*/found_t*/hit_t*
 # and the presence metrics for all three fixation rules; PNGs appear under
 # logs/$RUN_GROUP/$RUN_NAME/visualization/. No tracker (tracker=none): the numbers are in
 # the job log only.

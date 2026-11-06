@@ -25,7 +25,16 @@ from canvit.harness.rollout.selector import RandomSelector
 from canvit.harness.rollout.viewpoint import ViewpointType
 
 from .config import SearchConfig, search_policy_config
-from .loss import box_centres, hit, per_image_loss, presence_loss, target_map
+from .loss import (
+    argmax_centres,
+    box_centres,
+    inside_box,
+    per_image_loss,
+    percent_label,
+    presence_loss,
+    square_overlaps_box,
+    target_map,
+)
 
 log = logging.getLogger(__name__)
 
@@ -118,9 +127,10 @@ class SearchRunTask:
 
     @property
     def best_metric(self) -> str:
-        """Last-glimpse hit rate under the learned policy, or under random fixations when no
-        policy is trained (``--preset probe``)."""
-        return "hit_final_policy" if self._joint is not None else "hit_final_random"
+        """Last-glimpse ``found`` (the task head's argmax inside the target box) under the
+        learned policy, or under random fixations when no policy is trained (``--preset probe``)."""
+        last = self.cfg.n_timesteps - 1
+        return f"found_t{last}_policy" if self._joint is not None else f"found_t{last}_random"
 
     # --- capabilities & defaults ------------------------------------------
     def caps(self):
@@ -271,53 +281,70 @@ class SearchRunTask:
         return bound
 
     # --- visualization (canvit/search/viz.py) ------------------------------
-    def _policy_logits(self, model, joint, state: RecurrentState, targets: Tensor) -> Tensor:
-        """[n, Gp, Gp] scorer logits on ``state`` for the first ``n = len(targets)`` samples:
-        the distribution the policy draws the NEXT fixation from. The scorer is deterministic
+    def _viz_index(self, boxes: Tensor) -> Tensor:
+        """The batch rows the figure shows: up to ``viz_samples // 2`` target-present rows,
+        then up to as many target-absent rows (the figure's top and bottom half); a kind
+        the batch lacks is filled up from the other. ``condition='tp'``: the first
+        ``viz_samples`` rows."""
+        n = min(self.cfg.viz_samples, boxes.shape[0])
+        present = box_centres(boxes)[1].any(-1)
+        tp = present.nonzero().flatten()
+        ta = (~present).nonzero().flatten()
+        if self.cfg.condition != "both":
+            return torch.arange(n, device=boxes.device)
+        k_tp = min(len(tp), max(n // 2, n - len(ta)))
+        return torch.cat([tp[:k_tp], ta[:n - k_tp]])
+
+    def _policy_logits(self, model, joint, state: RecurrentState, targets: Tensor, idx: Tensor) -> Tensor:
+        """[n, Gp, Gp] scorer logits on ``state`` for the batch rows ``idx``: the
+        distribution the policy draws the NEXT fixation from. The scorer is deterministic
         (no BatchNorm, no dropout), so this equals the selector's own forward. The encoder's
         rolling reference is restored, so a mid-rollout call cannot shift later features."""
-        n = targets.shape[0]
-        st = RecurrentState(canvas=state.canvas[:n], recurrent_cls=state.recurrent_cls[:n])
+        st = RecurrentState(canvas=state.canvas[idx], recurrent_cls=state.recurrent_cls[idx])
         enc = joint.policy_selector.encoder
         prev = enc.prev
-        # the encoder's rolling reference holds the whole batch; slice it to the n samples
-        enc.prev = (prev[0][:n], prev[1][:n] if prev[1] is not None else None)
+        # the encoder's rolling reference holds the whole batch (or the batch-1 init
+        # template at t0, which broadcasts); select the same rows
+        enc.prev = tuple(None if x is None else x if x.shape[0] == 1 else x[idx] for x in prev)
         try:
             with torch.no_grad():
                 embed = self._policy_embed(model)
                 assert embed is not None
-                scores = joint.scorer(enc(st).float(), cond=embed(targets))
+                scores = joint.scorer(enc(st).float(), cond=embed(targets[idx]))
         finally:
             enc.prev = prev
         g = int(round(scores[0].numel() ** 0.5))
-        return scores.reshape(n, g, g).float()
+        return scores.reshape(len(idx), g, g).float()
 
-    def _viz_capture(self, model, *, hidden, logits, presence, state, centers, targets, joint) -> dict:
-        """One glimpse of the figure for the first ``viz_samples`` samples, on CPU."""
-        n = min(self.cfg.viz_samples, hidden.shape[0])
-        return {"center": centers[:n].detach().float().cpu(),
-                "logits": logits[:n].detach().float().cpu(),
-                "presence": presence[:n].detach().float().cpu() if presence is not None else None,
-                "canvas": hidden[:n].detach().float().cpu(),
-                "policy_next": (self._policy_logits(model, joint, state, targets[:n]).cpu()
+    def _viz_capture(self, model, *, hidden, logits, presence, state, centers, targets, joint,
+                     idx: Tensor) -> dict:
+        """One glimpse of the figure for the batch rows ``idx`` (``_viz_index``), on CPU.
+        ``logits`` / ``presence`` are already restricted to those rows."""
+        return {"idx": idx.cpu(),
+                "center": centers[idx].detach().float().cpu(),
+                "logits": logits.detach().float().cpu(),
+                "presence": presence.detach().float().cpu() if presence is not None else None,
+                "canvas": hidden[idx].detach().float().cpu(),
+                "policy_next": (self._policy_logits(model, joint, state, targets, idx).cpu()
                                 if joint is not None else None)}
 
     def _episode(self, frames: list[dict], *, images, boxes, targets, present):
         from .viz import SearchEpisode
-        n = frames[0]["center"].shape[0]
+        idx = frames[0]["idx"]
+        images, boxes, targets, present = (x.cpu()[idx] for x in (images, boxes, targets, present))
         policy = None
         if frames[0]["policy_next"] is not None:
             nxt = torch.stack([f["policy_next"] for f in frames])  # nxt[t] chose fixation t+1
             policy = torch.cat([torch.full_like(nxt[:1], float("nan")), nxt[:-1]])
         names = self._classes()
         return SearchEpisode(
-            images=images[:n].cpu(), boxes=boxes[:n].cpu(), targets=[names[int(k)] for k in targets[:n]],
+            images=images, boxes=boxes, targets=[names[int(k)] for k in targets],
             centers=torch.stack([f["center"] for f in frames]), logits=torch.stack([f["logits"] for f in frames]),
             canvas=torch.stack([f["canvas"] for f in frames]), policy=policy,
-            present=present[:n].cpu().bool(),
+            present=present.bool(),
             presence=(torch.stack([f["presence"] for f in frames]) if frames[0]["presence"] is not None
                       else None),
-            hit_box_frac=self.cfg.hit_box_frac, loss_kind=self.cfg.loss, sigma=self.cfg.target_sigma)
+            overlap_box_frac=self.cfg.overlap_box_frac, loss_kind=self.cfg.loss, sigma=self.cfg.target_sigma)
 
     def _save_episode(self, frames, *, batch, run_dir, subdir, step, title) -> None:
         from canvit.harness.viz.disk import save_figure
@@ -331,11 +358,11 @@ class SearchRunTask:
         """Branch-0 capture of the TRAINING rollout (sampled fixations, augmented images)."""
         core = getattr(model, "module", model)
         bound = self._bound
-        n = min(self.cfg.viz_samples, images.shape[0])
+        idx = self._viz_index(bound.boxes)
         with torch.no_grad():
-            logits, pres = core.head(gout.readout[:n].float(), bound.targets[:n])
+            logits, pres = core.head(gout.readout[idx].float(), bound.targets[idx])
         return self._viz_capture(core, hidden=gout.readout, logits=logits, presence=pres, state=gout.state,
-                                 centers=viewpoint.centers, targets=bound.targets, joint=self._joint)
+                                 centers=viewpoint.centers, targets=bound.targets, joint=self._joint, idx=idx)
 
     def render_viz(self, viz, *, batch, run_dir, step):
         """Training-rollout figure -> ``{run_dir}/visualization/search_train/``."""
@@ -347,20 +374,24 @@ class SearchRunTask:
     # --- evaluation --------------------------------------------------------
     def _rollout_metrics(self, *, model, images, targets, boxes, T, cg, amp, choose=None, joint=None,
                          record: list | None = None):
-        """One closed-loop episode of ``T`` glimpses; returns per-timestep (loss [B], hit [B]).
+        """One closed-loop episode of ``T`` glimpses.
 
         t0 is the centred fixation. Later fixations come from ``choose(t, logits, visited)``
         (random / greedy) or, with ``joint``, from the learned scorer's argmax. ``record``
         (a list) collects the figure's per-glimpse frames. Returns per-timestep lists of the
-        heatmap KL [B], the hit [B] and the presence logit [B] (None without a presence head)."""
+        heatmap KL [B], the presence logit [B] (None without a presence head), and a dict of
+        per-timestep [B] bool checks: ``argmax_in`` / ``argmax_overlap`` (the task head's
+        argmax inside the target box / its ``overlap_box_frac`` square overlapping it) and
+        ``fix_in`` / ``fix_overlap`` (the same for fixation t)."""
         from canvit.harness.rollout.eval_viewpoints import deploy_rollout_viewpoints
         from canvit.harness.rollout.engine import _to_vp
 
         B = images.shape[0]
         tmap = target_map(boxes, grid=cg, kind=self.cfg.loss, sigma=self.cfg.target_sigma)
         losses: list[Tensor] = []
-        hits: list[Tensor] = []
         presences: list[Tensor | None] = []
+        checks: dict[str, list[Tensor]] = {k: [] for k in ("argmax_in", "argmax_overlap", "fix_in", "fix_overlap")}
+        frac = self.cfg.overlap_box_frac
         visited = torch.zeros(B, cg * cg, dtype=torch.bool, device=images.device)
         last_logits: list[Tensor] = []
 
@@ -379,12 +410,18 @@ class SearchRunTask:
             logits, pres = model.head(hidden.float(), targets)
             logits = logits.float()
             losses.append(per_image_loss(logits, tmap))
-            hits.append(hit(logits, boxes, box_frac=self.cfg.hit_box_frac))
             presences.append(pres)
+            guess, fix = argmax_centres(logits), vp.centers.flip(-1)  # both (x, y)
+            checks["argmax_in"].append(inside_box(guess, boxes))
+            checks["argmax_overlap"].append(square_overlaps_box(guess, boxes, box_frac=frac))
+            checks["fix_in"].append(inside_box(fix, boxes))
+            checks["fix_overlap"].append(square_overlaps_box(fix, boxes, box_frac=frac))
             if record is not None:
-                record.append(self._viz_capture(model, hidden=hidden, logits=logits, presence=pres,
-                                                state=out.state,
-                                                centers=vp.centers, targets=targets, joint=joint))
+                idx = self._viz_index(boxes)
+                record.append(self._viz_capture(model, hidden=hidden, logits=logits[idx],
+                                                presence=pres[idx] if pres is not None else None,
+                                                state=out.state, centers=vp.centers, targets=targets,
+                                                joint=joint, idx=idx))
             mark(vp)
             last_logits[:] = [logits]
             return out.state
@@ -405,7 +442,7 @@ class SearchRunTask:
                 state = advance(vp, state, t)
                 if t < T - 1:
                     vp = choose(sel, ctx, last_logits[0], visited)
-        return losses, hits, presences
+        return losses, presences, checks
 
     def _greedy(self, cg: int):
         """Fixate the current heatmap's argmax among cells not yet visited."""
@@ -427,13 +464,29 @@ class SearchRunTask:
 
     @torch.no_grad()
     def evaluate(self, *, model, head, val_loader, device, step, tracker=None, run_dir=None, joint=None):
-        """Per-timestep metrics on the val set under each of ``cfg.eval_policies``.
+        """Validation under each of ``cfg.eval_policies`` (random / greedy / policy fixations).
 
-        ``loss`` (heatmap KL) and ``hit`` average over the target-present trials only (Haoze's
-        accuracy). With a presence head: ``presence_acc`` / ``recall`` (target-present trials
-        judged present) / ``specificity`` (target-absent judged absent) / ``precision`` / ``f1``
-        at p(present) > 0.5, and ``correct``: a hit AND "present" on a target-present trial,
-        "absent" on a target-absent one."""
+        Localisation, over the target-present trials, after glimpse t (X = ``percent_label``
+        of ``cfg.overlap_box_frac``, 10 by default):
+
+        - ``found``: the task head's argmax lies inside the target box (strict).
+        - ``found_X_percent``: a square of side ``overlap_box_frac`` x scene around that argmax
+          overlaps the box (GVSM's fixation box / Haoze's rule).
+        - ``hit`` / ``hit_X_percent``: the same two criteria on the FIXATIONS: some fixation
+          0..t (t0, the fixed centre, included) satisfied it.
+
+        ``correct_<criterion>``, over all trials: a target-present trial counts if it is
+        located by that criterion AND judged "present", a target-absent trial if judged
+        "absent" (without a presence head: located). ``loss`` is the heatmap KL over the
+        target-present trials. With a presence head, at p(present) > 0.5: ``presence_acc``,
+        ``recall`` (present trials judged present), ``specificity`` (absent judged absent),
+        ``precision``, ``f1``.
+
+        Keys are ``<metric>_t<t>_<policy>``. Every value goes to ``run_dir/eval.jsonl`` (one
+        line per validation). The returned dict -- the harness logs it under ``eval/`` -- holds
+        ``loss`` / ``found`` / ``hit`` / ``correct_found`` / ``presence_acc`` at every glimpse
+        and the rest at the last glimpse only. ``tracker`` additionally gets a short
+        ``overview/`` section (``_overview``)."""
         T = self.cfg.n_timesteps
         cg = self.canvas_grid(model)
         amp: Any = nullcontext()
@@ -443,7 +496,11 @@ class SearchRunTask:
         was_training = model.head.training
         model.head.eval()
         policies = [p for p in self.cfg.eval_policies if p != "policy" or joint is not None]
-        keys = ("kl", "hit", "tpos", "tneg", "fpos", "correct")
+        pct = percent_label(self.cfg.overlap_box_frac)
+        # criterion -> (rollout check, cumulative over the fixations so far?)
+        crit = {"found": ("argmax_in", False), f"found_{pct}": ("argmax_overlap", False),
+                "hit": ("fix_in", True), f"hit_{pct}": ("fix_overlap", True)}
+        keys = ("kl", "tpos", "tneg", "fpos", *crit, *(f"correct_{c}" for c in crit))
         sums = {p: {k: [0.0] * T for k in keys} for p in policies}
         n_tp = n_ta = 0
         has_presence = False
@@ -466,27 +523,33 @@ class SearchRunTask:
                     kw = dict(model=model, images=images, targets=targets, boxes=boxes, T=T, cg=cg, amp=amp,
                               record=record)
                     if p == "policy":
-                        losses, hits, pres = self._rollout_metrics(**kw, joint=joint)
+                        losses, pres, chk = self._rollout_metrics(**kw, joint=joint)
                     elif p == "greedy":
-                        losses, hits, pres = self._rollout_metrics(**kw, choose=self._greedy(cg))
+                        losses, pres, chk = self._rollout_metrics(**kw, choose=self._greedy(cg))
                     elif p == "random":
-                        losses, hits, pres = self._rollout_metrics(**kw, choose=self._random)
+                        losses, pres, chk = self._rollout_metrics(**kw, choose=self._random)
                     else:
                         raise ValueError(f"unknown eval policy {p!r}")
                     s = sums[p]
+                    reached = {c: torch.zeros_like(present) for c in crit}
                     for t in range(T):
-                        h = hits[t] & present
+                        said = pres[t] > 0 if pres[t] is not None else None  # p(present) > 0.5
                         s["kl"][t] += losses[t][present].sum().item()
-                        s["hit"][t] += h.float().sum().item()
-                        if pres[t] is None:
-                            s["correct"][t] += h.float().sum().item()
+                        for c, (k, cumulative) in crit.items():
+                            ok = chk[k][t]
+                            if cumulative:  # some fixation 0..t
+                                reached[c] = reached[c] | ok
+                                ok = reached[c]
+                            ok = ok & present
+                            s[c][t] += ok.float().sum().item()
+                            corr = ok if said is None else (ok & said) | (~said & ~present)
+                            s[f"correct_{c}"][t] += corr.float().sum().item()
+                        if said is None:
                             continue
                         has_presence = True
-                        said = pres[t] > 0  # p(present) > 0.5
                         s["tpos"][t] += (said & present).float().sum().item()
                         s["tneg"][t] += (~said & ~present).float().sum().item()
                         s["fpos"][t] += (said & ~present).float().sum().item()
-                        s["correct"][t] += ((h & said) | (~said & ~present)).float().sum().item()
                     if record:
                         try:  # a diagnostic: a plotting failure must never abort validation
                             self._save_episode(record, batch=batch, run_dir=run_dir,
@@ -497,27 +560,51 @@ class SearchRunTask:
                 n += images.shape[0]
         if was_training:
             model.head.train()
-        out: dict[str, float] = {}
+        names = ["loss", *crit, *(f"correct_{c}" for c in crit)]
+        if has_presence:
+            names += ["presence_acc", "recall", "specificity", "precision", "f1"]
+        full: dict[str, float] = {}
         for p in policies:
             s = sums[p]
-            names = ["loss", "hit", "correct"]
             for t in range(T):
-                out[f"loss_t{t}_{p}"] = s["kl"][t] / max(n_tp, 1)
-                out[f"hit_t{t}_{p}"] = s["hit"][t] / max(n_tp, 1)
-                out[f"correct_t{t}_{p}"] = s["correct"][t] / max(n, 1)
+                full[f"loss_t{t}_{p}"] = s["kl"][t] / max(n_tp, 1)
+                for c in crit:
+                    full[f"{c}_t{t}_{p}"] = s[c][t] / max(n_tp, 1)
+                    full[f"correct_{c}_t{t}_{p}"] = s[f"correct_{c}"][t] / max(n, 1)
                 if has_presence:
                     tpos, tneg, fpos = s["tpos"][t], s["tneg"][t], s["fpos"][t]
                     rec, prec = tpos / max(n_tp, 1), tpos / max(tpos + fpos, 1)
-                    out[f"presence_acc_t{t}_{p}"] = (tpos + tneg) / max(n, 1)
-                    out[f"recall_t{t}_{p}"] = rec
-                    out[f"specificity_t{t}_{p}"] = tneg / max(n_ta, 1)
-                    out[f"precision_t{t}_{p}"] = prec
-                    out[f"f1_t{t}_{p}"] = 2 * prec * rec / (prec + rec) if prec + rec > 0 else 0.0
-            if has_presence:
-                names += ["presence_acc", "recall", "specificity", "precision", "f1"]
-            for k in names:
-                out[f"{k}_final_{p}"] = out[f"{k}_t{T - 1}_{p}"]
-        return out
+                    full[f"presence_acc_t{t}_{p}"] = (tpos + tneg) / max(n, 1)
+                    full[f"recall_t{t}_{p}"] = rec
+                    full[f"specificity_t{t}_{p}"] = tneg / max(n_ta, 1)
+                    full[f"precision_t{t}_{p}"] = prec
+                    full[f"f1_t{t}_{p}"] = 2 * prec * rec / (prec + rec) if prec + rec > 0 else 0.0
+        if run_dir is not None:
+            import json
+            from pathlib import Path
+            with open(Path(run_dir) / "eval.jsonl", "a") as f:
+                f.write(json.dumps({"step": step, **full}) + "\n")
+        if tracker is not None:
+            tracker.log_metrics({f"overview/{k}": v for k, v in self._overview(full, T, pct).items()}, step=step)
+        per_glimpse = {"loss", "found", "hit", "correct_found", "presence_acc"}
+        return {f"{k}_t{t}_{p}": full[f"{k}_t{t}_{p}"]
+                for p in policies for k in names for t in range(T) if k in per_glimpse or t == T - 1}
+
+    @staticmethod
+    def _overview(full: dict[str, float], T: int, pct: str) -> dict[str, float]:
+        """The short W&B section: last-glimpse values under the same names as in ``eval/``,
+        plus the policy-minus-random gain of ``found`` / ``found_X_percent``. Keys whose
+        policy or metric this run lacks are left out."""
+        L = T - 1
+        rules = ("random", "greedy", "policy")
+        wanted = ([f"{c}_t{L}_{p}" for c in ("found", f"found_{pct}", "hit", f"hit_{pct}") for p in rules]
+                  + [f"{c}_t{L}_{p}" for c in ("correct_found", f"correct_found_{pct}") for p in ("random", "policy")]
+                  + [f"presence_acc_t{L}_policy", f"loss_t{L}_policy"])
+        ov = {k: full[k] for k in wanted if k in full}
+        for c in ("found", f"found_{pct}"):
+            if f"{c}_t{L}_policy" in full and f"{c}_t{L}_random" in full:
+                ov[f"{c}_gain_t{L}_policy_vs_random"] = full[f"{c}_t{L}_policy"] - full[f"{c}_t{L}_random"]
+        return ov
 
     # --- checkpoint ----------------------------------------------------------
     def model_config(self, model):

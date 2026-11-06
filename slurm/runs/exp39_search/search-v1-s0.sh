@@ -19,7 +19,8 @@
 # ONE JOB, NOT AN ARRAY: resume is not tested for the search task, so the run must fit the
 # walltime. TIME is set from the V100 smoke run (exp38, job 17131243: 0.63 s/step in fp32,
 # 54 s per validation). Checkpoints every 2000
-# steps keep a crashed run's progress on disk; best.pt follows hit_final_policy.
+# steps keep a crashed run's progress on disk; best.pt follows hit_final_policy
+# (this run's pin predates the metric rename; later runs: found_t3_policy).
 #
 # Later variants (not this run): --cfg.supervise every; --rl.reward difference (needs
 # supervise every).
