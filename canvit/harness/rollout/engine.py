@@ -51,11 +51,23 @@ if TYPE_CHECKING:  # heavy import kept off the runtime path
 class GlimpseOut(NamedTuple):
     """What a task returns from ``forward_glimpse``: the opaque ``readout`` that
     ``step_loss``/``per_image_loss`` consume, plus the recurrent state and VPE to
-    thread to the next glimpse."""
+    thread to the next glimpse.
+
+    ``local_patches`` ([B,n_patch,local_dim], optional): the backbone's RAW local
+    token output for this glimpse, BEFORE/AS written into the canvas (as opposed to
+    the canvas state, which is AFTER writing and accumulated over every glimpse so
+    far). Threaded to the NEXT glimpse's selector call for the "local_feat" policy
+    feature group; None for tasks that do not populate it (zero behavior change).
+
+    ``write_snapshots`` (optional): the glimpse's canvas right after each of its
+    writes (``CanViTOutput.write_snapshots``), threaded the same way for the
+    "depth_feat" policy feature group."""
 
     readout: Any
     state: RecurrentState
     vpe: Tensor | None
+    local_patches: Tensor | None = None
+    write_snapshots: list[Tensor] | None = None
 
 
 class GlimpseLoss(Protocol):
@@ -271,6 +283,12 @@ def run_rollout(
         total_detached = L.combined.detach().float()
         n_steps = 1
         state = gout.state
+        # The glimpse JUST taken's raw local tokens (None at t0: no glimpse has
+        # happened yet), threaded to the NEXT select() call for "local_feat".
+        # Detached in lockstep with `state` at every TBPTT chunk boundary below.
+        last_local = gout.local_patches
+        # Same idea, for "depth_feat": the glimpse's canvas after each of its writes.
+        last_write_snapshots = gout.write_snapshots
         final_readout = gout.readout
 
         # chunk_size==1: t0 is already a complete chunk.
@@ -279,10 +297,17 @@ def run_rollout(
             if n_glimpses > 1:
                 state = RecurrentState(canvas=gout.state.canvas.detach(),
                                        recurrent_cls=gout.state.recurrent_cls.detach())
+                last_local = last_local.detach() if last_local is not None else None
+                last_write_snapshots = (
+                    [s.detach() for s in last_write_snapshots] if last_write_snapshots is not None else None
+                )
                 chunk_loss = torch.zeros((), device=device)
 
         for t in range(1, n_glimpses):
-            vp_named = sel.select(vp_type=ViewpointType.RANDOM, ctx=ctx, t=t, batch_size=B, device=device, state=state)
+            vp_named = sel.select(
+                vp_type=ViewpointType.RANDOM, ctx=ctx, t=t, batch_size=B, device=device,
+                state=state, local_patches=last_local, write_snapshots=last_write_snapshots,
+            )
             vp = _to_vp(vp_named)
             with amp_ctx:
                 gout = task.forward_glimpse(
@@ -368,11 +393,19 @@ def run_rollout(
                 if not is_last:
                     state = RecurrentState(canvas=gout.state.canvas.detach(),
                                            recurrent_cls=gout.state.recurrent_cls.detach())
+                    last_local = gout.local_patches.detach() if gout.local_patches is not None else None
+                    last_write_snapshots = (
+                        [s.detach() for s in gout.write_snapshots] if gout.write_snapshots is not None else None
+                    )
                     chunk_loss = torch.zeros((), device=device)
                 else:
                     state = gout.state
+                    last_local = gout.local_patches
+                    last_write_snapshots = gout.write_snapshots
             else:
                 state = gout.state
+                last_local = gout.local_patches
+                last_write_snapshots = gout.write_snapshots
 
         # A trailing partial chunk (n_glimpses not a multiple of eff_chunk) still
         # needs its backward. For distill (chunk_size divides its stochastic length

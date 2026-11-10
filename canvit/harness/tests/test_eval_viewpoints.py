@@ -203,7 +203,7 @@ def _tiny_joint(prime_on_policy: float = 1.0):
         def reset(self):
             pass
 
-        def __call__(self, state):
+        def __call__(self, state, **_kw):
             return torch.zeros(_B, 1)
 
     scorer = _Scorer()

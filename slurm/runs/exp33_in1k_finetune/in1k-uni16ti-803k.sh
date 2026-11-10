@@ -13,7 +13,7 @@
 set -euo pipefail
 
 # === ESSENTIALS ===
-RUN_GROUP=jon_exp33_in1k_finetune
+RUN_GROUP=caglar_exp33_in1k_finetune
 RUN_NAME=in1k-uni16ti-803k
 ARRAY="${ARRAY:-0-48%1}"     # 49 jobs x 8192 = 401,408 steps (~20 epochs @ batch 64).
                              # Override when RESUMING a partially-done run: the array is a
@@ -33,7 +33,7 @@ NGPU=1
 TASK=in1k
 
 # === config (exp25 recipe) ===
-CFG_WANDB_PROJECT=jon_exp33_in1k_finetune
+CFG_WANDB_PROJECT=caglar_exp33_in1k_finetune
 CFG_MODEL_REPO=/mnt/vast-nhr/projects/nib00021/jonathan/repos/canvit/logs/jon_exp22_full_runs/exp22-uniform16-teacherinit-lrdrop2-803k/checkpoints/step-16384-hf
 CFG_PROBE_REPO=canvit/dinov3-vitb16-lvd1689m-in1k-512x512-linear-clf-probe  # fused into the head (TPU parity)
 CFG_MODE=finetune

@@ -29,7 +29,7 @@ class _Net(nn.Module):
 
 def _sel(**kw):
     return PolicySelector(
-        net=_Net(), encoder=lambda s: s, vp_flat=torch.rand(_A, 3),
+        net=_Net(), encoder=lambda s, **_kw: s, vp_flat=torch.rand(_A, 3),
         fallback=RandomSelector(is_foveated=False, foveated_scale=None, min_viewpoint_scale=0.05),
         generator=torch.Generator().manual_seed(0), **kw)
 

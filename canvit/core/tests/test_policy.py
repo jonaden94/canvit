@@ -106,6 +106,87 @@ def test_state_encoder_full_and_intrinsic() -> None:
     assert torch.isfinite(fi).all()
 
 
+def test_state_encoder_rec_cls_group() -> None:
+    """"rec_cls" (opt-in, not in FEATURE_GROUPS/INTRINSIC_GROUPS): the backbone's
+    recurrent_cls token, local_dim wide (independent of canvas_dim), broadcast to
+    every grid cell. Needs no probe and no entropy."""
+    torch.manual_seed(0)
+    seg = CanViTForSemanticSegmentation(backbone_name="vits16", model_config={}, num_classes=150)
+    seg.eval().requires_grad_(False)
+    state = seg.init_state(batch_size=_B, canvas_grid_size=_G)
+    local_dim = seg.canvit.local_dim
+
+    groups = ("ln_feat", "rec_cls")
+    enc = StateEncoder(seg, canvas_grid=_G, feature_groups=groups)
+    assert enc.needs_rec_cls and not enc.needs_entropy
+    f = enc(state)
+    assert f.shape == (_B, feature_channels(seg.canvas_dim, groups, local_dim), 32, 32)
+    assert torch.isfinite(f).all()
+    # broadcast: every spatial cell carries the SAME recurrent_cls-derived vector
+    rec_part = f[:, seg.canvas_dim :]
+    assert torch.allclose(rec_part, rec_part[:, :, :1, :1].expand_as(rec_part))
+
+
+def test_state_encoder_local_feat_group() -> None:
+    """"local_feat" (opt-in): the RAW local tokens of the glimpse just taken, mean-
+    pooled + broadcast. None at t0 (no glimpse yet) -> zero-filled rather than
+    omitted, so the channel count stays constant across the rollout."""
+    torch.manual_seed(0)
+    seg = CanViTForSemanticSegmentation(backbone_name="vits16", model_config={}, num_classes=150)
+    seg.eval().requires_grad_(False)
+    state = seg.init_state(batch_size=_B, canvas_grid_size=_G)
+    local_dim = seg.canvit.local_dim
+
+    groups = ("ln_feat", "local_feat")
+    enc = StateEncoder(seg, canvas_grid=_G, feature_groups=groups)
+    assert enc.needs_local_feat and not enc.needs_entropy and not enc.needs_rec_cls
+
+    f_t0 = enc(state)  # local_patches=None (t0: no glimpse yet) -> zero-filled
+    assert f_t0.shape == (_B, feature_channels(seg.canvas_dim, groups, local_dim), 32, 32)
+    assert torch.isfinite(f_t0).all()
+    local_part_t0 = f_t0[:, seg.canvas_dim :]
+    # LayerNorm of an all-zero vector is itself all zero (no epsilon bias in F.layer_norm's output).
+    assert torch.allclose(local_part_t0, torch.zeros_like(local_part_t0))
+
+    n_patch = 5
+    local_patches = torch.randn(_B, n_patch, local_dim)
+    f = enc(state, local_patches=local_patches)
+    assert f.shape == f_t0.shape
+    assert torch.isfinite(f).all()
+    local_part = f[:, seg.canvas_dim :]
+    assert torch.allclose(local_part, local_part[:, :, :1, :1].expand_as(local_part))  # broadcast
+    assert not torch.allclose(local_part, local_part_t0)  # a real glimpse differs from the t0 zero-fill
+
+
+def test_state_encoder_depth_feat_group() -> None:
+    """"depth_feat" (opt-in): how much the canvas changed WITHIN the glimpse just
+    taken, between its first and last write. Zero-filled at t0 or with fewer than
+    two write snapshots (nothing to take a within-glimpse delta over)."""
+    torch.manual_seed(0)
+    seg = CanViTForSemanticSegmentation(backbone_name="vits16", model_config={}, num_classes=150)
+    seg.eval().requires_grad_(False)
+    state = seg.init_state(batch_size=_B, canvas_grid_size=_G)
+
+    groups = ("ln_feat", "depth_feat")
+    enc = StateEncoder(seg, canvas_grid=_G, feature_groups=groups)
+    assert enc.needs_depth_feat and not enc.needs_entropy and not enc.needs_rec_cls
+
+    f_t0 = enc(state)  # write_snapshots=None (t0: no glimpse yet) -> zero-filled
+    assert f_t0.shape == (_B, feature_channels(seg.canvas_dim, groups), 32, 32)
+    assert torch.isfinite(f_t0).all()
+    depth_part_t0 = f_t0[:, seg.canvas_dim :]
+    assert torch.allclose(depth_part_t0, torch.zeros_like(depth_part_t0))
+
+    canvas_a = torch.randn_like(state.canvas)
+    f_one = enc(state, write_snapshots=[canvas_a])  # only 1 snapshot -> still zero-filled
+    assert torch.allclose(f_one[:, seg.canvas_dim :], torch.zeros_like(depth_part_t0))
+
+    canvas_b = torch.randn_like(state.canvas)
+    f = enc(state, write_snapshots=[canvas_a, canvas_b, canvas_b])  # >=2: uses first and LAST
+    assert torch.isfinite(f).all()
+    assert not torch.allclose(f[:, seg.canvas_dim :], depth_part_t0)
+
+
 # --------------------------------------------------------------------------- #
 # readout='local': the autoreg_tryout policy head (per-cell 1x1, no U-Net).
 # --------------------------------------------------------------------------- #

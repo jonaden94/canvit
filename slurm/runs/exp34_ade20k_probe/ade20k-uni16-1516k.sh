@@ -16,7 +16,7 @@
 set -euo pipefail
 
 # === ESSENTIALS ===
-RUN_GROUP=jon_exp34_ade20k_probe
+RUN_GROUP=caglar_exp34_ade20k_probe
 RUN_NAME=ade20k-uni16-1516k
 ARRAY=0-0%1
 TIME=0-08:00:00
@@ -25,7 +25,7 @@ NGPU=1                       # ade20k has supports_ddp=False
 TASK=ade20k
 
 # === config (exp24 recipe) ===
-CFG_WANDB_PROJECT=jon_exp34_ade20k_probe
+CFG_WANDB_PROJECT=caglar_exp34_ade20k_probe
 CFG_MODEL_REPO=/mnt/vast-nhr/projects/nib00021/jonathan/repos/canvit/logs/jon_exp22_full_runs/exp22-uniform16-lrdrop-1516k/checkpoints/step-319488-hf
 CFG_RESIZE_MODE=squish
 EXTRA_ARGS=""

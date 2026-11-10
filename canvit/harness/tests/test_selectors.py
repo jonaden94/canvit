@@ -18,7 +18,7 @@ class _FakeEncoder:
     def reset(self):
         self.resets += 1
 
-    def __call__(self, state):
+    def __call__(self, state, **_kw):
         return torch.zeros(_B, 3, 32, 32)
 
 

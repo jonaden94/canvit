@@ -36,6 +36,18 @@ export VAL_INDEX_DIR="/mnt/vast-nhr/projects/nib00021/jonathan/repos/_data_cache
 export LOGS_DIR="/mnt/vast-nhr/projects/nib00021/caglar/logs"
 export WANDB_DIR="/mnt/vast-nhr/projects/nib00021/caglar/wandb"
 
+# harness_train.sbatch falls back to /mnt/vast-nhr/projects/nib00021/ersatz_local when a
+# compute node's local scratch has <2G free — that fallback dir is only writable by its
+# owner (u25995), so every job hit "Permission denied" and died in ~20s. Pre-set TMPDIR to
+# a dir I own with plenty of space, so the node-local check passes and that path never runs.
+# Per-job subdir (${SLURM_JOB_ID}, unique per array task too) — a single shared path broke
+# the moment two jobs ran concurrently on the same node: both tried to `git archive | tar -x`
+# their pinned commit into the SAME $TMPDIR/canvit_src at once, and the second tar failed with
+# "Cannot open: File exists" (2026-10-19, jobs 16750950/16750951). mkdir here so it exists
+# before harness_train.sbatch's own `df`/git-archive steps run.
+export TMPDIR="/mnt/vast-nhr/projects/nib00021/caglar/tmp/${SLURM_JOB_ID:-interactive}"
+mkdir -p "$TMPDIR"
+
 # Tracker config
 export WANDB_PROJECT="canvit-train"   # TODO: change as needed
 export WANDB_ENTITY=""                   # leave empty to use your default account

@@ -103,6 +103,17 @@ class JointPolicyConfig:
     entropy_bonus: float = 0.01
     entropy_target: float | None = 1.0
     alpha_lr: float = 0.05
+    qprop: bool = False
+    """PG only (ignored by qreg/vpg). Adds a second ViewpointScorer as an off-policy
+    Q-value critic (:class:`~canvit.harness.policy.rl.PG`'s ``qprop`` field, wired
+    here): the exact expectation of the critic's Q over the actor's own action
+    distribution becomes the main (zero-variance) gradient term, and REINFORCE's
+    usual noisy score-function term is applied only to the RESIDUAL between the
+    critic's prediction and the real measured reward for the action actually taken.
+    The critic shares ``dueling`` below and is trained by its own MSE-to-reward loss
+    (added to the optimizer's existing ``policy`` param group, saved in the same
+    ``.policy.pt`` sidecar) -- no new reward, no new launcher-level CFG knob needed
+    beyond this flag."""
     policy_warmup_steps: int = 0
     """Steps to ramp prime_on_policy 0 -> its target (0 = constant target from step 0)."""
 

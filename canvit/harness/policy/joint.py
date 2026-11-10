@@ -66,6 +66,10 @@ class JointPolicy:
     running: dict[int, RunningNorm] = field(default_factory=dict)
     log_alpha: Tensor | None = None
     last_step: dict = field(default_factory=dict)  # detached per-step policy metrics for logging
+    critic: ViewpointScorer | None = None
+    """Q-Prop only (PG objective, obj.qprop=True); None for every other objective/config
+    (qreg, vpg, plain pg) -- every method below that branches on `self.critic is not None`
+    is therefore an exact no-op for anything that isn't a qprop run."""
 
     def branch_selector(self, t0_type: ViewpointType) -> tuple[object, bool]:
         """(selector, is_policy_branch) for a branch with this t0 type. Policy
@@ -90,11 +94,18 @@ class JointPolicy:
     def broadcast(self, src: int = 0) -> None:
         for t in list(self.scorer.parameters()) + list(self.scorer.buffers()):
             dist.broadcast(t.data, src=src)
+        if self.critic is not None:
+            for t in list(self.critic.parameters()) + list(self.critic.buffers()):
+                dist.broadcast(t.data, src=src)
 
     def allreduce_grads(self) -> None:
         for p in self.scorer.parameters():
             if p.grad is not None:
                 dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+        if self.critic is not None:
+            for p in self.critic.parameters():
+                if p.grad is not None:
+                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
 
     def state_dict(self) -> dict:
         """Policy training state for the checkpoint sidecar (scorer + reward
@@ -104,6 +115,7 @@ class JointPolicy:
             "scorer": self.scorer.state_dict(),
             "running": {d: (rn.mean, rn.sq, rn.count) for d, rn in self.running.items()},
             "log_alpha": None if self.log_alpha is None else self.log_alpha.detach().cpu(),
+            "critic": None if self.critic is None else self.critic.state_dict(),
         }
 
     def load_state_dict(self, sd: dict) -> None:
@@ -113,6 +125,8 @@ class JointPolicy:
             rn.mean, rn.sq, rn.count = mean.to(self.device), sq.to(self.device), count
         if sd.get("log_alpha") is not None and self.log_alpha is not None:
             self.log_alpha = sd["log_alpha"].to(self.device)
+        if sd.get("critic") is not None and self.critic is not None:
+            self.critic.load_state_dict(sd["critic"])
 
     def _norm(self, depth: int) -> RunningNorm:
         rn = self.running.get(depth)
@@ -165,7 +179,31 @@ class JointPolicy:
         if isinstance(obj, PG):
             target = self._norm(depth).normalize(reward, subtract_only=obj.z_subtract_only).detach()
             alpha = obj.entropy_bonus if self.log_alpha is None else self.log_alpha.exp()
-            loss, entropy, _ = pg_loss(scores, flat_idx, target, alpha=alpha, crit_all=None)
+            crit_all = None
+            if self.critic is not None:
+                # Q-Prop: the critic scores the SAME state features the actor's
+                # PolicySelector just featurized for this glimpse (stashed on
+                # `last_aux` by `select()`, same read pattern as `state_value` uses
+                # for VPG's baseline above). A live (grad-enabled) forward, since
+                # `critic_loss` inside `pg_loss` must backprop into the critic's own
+                # parameters.
+                aux = self.policy_selector.last_aux
+                assert aux is not None, "qprop critic needs this glimpse's `feats`, but last_aux is empty"
+                # ViewpointScorer's raw forward is [B, n_scale, cpa, cpa], not the flat
+                # [B, A] `pg_loss` expects -- match PolicySelector.select()'s own
+                # `.reshape(batch_size, -1)` (selector.py:114) exactly, or `.gather`
+                # below raises on a dim mismatch (caught by the exp39 smoke test).
+                crit_all = self.critic(aux["feats"].float()).reshape(scores.shape[0], -1)
+            loss, entropy, metrics = pg_loss(scores, flat_idx, target, alpha=alpha, crit_all=crit_all)
+            if self.critic is not None:  # surface critic_loss/resid_std for logging; plain PG is unchanged
+                # pg_loss's metrics dict carries live (non-detached) tensors -- e.g.
+                # critic_loss, which must stay attached for its own .backward() to reach
+                # the critic. Detach the copy that goes into `last_step` (log-only, read
+                # after the step's backward/optimizer.step() already ran) the same way
+                # vpg_loss's own returned metrics already are, so `float(v)` logging
+                # doesn't warn about converting a grad-carrying tensor and doesn't keep
+                # this step's graph referenced any longer than necessary.
+                self.last_step = {k: v.detach() if isinstance(v, Tensor) else v for k, v in metrics.items()}
             if self.log_alpha is not None:
                 assert obj.entropy_target is not None
                 entropy_floor_step(

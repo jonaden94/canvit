@@ -79,6 +79,7 @@ class CanViTOutput:
     state: RecurrentState
     local_patches: Tensor  # [B, H*W, local_dim]
     vpe: Tensor | None  # [B, local_dim]
+    write_snapshots: list[Tensor] | None = None  # opt-in: canvas after each write_after block
 
 
 def compute_rw_positions(
@@ -321,6 +322,7 @@ class CanViT(nn.Module):
         canvas_grid_size: int | None = None,
         canvas_rope: RoPE | None = None,
         modulation: Modulation | None = None,
+        collect_write_snapshots: bool = False,
     ) -> CanViTOutput:
         B = image.shape[0]
         recurrent_cls = state.recurrent_cls
@@ -376,6 +378,7 @@ class CanViT(nn.Module):
 
         read_idx = 0
         write_idx = 0
+        write_snapshots: list[Tensor] = []
 
         for block_idx in range(self.backbone.n_blocks):
             block_mod = mod.block[block_idx] if mod is not None else None
@@ -396,6 +399,8 @@ class CanViT(nn.Module):
                 )
                 canvas = write_out if self.cfg.canvas_update_mode == "convex" else canvas + write_out
                 write_idx += 1
+                if collect_write_snapshots:  # opt-in, default off: zero cost/behavior change otherwise
+                    write_snapshots.append(canvas)
 
         # Consolidate the memory between glimpses: self-attention over the canvas
         # tokens (registers + spatial) after this glimpse's writes, so the next
@@ -417,6 +422,10 @@ class CanViT(nn.Module):
             state=new_state,
             local_patches=out.patches.contiguous(),
             vpe=vpe_processed,
+            # Pre-self-attention-consolidation (see the `canvas_self_attn` loop above):
+            # the LAST entry is the canvas right after its last write, not byte-identical
+            # to `new_state.canvas` when `canvas_self_attn` is non-empty.
+            write_snapshots=write_snapshots if collect_write_snapshots else None,
         )
 
     def forward_reduce(

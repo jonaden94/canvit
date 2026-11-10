@@ -89,7 +89,8 @@ def build_policy(
             value_bias_init=rl.vpg_value_bias_init,
         )
     else:
-        obj = PG(entropy_bonus=rl.entropy_bonus, entropy_target=rl.entropy_target, alpha_lr=rl.alpha_lr)
+        obj = PG(entropy_bonus=rl.entropy_bonus, entropy_target=rl.entropy_target, alpha_lr=rl.alpha_lr,
+                 qprop=rl.qprop)
 
     # VPG is defined for the FOVEATED action space (autoreg_tryout only ever ran a foveated
     # model). It runs on uniform and is internally consistent there, but it is not the same
@@ -134,11 +135,27 @@ def build_policy(
         canvas_dim=canvit.cfg.canvas_dim, width=rl.width, n_scale=n_scale, scales=scales,
         centers_per_axis=rl.centers_per_axis, block_layers=rl.block_layers, groups=feature_groups,
         dueling=dueling, action_space=action_space, readout=rl.policy_readout,
+        local_dim=canvit.local_dim,
     ).to(device)
     if isinstance(obj, VPG) and obj.value_bias_init is not None:
         assert scorer.vhead is not None
         torch.nn.init.constant_(scorer.vhead[-1].bias, obj.value_bias_init)
     scorer.train()
+
+    # Q-Prop critic: a SECOND, fully independent ViewpointScorer, built identically to
+    # the actor `scorer` above (same action space / grid / width / blocks), used only as
+    # an off-policy Q-value estimator feeding `pg_loss`'s `crit_all` -- never for action
+    # selection (the actor's own PolicySelector is untouched). None for every other
+    # objective/config, which is what keeps this change a no-op for qreg/vpg/plain-pg.
+    critic: ViewpointScorer | None = None
+    if isinstance(obj, PG) and obj.qprop:
+        critic = ViewpointScorer(
+            canvas_dim=canvit.cfg.canvas_dim, width=rl.width, n_scale=n_scale, scales=scales,
+            centers_per_axis=rl.centers_per_axis, block_layers=rl.block_layers, groups=feature_groups,
+            dueling=rl.dueling, action_space=action_space, readout=rl.policy_readout,
+            local_dim=canvit.local_dim,
+        ).to(device)
+        critic.train()
 
     encoder = StateEncoder(encode_model, canvas_grid=canvas_grid, feature_groups=feature_groups)
 
@@ -157,6 +174,7 @@ def build_policy(
         rl_weight=rl.rl_weight, keep_random_branch=rl.keep_random_branch,
         target_momentum=rl.target_momentum, device=device,
         prime_target=rl.prime_on_policy, prime_warmup=rl.policy_warmup_steps,
+        critic=critic,
     )
     if isinstance(obj, PG) and obj.entropy_target is not None:
         jp.log_alpha = torch.tensor(math.log(obj.entropy_bonus), device=device)

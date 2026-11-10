@@ -30,7 +30,7 @@
 set -euo pipefail
 
 # === ESSENTIALS ===
-RUN_GROUP=jon_exp35_policy_qreg_10seed
+RUN_GROUP=caglar_exp35_policy_qreg_10seed
 SEED="${SEED:-0}"
 RUN_NAME=exp35-policy-qreg-s$SEED
 ARRAY=0-0%1                  # single job: 8000 steps fits well inside the walltime
@@ -41,7 +41,7 @@ TASK=ade20k
 
 # === config (exp27 lossfix recipe; everything else must come from the defaults, or this
 #     stops being the ported reference) ===
-CFG_WANDB_PROJECT=jon_exp35_policy_qreg_10seed
+CFG_WANDB_PROJECT=caglar_exp35_policy_qreg_10seed
 CFG_SEED=$SEED
 CFG_MAX_STEPS=9000           # 9000, not 8000: the loop evaluates when step % val_every == 0
                              # and never reaches max_steps itself, so an 8000-step run's last

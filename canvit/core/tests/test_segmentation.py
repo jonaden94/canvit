@@ -171,6 +171,25 @@ class TestCanViTForSemanticSegmentation:
             logits = seg.head(spatial)
         assert logits.shape == (B, NUM_CLASSES, CANVAS_GRID, CANVAS_GRID)
 
+    def test_collect_write_snapshots_is_opt_in(self, dummy_input):
+        """`collect_write_snapshots` defaults to False/None (zero behavior change for
+        every pre-existing caller); True returns one canvas snapshot per write block,
+        matching `write_after_blocks`."""
+        glimpse, vp = dummy_input
+        seg = _minimal_seg_model().eval()
+        state = seg.init_state(batch_size=B, canvas_grid_size=CANVAS_GRID)
+        with torch.inference_mode():
+            out_default = seg.canvit(image=glimpse, state=state, viewpoint=vp)
+            out_collect = seg.canvit(image=glimpse, state=state, viewpoint=vp, collect_write_snapshots=True)
+        assert out_default.write_snapshots is None
+        n_writes = len(seg.canvit.write_after_blocks)
+        assert n_writes >= 2  # the depth_feat policy feature needs >=2 to take a delta
+        assert out_collect.write_snapshots is not None
+        assert len(out_collect.write_snapshots) == n_writes
+        for s in out_collect.write_snapshots:
+            assert s.shape == state.canvas.shape
+            assert torch.isfinite(s).all()
+
     def test_state_dict_has_canvit_and_head(self):
         """State dict must namespace CanViT vs head so CanViTForSemanticSegmentation.
         from_pretrained can round-trip both halves cleanly."""

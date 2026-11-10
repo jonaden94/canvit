@@ -30,7 +30,7 @@
 set -euo pipefail
 
 # === ESSENTIALS ===
-RUN_GROUP=jon_exp32_pretrain_lrdrop
+RUN_GROUP=caglar_exp32_pretrain_lrdrop
 RUN_NAME=exp32-fovi-teacherinit
 ARRAY=0-137%1
 TIME=0-02:00:00
@@ -39,7 +39,7 @@ NGPU=1
 TASK=distill
 
 # === config (copied from exp22; see header for the three accepted diffs) ===
-CFG_WANDB_PROJECT=jon_exp32_pretrain_lrdrop
+CFG_WANDB_PROJECT=caglar_exp32_pretrain_lrdrop
 CFG_PEAK_LR=0.0004
 CFG_BATCH_SIZE_PER_GPU=64
 CFG_STEPS_PER_JOB=8192

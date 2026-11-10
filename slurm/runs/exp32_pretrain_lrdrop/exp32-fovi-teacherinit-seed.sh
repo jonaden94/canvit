@@ -37,7 +37,7 @@
 set -euo pipefail
 
 # === ESSENTIALS ===
-RUN_GROUP=jon_exp32_pretrain_lrdrop
+RUN_GROUP=caglar_exp32_pretrain_lrdrop
 SEED="${SEED:?set SEED=1..5 (seed 0 is exp32-fovi-teacherinit itself)}"
 RUN_NAME=exp32-fovi-teacherinit-s$SEED
 ARRAY=0-24%1                  # 25 x 8192 = 204800 steps
@@ -47,7 +47,7 @@ NGPU=1
 TASK=distill
 
 # === config: byte-identical to exp32-fovi-teacherinit.sh except CFG_SEED ===
-CFG_WANDB_PROJECT=jon_exp32_pretrain_lrdrop
+CFG_WANDB_PROJECT=caglar_exp32_pretrain_lrdrop
 CFG_SEED=$SEED
 CFG_PEAK_LR=0.0004
 CFG_BATCH_SIZE_PER_GPU=64

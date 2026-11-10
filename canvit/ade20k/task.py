@@ -62,9 +62,17 @@ class BoundAde20kTask:
         )
         ctx = torch.no_grad() if backbone_no_grad else nullcontext()
         with ctx:
-            out = seg.canvit(image=model_input, state=state, viewpoint=viewpoint)
+            # collect_write_snapshots is a pure side effect (extra tensor refs kept in a
+            # list, no RNG/compute difference) -- always on, like local_patches below,
+            # so the "depth_feat" policy group needs no per-task opt-in flag.
+            out = seg.canvit(
+                image=model_input, state=state, viewpoint=viewpoint, collect_write_snapshots=True
+            )
             hidden = seg.canvit.get_spatial(out.state.canvas).view(B, self.canvas_grid, self.canvas_grid, -1)
-        return GlimpseOut(readout=hidden, state=out.state, vpe=out.vpe)
+        return GlimpseOut(
+            readout=hidden, state=out.state, vpe=out.vpe,
+            local_patches=out.local_patches, write_snapshots=out.write_snapshots,
+        )
 
     def _logits(self, readout: Tensor) -> Tensor:
         return self.seg.head(readout.float())  # [B, C, G, G]
@@ -272,7 +280,10 @@ class Ade20kRunTask:
             groups["head"] = list(model.head.parameters())
         if spec.train_policy:
             assert joint is not None
-            groups["policy"] = list(joint.scorer.parameters())
+            params = list(joint.scorer.parameters())
+            if joint.critic is not None:  # Q-Prop: critic rides the same param group/LR
+                params += list(joint.critic.parameters())
+            groups["policy"] = params
         return groups
 
     def resume_start_step(self, payload, scheduler):

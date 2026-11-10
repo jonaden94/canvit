@@ -41,6 +41,8 @@ class Selector(Protocol):
         batch_size: int,
         device: torch.device,
         state: RecurrentState,
+        local_patches: Tensor | None = None,
+        write_snapshots: list[Tensor] | None = None,
     ) -> NamedViewpoint: ...
 
 
@@ -101,6 +103,8 @@ class PolicySelector:
         batch_size: int,
         device: torch.device,
         state: RecurrentState,
+        local_patches: Tensor | None = None,
+        write_snapshots: list[Tensor] | None = None,
     ) -> NamedViewpoint:
         if vp_type == ViewpointType.FULL:
             return self.fallback.select(
@@ -108,9 +112,13 @@ class PolicySelector:
             )
         if self.feats_detached:  # cut the backbone from the policy graph (scorer still learns)
             with torch.no_grad():
-                feats = self.encoder(state)  # type: ignore[operator]
+                feats = self.encoder(  # type: ignore[operator]
+                    state, local_patches=local_patches, write_snapshots=write_snapshots
+                )
         else:
-            feats = self.encoder(state)  # type: ignore[operator]
+            feats = self.encoder(  # type: ignore[operator]
+                state, local_patches=local_patches, write_snapshots=write_snapshots
+            )
         scores = self.net(feats.float()).reshape(batch_size, -1)  # type: ignore[operator]
         if self.select_bn_eval:
             # Mode (b): SELECT under eval-mode BN (running stats), keeping `scores` — the
@@ -189,6 +197,8 @@ class MixtureSelector:
         batch_size: int,
         device: torch.device,
         state: RecurrentState,
+        local_patches: Tensor | None = None,
+        write_snapshots: list[Tensor] | None = None,
     ) -> NamedViewpoint:
         if vp_type == ViewpointType.FULL or self.p_policy <= 0.0:
             self.last_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
@@ -196,7 +206,8 @@ class MixtureSelector:
                 vp_type=vp_type, ctx=ctx, t=t, batch_size=batch_size, device=device, state=state
             )
         pol = self.policy_sel.select(
-            vp_type=vp_type, ctx=ctx, t=t, batch_size=batch_size, device=device, state=state
+            vp_type=vp_type, ctx=ctx, t=t, batch_size=batch_size, device=device, state=state,
+            local_patches=local_patches, write_snapshots=write_snapshots,
         )
         if self.p_policy >= 1.0:
             self.last_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
@@ -296,6 +307,8 @@ class RandomSelector:
         batch_size: int,
         device: torch.device,
         state: RecurrentState,
+        local_patches: Tensor | None = None,
+        write_snapshots: list[Tensor] | None = None,
     ) -> NamedViewpoint:
         """Create a NamedViewpoint (has .name for viz, convertible to canvit Viewpoint).
 

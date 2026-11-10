@@ -372,7 +372,10 @@ class DistillRunTask:
             groups["backbone"] = list(model.parameters())
         if spec.train_policy:
             assert joint is not None
-            groups["policy"] = list(joint.scorer.parameters())
+            params = list(joint.scorer.parameters())
+            if joint.critic is not None:  # Q-Prop: critic rides the same param group/LR
+                params += list(joint.critic.parameters())
+            groups["policy"] = params
         return groups
 
     # --- visualization (ported from train/loop.py; saved LOCALLY, never uploaded) ---

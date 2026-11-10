@@ -23,7 +23,7 @@
 set -euo pipefail
 
 # === ESSENTIALS ===
-RUN_GROUP=jon_exp32_pretrain_lrdrop
+RUN_GROUP=caglar_exp32_pretrain_lrdrop
 RUN_NAME=exp32-uniform16-teacherinit-lrdrop
 ARRAY=0-24%1                  # 25 jobs x 8192 = 204,800 steps
 TIME=0-02:00:00
@@ -40,7 +40,7 @@ if [ ! -f "$SEED_CKPT" ]; then
 fi
 
 # === config (same as phase A, except the LR and no warmup) ===
-CFG_WANDB_PROJECT=jon_exp32_pretrain_lrdrop
+CFG_WANDB_PROJECT=caglar_exp32_pretrain_lrdrop
 CFG_SEED_CKPT=$SEED_CKPT
 CFG_PEAK_LR=0.00004           # 4e-4 x 0.1
 CFG_WARMUP_STEPS=0            # -> ConstantLR at 4e-5 from step 0

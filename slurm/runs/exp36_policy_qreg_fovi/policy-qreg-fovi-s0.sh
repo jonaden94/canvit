@@ -53,7 +53,7 @@
 set -euo pipefail
 
 # === ESSENTIALS ===
-RUN_GROUP=jon_exp36_policy_qreg_fovi
+RUN_GROUP=caglar_exp36_policy_qreg_fovi
 SEED="${SEED:-0}"
 RUN_NAME=exp36-policy-qreg-fovi-s$SEED
 ARRAY=0-0%1                  # single job: 9000 steps fits inside the walltime
@@ -75,7 +75,7 @@ CFG_MODEL_REPO=/mnt/vast-nhr/projects/nib00021/jonathan/repos/canvit/logs/jon_ex
 CFG_PROBE_REPO=$_PROBE_RUN/best.pt   # the training checkpoint itself; no conversion
 
 # === config (exp31 lossfix recipe; only the grid follows the probe) ===
-CFG_WANDB_PROJECT=jon_exp36_policy_qreg_fovi
+CFG_WANDB_PROJECT=caglar_exp36_policy_qreg_fovi
 CFG_SEED=$SEED
 CFG_MAX_STEPS=9000           # 9000, not 8000: the loop evaluates on step % val_every == 0
                              # and never reaches max_steps, so an 8000-step run's last eval

@@ -101,10 +101,13 @@ class Frontend(nn.Module):
     sizes: list[int]
     groups: tuple[str, ...]
 
-    def __init__(self, canvas_dim: int, width: int, *, groups: tuple[str, ...] = FEATURE_GROUPS):
+    def __init__(
+        self, canvas_dim: int, width: int, *, groups: tuple[str, ...] = FEATURE_GROUPS,
+        local_dim: int | None = None,
+    ):
         super().__init__()
         self.groups = groups
-        self.sizes = group_sizes(canvas_dim, groups)
+        self.sizes = group_sizes(canvas_dim, groups, local_dim)
         self.bn = nn.BatchNorm2d(sum(self.sizes))
         self.proj = nn.ModuleList([nn.Conv2d(sz, width, 1) for sz in self.sizes])
         self.norm = nn.ModuleList([LayerNorm2d(width) for _ in self.sizes])
@@ -176,13 +179,14 @@ class ViewpointScorer(  # pyright: ignore[reportIncompatibleMethodOverride]  # S
         dueling: bool = False,
         action_space: ActionSpace = "safebox",
         readout: Readout = "unet",
+        local_dim: int | None = None,
     ):
         super().__init__()
         scales, groups = tuple(scales), tuple(groups)  # config.json round-trips tuples as lists
         assert len(scales) == n_scale, "need one entry in `scales` per scale channel"
         self.action_space: ActionSpace = action_space
         self.readout: Readout = readout
-        self.frontend = Frontend(canvas_dim, width, groups=groups)
+        self.frontend = Frontend(canvas_dim, width, groups=groups, local_dim=local_dim)
         # 'local' skips the U-Net entirely -- do not INSTANTIATE it either, or the unused
         # params would ride in the optimizer and the published state_dict.
         if readout == "unet":
@@ -206,7 +210,7 @@ class ViewpointScorer(  # pyright: ignore[reportIncompatibleMethodOverride]  # S
         )
         # dueling: V(s) from the mean-pooled INPUT features (a scalar is not location-resolved, so pooled
         # conditioning is fine); the map becomes a mean-zero advantage. Argmax — hence deploy — is unchanged.
-        ch = feature_channels(canvas_dim, groups)
+        ch = feature_channels(canvas_dim, groups, local_dim)
         self.vhead = nn.Sequential(nn.Linear(ch, 64), nn.GELU(), nn.Linear(64, 1)) if dueling else None
 
     def forward(self, feats: Tensor) -> Tensor:
