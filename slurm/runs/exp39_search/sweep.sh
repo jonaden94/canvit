@@ -20,7 +20,7 @@
 # val trials); base / sup-every / gain-reward have 3 seeds, so their spread is the noise floor.
 set -euo pipefail
 
-WHICH="${1:?usage: sweep.sh A|B|test}"
+WHICH="${1:?usage: sweep.sh A|B|C|D|E|test}"
 RUN_GROUP=jon_exp39_search
 TASK=search
 NGPU=1
@@ -70,6 +70,23 @@ policy-lr5e-4-s1     --cfg.seed 1 $PLR5
 policy-lr1e-3-s1     --cfg.seed 1 $PLR10
 aug-none-s1          --cfg.seed 1 $AUG_NONE
 " ;;
+C|D)  # 2026-11-09, owner: replicate the only lead (head LR 3e-4, 1 seed so far) and the gain
+    # reward's fixation effect (gain-reward vs sup-every differ ONLY in the reward; seeds 3-4
+    # paired). One run of each kind per job, so either job alone is a balanced replicate.
+    # A ran 10 runs in 44.4 h => ~4.4 h per run, 3 runs ~13.3 h.
+    TIME=0-16:00:00
+    if [ "$WHICH" = C ]; then HS=1; RS=3; else HS=2; RS=4; fi
+    SWEEP_SPEC="
+head-lr3e-4-s$HS       --cfg.seed $HS --cfg.peak-lr 3e-4
+gain-reward-s$RS       --cfg.seed $RS $GAIN
+sup-every-s$RS         --cfg.seed $RS $SUP
+" ;;
+E)  # 2026-11-10: job C (17206767) was cancelled by accident at step 17000 of its last run; that
+    # run's local dir and W&B run (mlfn5a9g) were deleted, and it is redone here from scratch.
+    TIME=0-06:00:00
+    SWEEP_SPEC="
+sup-every-s3         --cfg.seed 3 $SUP
+" ;;
 test)
     # Checks the wrapper: a run that fails at startup must not stop the next one; the second
     # run trains, validates, writes figures and eval.jsonl, and logs to a separate W&B
@@ -86,7 +103,7 @@ test)
 must-fail            --cfg.no-such-flag 1
 short-gain-reward    --cfg.seed 0 $GAIN
 " ;;
-*)  echo "usage: sweep.sh A|B|test" >&2; exit 1 ;;
+*)  echo "usage: sweep.sh A|B|C|D|E|test" >&2; exit 1 ;;
 esac
 
 if [ "${DRY_RUN:-0}" = 1 ]; then  # print what would run, submit nothing
