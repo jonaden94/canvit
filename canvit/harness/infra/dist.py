@@ -12,6 +12,7 @@ from __future__ import annotations
 import atexit
 import logging
 import os
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -66,7 +67,11 @@ def init_dist() -> None:
     # and the heterogeneous-mapping hang it warns about. Our rank → device
     # mapping is already established by torch.cuda.set_device(_local_rank)
     # above, so the explicit binding matches what PyTorch would have guessed.
-    dist.init_process_group(backend="nccl", rank=_rank, world_size=_world_size, device_id=_device)
+    # timeout: validation runs on rank 0 only while the other ranks wait at a barrier, and
+    # NCCL's default of 10 min aborts that wait. A multi-retina validation (one pass per
+    # retina; ~4-7 min estimated for exp38's 9) comes close, so allow 15 min.
+    dist.init_process_group(backend="nccl", rank=_rank, world_size=_world_size, device_id=_device,
+                            timeout=timedelta(minutes=15))
 
     # Register cleanup at interpreter shutdown to silence PyTorch's
     # "destroy_process_group() was not called before program exit" warning.
