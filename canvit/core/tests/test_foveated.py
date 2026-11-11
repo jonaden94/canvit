@@ -11,7 +11,6 @@ Covers:
 Skipped when the optional ``fovi`` dependency is not installed.
 """
 
-import importlib.util
 
 import pytest
 import torch
@@ -23,11 +22,6 @@ from canvit.core import (
     Viewpoint,
     create_backbone,
     create_patcher,
-)
-
-pytestmark = pytest.mark.skipif(
-    importlib.util.find_spec("fovi") is None,
-    reason="fovi optional dependency not installed",
 )
 
 # Image side length (px) fed to the foveated patcher in these tests. The

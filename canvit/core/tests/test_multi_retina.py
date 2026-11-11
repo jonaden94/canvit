@@ -10,7 +10,6 @@ and a forward without a retina choice fails.
 Skipped when the optional ``fovi`` dependency is not installed.
 """
 
-import importlib.util
 from dataclasses import replace
 
 import pytest
@@ -19,11 +18,6 @@ import torch
 from canvit.core import FoveatedPatcherConfig, Viewpoint
 from canvit.core.patcher.conditioning import PatchConditioningConfig
 from canvit.core.patcher.foveated import FoveatedPatcher
-
-pytestmark = pytest.mark.skipif(
-    importlib.util.find_spec("fovi") is None,
-    reason="fovi optional dependency not installed",
-)
 
 IMAGE_PX = 128
 EMBED = 32

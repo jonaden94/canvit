@@ -16,7 +16,6 @@ Skipped when the optional ``fovi`` dependency is not installed.
 """
 
 import copy
-import importlib.util
 
 import pytest
 import torch
@@ -31,11 +30,6 @@ from canvit.core import (
 )
 from canvit.core.patcher.conditioning import FiLMConfig, PatchConditioningConfig
 from canvit.core.patcher.square import SquarePatcher
-
-pytestmark = pytest.mark.skipif(
-    importlib.util.find_spec("fovi") is None,
-    reason="fovi optional dependency not installed",
-)
 
 # Compact configs (small fixation window so peripheral square samples spill out
 # of field and exercise the padding path). The fovi-derived params match the
@@ -213,7 +207,8 @@ def test_pad_mask_applied_under_zero_padding():
     than the image (128) so masked samples land *inside* the image — there,
     zeroing genuinely changes the result."""
     import torch.nn.functional as F
-    from fovi.sensing.coords import transform_sampling_grid
+
+    from canvit.core.foveation.coords import transform_sampling_grid
 
     p = _patcher(CFGS["strided"])  # pattern built at pattern_reference_size=64
     assert int(p.pad_mask.sum()) > 0

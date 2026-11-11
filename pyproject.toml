@@ -8,7 +8,9 @@ requires-python = ">=3.12"
 dependencies = [
     # --- core (was the separate canvit-pytorch distribution until the 2026-09-03 merge) ---
     "numpy>=2.2.0,<2.4.0",
-    "fovi",                 # was canvit-pytorch's [fovi] extra; the foveated/square patchers need it
+    "einops",               # canvit.core.foveation (the geometry ported from fovi, 2026-11-12)
+    "scipy",                # canvit.core.foveation: Delaunay, for sample_cortex="geodesic" only
+    "pygeodesic",           # canvit.core.foveation: geodesic KNN, for sample_cortex="geodesic" only
     "timm>=1.0.0",          # was canvit-pytorch's [policy] extra; canvit.core.policy's ConvNeXt-V2 blocks
     # --- training / eval ---
     "dinov3",
@@ -45,7 +47,7 @@ build-backend = "hatchling.build"
 packages = ["canvit"]
 
 [tool.uv]
-default-groups = ["dev", "cuda"]
+default-groups = ["dev", "cuda", "fovi-legacy"]
 # The cu126 (V100+A100) torch in the `cu126` group is a conflicting alternative
 # to the default `cuda` (cu13x) torch, so uv keeps two separate locked
 # resolutions instead of trying to reconcile them — same pattern as
@@ -59,13 +61,8 @@ url = "https://download.pytorch.org/whl/cu126"
 explicit = true
 
 [tool.uv.sources]
-# Local editable: picks up live edits in the sibling fovi clone. This source used to
-# live in CanViT-PyTorch/pyproject.toml and was inherited transitively via
-# `canvit-pytorch[fovi]`; the core merge folded that package in, so it is declared here
-# now. Without it uv would resolve `fovi` from PyPI instead of the fork. Assumes the
-# project repos are cloned side by side in one parent folder. Swap back to the remote
-# fork — `fovi = { git = "https://github.com/jonaden94/fovi.git" }` — to install without
-# the sibling present. See README "Local multi-repo setup".
+# fovi for the `fovi-legacy` group only (see there). Local editable sibling clone; swap to
+# `fovi = { git = "https://github.com/jonaden94/fovi.git" }` to install without it.
 fovi = { path = "../fovi", editable = true }
 dinov3 = { git = "https://github.com/facebookresearch/dinov3.git", rev = "54694f7627fd815f62a5dcc82944ffa6153bbb76" }
 dinov3-in1k-probes = { git = "https://github.com/m2b3/dinov3-in1k-probes.git" }
@@ -74,6 +71,11 @@ torch = [{ index = "pytorch-cu126", group = "cu126" }]
 torchvision = [{ index = "pytorch-cu126", group = "cu126" }]
 
 [dependency-groups]
+# canvit's own code no longer imports fovi (its geometry is ported to canvit.core.foveation,
+# 2026-11-12). This group keeps fovi and its dependencies in the venv for the launchers that
+# pin a pre-port TRAIN_COMMIT plus a FOVI_COMMIT: those snapshots still `import fovi`, and the
+# archived fovi needs its third-party packages installed. Default-on so `uv sync` keeps them.
+fovi-legacy = ["fovi"]
 dev = [
     "ipykernel",  # Jupyter kernel for notebooks (installed in both .venv and .venv-cu126)
     "basedpyright>=1.36.1",

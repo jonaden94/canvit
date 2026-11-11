@@ -1,4 +1,4 @@
-"""Foveated patcher: ``fovi`` RetinalTransform + KNNPartitioningPatchEmbedding.
+"""Foveated patcher: RetinalTransform + KNNPartitioningPatchEmbedding (``canvit.core.foveation``).
 
 Operates on the **full image** (not a pre-cropped glimpse). Foveation is
 anchored at the model's current fixation point, which lives in
@@ -8,7 +8,7 @@ a window of ``fix_size = scale * H`` px around the fixation (``scale=1`` -> full
 image, ``<1`` zooms in, ``>1`` zooms out — the periphery then samples outside
 the image, which is intentional). ``scale`` is per-sample (shape ``[B]``).
 
-Per-patch positions in the visual-field frame are exposed by fovi at
+Per-patch positions in the visual-field frame are exposed at
 ``KNNPartitioningPatchEmbedding.out_coords.cartesian_rowcol`` in ``[-1, 1]^2``
 (row, col); they map to image-frame scene positions as
 
@@ -21,14 +21,11 @@ With ``scale == 1`` (full-image foveation) this reduces to
 out-of-image patches, which RoPE handles gracefully (the model learns to ignore
 them implicitly).
 
-fovi's modules keep their sampling state as plain attributes rather than
-``nn.Module`` buffers. We override ``_apply`` so that the usual
-``model.to(device)`` walks those tensors too — without this, the sampling
-grid stays on CPU and ``grid_sample`` errors out at the first forward.
-
-``fovi`` is an optional dependency declared as the ``[fovi]`` extra of
-``canvit``. Importing this module without fovi installed raises a
-clear ``ImportError``.
+The geometry modules (ported from fovi, see :mod:`canvit.core.foveation`) keep
+their sampling state as plain attributes rather than ``nn.Module`` buffers. We
+override ``_apply`` so that the usual ``model.to(device)`` walks those tensors
+too — without this, the sampling grid stays on CPU and ``grid_sample`` errors
+out at the first forward.
 """
 
 from dataclasses import dataclass, field
@@ -38,6 +35,9 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from canvit.core.foveation.knn import KNNPartitioningPatchEmbedding
+from canvit.core.foveation.retina import RetinalTransform
+from canvit.core.foveation.square import fovi_ring_keep_mask
 from canvit.core.patcher.base import Patcher
 from canvit.core.patcher.conditioning import (
     PatchConditioningConfig,
@@ -172,19 +172,8 @@ def _set_reference_grid(kpe: nn.Module, side: int) -> None:
 _RETINA_REF_PX = 512
 
 
-def _require_fovi() -> None:
-    try:
-        import fovi  # noqa: F401
-    except ImportError as e:  # pragma: no cover - environment dependent
-        raise ImportError(
-            "FoveatedPatcher requires the optional `fovi` dependency. "
-            "Install via `pip install 'canvit'` or "
-            "`uv add 'canvit'`."
-        ) from e
-
-
 class FoveatedPatcher(Patcher):
-    """Foveated patcher backed by fovi.
+    """Foveated patcher: fovi's retina and KNN patch embedding (:mod:`canvit.core.foveation`).
 
     Patch positions are cached as a (non-persistent) buffer so that
     ``patcher.to(device)`` migrates them along with the model.
@@ -201,11 +190,6 @@ class FoveatedPatcher(Patcher):
         device: torch.device | str = "cpu",
     ) -> None:
         super().__init__()
-        _require_fovi()
-        # Imported lazily so the uniform path has no fovi dependency.
-        from fovi.arch.knnvit import KNNPartitioningPatchEmbedding
-        from fovi.sensing.retina import RetinalTransform
-
         self.cfg = cfg
         self.embed_dim = embed_dim
         dev = torch.device(device) if isinstance(device, str) else device
@@ -307,8 +291,6 @@ class FoveatedPatcher(Patcher):
         # `0` disables it and leaves the embedding bit-identical (no mask is even
         # computed); `prune_output_coords` is itself a no-op for an all-keep mask.
         if cfg.min_ring_new_pixels > 0:
-            from fovi.sensing.square import fovi_ring_keep_mask
-
             keep = fovi_ring_keep_mask(
                 self.kpe,
                 reference_size=cfg.pattern_reference_size,

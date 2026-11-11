@@ -223,7 +223,8 @@ def _extract_square_sample0(
     (``pad_mask``) slots are dropped; out-of-field non-masked slots are kept.
     """
     import torch.nn.functional as F
-    from fovi.sensing.coords import transform_sampling_grid
+
+    from canvit.core.foveation.coords import transform_sampling_grid
 
     patcher = getattr(model, "patcher", None)
     # Duck-type the square patcher (no retina/kpe; exposes the pattern directly).

@@ -5,7 +5,6 @@ generator in isolation and the end-to-end no-op-at-init property of the
 ``*_modulate`` backbone.
 """
 
-import importlib.util
 from dataclasses import replace
 
 import pytest
@@ -144,7 +143,6 @@ def test_standard_model_unchanged_no_modulation_keys():
     assert not any("token_modulation" in k for k in model.state_dict())
 
 
-@pytest.mark.skipif(importlib.util.find_spec("fovi") is None, reason="fovi not installed")
 def test_modulation_noop_at_init_foveated():
     """Same no-op-at-init guarantee with the foveated patcher (the real use case)."""
     fov = FoveatedPatcherConfig(
@@ -172,7 +170,6 @@ def test_modulation_noop_at_init_foveated():
     assert torch.allclose(o_std.state.canvas, o_mod.state.canvas, atol=1e-5)
 
 
-@pytest.mark.skipif(importlib.util.find_spec("fovi") is None, reason="fovi not installed")
 def test_modulation_noop_at_init_foveated_pruned():
     """No-op-at-init still holds when ring pruning removes patches: the trunk /
     cross-attn modulation adapts to the pruned token count automatically."""

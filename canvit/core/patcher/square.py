@@ -4,18 +4,18 @@ A counterpart to :class:`~canvit.core.patcher.foveated.FoveatedPatcher` that
 samples the full image on a frozen set of ``P`` axis-aligned ``side x side``
 square patches (``K = side**2`` samples each) and embeds each patch with a plain
 linear projection. The sampling *pattern* is derived once (at fixation
-``(0.5, 0.5)``) by one of three builders in :mod:`fovi.sensing.square`:
+``(0.5, 0.5)``) by one of three builders in :mod:`canvit.core.foveation.square`:
 
   - ``method="fovi"``            — squarified approximation of a fovi
     ``KNNPartitioningPatchEmbedding`` partition;
   - ``method="fovi_regularized"`` — the same, with outer rings snapped to an
     integer image-pixel lattice;
   - ``method="strided"``          — standalone strided-square foveation (no fovi
-    sampling geometry; only :func:`fovi.sensing.square.build_strided_square`).
+    sampling geometry; only :func:`canvit.core.foveation.square.build_strided_square`).
 
 The pattern is frozen in fixation-window-normalized visual-field coords and
-re-placed at the model's fixation at forward time via fovi's
-``transform_sampling_grid`` — exactly mirroring ``FoveatedPatcher``'s
+re-placed at the model's fixation at forward time via
+``canvit.core.foveation.coords.transform_sampling_grid`` — exactly mirroring ``FoveatedPatcher``'s
 ``scene_pos = centers + (fix_size / image_size) * vf_rowcol`` contract, so the
 two patchers are interchangeable from CanViT's point of view.
 
@@ -30,10 +30,6 @@ This patcher reuses the embed-head MLP (:func:`canvit.core.patcher.embed
 (:mod:`canvit.core.patcher.conditioning`). CoordConv conditioning is not
 supported (its kernel-weight surgery is specific to the KNN-conv embed) and is
 rejected at construction.
-
-``fovi`` is required only for ``method in {"fovi", "fovi_regularized"}`` (to
-build the geometry source) and for the shared coordinate transforms; it is
-declared as the ``[fovi]`` extra of ``canvit``.
 """
 
 from dataclasses import dataclass, field
@@ -43,6 +39,14 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from canvit.core.foveation.coords import transform_sampling_grid, xy_to_colrow, xy_to_rowcol
+from canvit.core.foveation.knn import KNNPartitioningPatchEmbedding
+from canvit.core.foveation.square import (
+    build_fovi_square,
+    build_fovi_square_regularized,
+    build_strided_square,
+    square_ring_keep_mask,
+)
 from canvit.core.patcher.base import Patcher
 from canvit.core.patcher.conditioning import PatchConditioningConfig, create_conditioner
 from canvit.core.patcher.embed import build_embed_head, count_unique_pixels
@@ -132,27 +136,14 @@ class SquarePatcherConfig:
     ``grid_sample``'s zero-padding, which only blanks out-of-*image* samples."""
 
 
-def _require_fovi() -> None:
-    try:
-        import fovi  # noqa: F401
-    except ImportError as e:  # pragma: no cover - environment dependent
-        raise ImportError(
-            "SquarePatcher requires the optional `fovi` dependency. "
-            "Install via `pip install 'canvit'` or "
-            "`uv add 'canvit'`."
-        ) from e
-
-
 def _build_fovi_pe(cfg: SquarePatcherConfig, device: torch.device | str):
-    """Construct a fovi ``KNNPartitioningPatchEmbedding`` as the geometry source.
+    """Construct a ``KNNPartitioningPatchEmbedding`` as the geometry source.
 
     Only its sampling coordinates / KNN partition are used (to derive the square
     pattern); the embedding weights are discarded. Mirrors the kpe construction
     in ``FoveatedPatcher`` so the squarified pattern approximates the same
     foveation the foveated patcher would produce under matching config.
     """
-    from fovi.arch.knnvit import KNNPartitioningPatchEmbedding
-
     return KNNPartitioningPatchEmbedding(
         in_channels=3,
         embed_dim=1,  # unused (geometry only)
@@ -173,13 +164,7 @@ def _build_fovi_pe(cfg: SquarePatcherConfig, device: torch.device | str):
 
 
 def _build_pattern(cfg: SquarePatcherConfig, device: torch.device | str):
-    """Dispatch to the selected :mod:`fovi.sensing.square` builder."""
-    from fovi.sensing.square import (
-        build_fovi_square,
-        build_fovi_square_regularized,
-        build_strided_square,
-    )
-
+    """Dispatch to the selected :mod:`canvit.core.foveation.square` builder."""
     # The pattern is built against a fixed reference window, decoupled from the
     # per-forward deploy window (scale * H).
     ref_size = cfg.pattern_reference_size
@@ -207,7 +192,7 @@ def _build_pattern(cfg: SquarePatcherConfig, device: torch.device | str):
 
 
 class SquarePatcher(Patcher):
-    """Square-patch patcher backed by a frozen :class:`fovi.sensing.square.SquarePattern`.
+    """Square-patch patcher backed by a frozen :class:`canvit.core.foveation.square.SquarePattern`.
 
     The sampling grid (``_sample_colrow``), per-patch scene rowcol
     (``_patch_rowcol``) and out-of-field mask (``_pad_mask``) are cached as
@@ -229,9 +214,6 @@ class SquarePatcher(Patcher):
         device: torch.device | str = "cpu",
     ) -> None:
         super().__init__()
-        _require_fovi()
-        from fovi.sensing.coords import xy_to_colrow, xy_to_rowcol
-
         assert cfg.conditioning.mode not in ("coordconv", "coordconv_film"), (
             "SquarePatcher does not support coordconv conditioning "
             f"(got mode={cfg.conditioning.mode!r}); its weight surgery is "
@@ -257,8 +239,6 @@ class SquarePatcher(Patcher):
         # positions, pad mask, FiLM, trunk modulation) is the pruned set. `0`
         # disables it (bit-identical to the unpruned pattern).
         if cfg.min_ring_new_pixels > 0:
-            from fovi.sensing.square import square_ring_keep_mask
-
             keep = square_ring_keep_mask(
                 pattern,
                 reference_size=cfg.pattern_reference_size,
@@ -406,8 +386,6 @@ class SquarePatcher(Patcher):
         }
 
     def forward(self, image: Tensor, viewpoint: Viewpoint) -> tuple[Tensor, Tensor]:
-        from fovi.sensing.coords import transform_sampling_grid
-
         B, C, H, W = image.shape
         assert H == W, f"SquarePatcher expects a square image; got H={H}, W={W}"
         assert C == 3, f"SquarePatcher expects 3-channel images; got C={C}"
