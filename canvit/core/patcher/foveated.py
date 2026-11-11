@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Literal
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 from canvit.core.patcher.base import Patcher
@@ -123,6 +124,45 @@ class FoveatedPatcherConfig:
     and add ~0 new pixels, so they can be dropped with no loss of pixel coverage.
     ``0`` (default) disables pruning and is bit-identical to the unpruned
     embedding. Drops whole rings (the decision is per-ring)."""
+    retinas: list[tuple[float, int, int, bool]] = field(default_factory=list)
+    """Multi-retina training: one entry ``(cmf_a, resolution, cart_patch_size,
+    force_patches_less_than_matched)`` per retina, at least two; the other fields are
+    shared by all retinas, and the top-level values of these four are then unused.
+    Empty (default): the single retina of the top-level fields, unchanged.
+    All retinas share one kernel tensor on one reference grid: ``ref_frame_side_length``
+    if set, else the largest native grid of the list under ``arch_flag``. FiLM's
+    ``(gamma, beta)`` are conditioned on the retina as well as on the patch position
+    (requires ``conditioning.mode='film'``). Every retina must give the same number of
+    patches. The caller picks each sample's retina with
+    :meth:`FoveatedPatcher.set_retinas` before the forwards of a rollout."""
+
+
+def _check_multi_retina_cfg(cfg: FoveatedPatcherConfig) -> None:
+    assert len(cfg.retinas) >= 2, (
+        "retinas: give at least two entries; a single retina is set by the top-level "
+        "cmf_a / resolution / cart_patch_size / force_patches_less_than_matched")
+    assert cfg.conditioning.mode == "film", (
+        "multi-retina training tells the model the retina through FiLM: set conditioning.mode='film'")
+    assert cfg.conditioning.film.mlp_hidden, "the retina embedding enters FiLM's first hidden layer"
+    assert cfg.arch_flag in ("", "doubleres"), f"arch_flag {cfg.arch_flag!r}: only '' or 'doubleres'"
+    unsupported = {"per_ring_kernel": cfg.per_ring_kernel, "padding != 'zero'": cfg.padding != "zero",
+                   "min_ring_new_pixels > 0": cfg.min_ring_new_pixels > 0}
+    bad = [k for k, v in unsupported.items() if v]
+    assert not bad, f"not supported with multiple retinas: {bad}"
+
+
+def _set_reference_grid(kpe: nn.Module, side: int) -> None:
+    """Move a built fovi KNN layer to a ``side`` x ``side`` kernel grid, as if it had been
+    built with ``ref_frame_side_length=side``: new reference cells, new routing of the
+    samples to the cells (``local_rf``) and a freshly initialized weight of the new shape.
+    Rebuilding the layer instead would redo its KNN search (~10 s per retina)."""
+    kpe.ref_frame_side_length = side
+    kpe.compute_reference_coords("")
+    kpe.local_rf = kpe.compute_local_rf()
+    w = kpe.weight
+    kpe.weight = nn.Parameter(torch.empty(kpe.out_channels, kpe.in_channels * side * side,
+                                          device=w.device, dtype=w.dtype))
+    kpe._init_conv_like()
 
 
 # Placeholder window (px) passed to ``RetinalTransform`` at construction. It
@@ -183,48 +223,80 @@ class FoveatedPatcher(Patcher):
         # from config alone so kpe's in_channels can be set before kpe is built.
         extra_in_channels = conditioner_extra_in_channels(cfg.conditioning)
 
-        # Retinal sampling. fovi's ``start_res`` / ``fixation_size`` only set the
-        # forward *default* window; they do NOT size the sampling grid (that is
-        # ``res_mult * resolution``). Since we always pass an explicit per-forward
-        # ``fixation_size = scale * H``, the construction value is inert — we pass
-        # a fixed placeholder (``_RETINA_REF_PX``).
-        self.retina = RetinalTransform(
-            resolution=cfg.resolution,
-            start_res=_RETINA_REF_PX,
-            fov=cfg.fov,
-            cmf_a=cfg.cmf_a,
-            style=cfg.style,
-            sampler=cfg.sampler,
-            fixation_size=_RETINA_REF_PX,
-            auto_match_cart_resources=cfg.auto_match_cart_resources,
-            device=str(dev),
-        )
+        # One retina (the default), or several for multi-retina training.
+        self._multi = len(cfg.retinas) > 0
+        if self._multi:
+            _check_multi_retina_cfg(cfg)
+            retinas = [tuple(r) for r in cfg.retinas]
+        else:
+            retinas = [(cfg.cmf_a, cfg.resolution, cfg.cart_patch_size, cfg.force_patches_less_than_matched)]
 
-        # KNN patch embedding on the foveated samples. in_res / in_cart_res
-        # use the *configured* resolution so the auto-match step inside the
-        # embedding matches the one inside RetinalTransform (notebook checks
-        # `in_coords match RT coords: True` under this convention).
-        self.kpe = KNNPartitioningPatchEmbedding(
-            in_channels=3 + extra_in_channels,
-            embed_dim=kpe_embed_dim,
-            in_res=cfg.resolution,
-            in_cart_res=cfg.resolution,
-            fov=cfg.fov,
-            cmf_a=cfg.cmf_a,
-            style=cfg.style,
-            auto_match_cart_resources=cfg.auto_match_cart_resources,
-            cart_patch_size=cfg.cart_patch_size,
-            force_patches_less_than_matched=cfg.force_patches_less_than_matched,
-            transposed=False,
-            max_coord_val=cfg.max_coord_val,
-            sample_cortex=cfg.sample_cortex,
-            arch_flag=cfg.arch_flag,
-            ref_frame_side_length=cfg.ref_frame_side_length,
-            padding=cfg.padding,
-            per_ring_kernel=cfg.per_ring_kernel,
-            rf_interp=cfg.rf_interp,
-            device=str(dev),
-        )
+        def build(cmf_a: float, resolution: int, cart_patch_size: int, force: bool) -> tuple[Any, Any]:
+            # Retinal sampling. fovi's ``start_res`` / ``fixation_size`` only set the
+            # forward *default* window; they do NOT size the sampling grid (that is
+            # ``res_mult * resolution``). Since we always pass an explicit per-forward
+            # ``fixation_size = scale * H``, the construction value is inert — we pass
+            # a fixed placeholder (``_RETINA_REF_PX``).
+            retina = RetinalTransform(
+                resolution=resolution,
+                start_res=_RETINA_REF_PX,
+                fov=cfg.fov,
+                cmf_a=cmf_a,
+                style=cfg.style,
+                sampler=cfg.sampler,
+                fixation_size=_RETINA_REF_PX,
+                auto_match_cart_resources=cfg.auto_match_cart_resources,
+                device=str(dev),
+            )
+            # KNN patch embedding on the foveated samples. in_res / in_cart_res
+            # use the *configured* resolution so the auto-match step inside the
+            # embedding matches the one inside RetinalTransform (notebook checks
+            # `in_coords match RT coords: True` under this convention).
+            kpe = KNNPartitioningPatchEmbedding(
+                in_channels=3 + extra_in_channels,
+                embed_dim=kpe_embed_dim,
+                in_res=resolution,
+                in_cart_res=resolution,
+                fov=cfg.fov,
+                cmf_a=cmf_a,
+                style=cfg.style,
+                auto_match_cart_resources=cfg.auto_match_cart_resources,
+                cart_patch_size=cart_patch_size,
+                force_patches_less_than_matched=force,
+                transposed=False,
+                max_coord_val=cfg.max_coord_val,
+                sample_cortex=cfg.sample_cortex,
+                arch_flag=cfg.arch_flag,
+                ref_frame_side_length=cfg.ref_frame_side_length,
+                padding=cfg.padding,
+                per_ring_kernel=cfg.per_ring_kernel,
+                rf_interp=cfg.rf_interp,
+                device=str(dev),
+            )
+            return retina, kpe
+
+        geoms = [build(*r) for r in retinas]
+        self.retina, self.kpe = geoms[0]
+
+        if self._multi:
+            # One kernel grid for all retinas: `ref_frame_side_length` if set, else the
+            # largest native grid of the list (fovi's ceil(sqrt(k)) per retina, doubled by
+            # `doubleres`).
+            side = cfg.ref_frame_side_length or max(int(kpe.ref_grid_size) for _, kpe in geoms)
+            for _, kpe in geoms:
+                if int(kpe.ref_grid_size) != side:
+                    _set_reference_grid(kpe, side)
+            # The one kernel tensor is retina 0's `kpe.weight` (same state_dict key as a
+            # single-retina patcher); the other retinas keep only their geometry.
+            for _, kpe in geoms[1:]:
+                del kpe.weight
+            self.extra_retinas = nn.ModuleList(r for r, _ in geoms[1:])
+            self.extra_kpes = nn.ModuleList(k for _, k in geoms[1:])
+            n_out = [int(kpe.out_coords.cartesian.shape[0]) for _, kpe in geoms]
+            assert len(set(n_out)) == 1, f"all retinas must give the same number of patches; got {n_out}"
+            self.retina_names = [f"cmf{a:g}_res{r}_cps{c}" for a, r, c, _ in retinas]
+            assert len(set(self.retina_names)) == len(retinas), f"duplicate retinas: {self.retina_names}"
+            self._active_retinas: int | Tensor | None = None
 
         # Optional ring pruning: drop patches whose eccentricity ring adds fewer
         # than `min_ring_new_pixels` new pixels at the `pattern_reference_size`
@@ -250,6 +322,10 @@ class FoveatedPatcher(Patcher):
         # in state_dict.
         rowcol = self.kpe.out_coords.cartesian_rowcol.detach().clone().to(torch.float32)
         self.register_buffer("_patch_rowcol", rowcol, persistent=False)
+        if self._multi:  # [R, N, 2]: every retina's positions, picked per sample in forward
+            rowcol_all = torch.stack([k.out_coords.cartesian_rowcol.detach().clone().to(torch.float32)
+                                      for _, k in geoms])
+            self.register_buffer("_patch_rowcol_all", rowcol_all, persistent=False)
 
         # MLP head over the per-patch tokens produced by `self.kpe`. Empty when
         # `hidden_dims_patch_embed` is empty, in which case `self.embed_head` is
@@ -263,6 +339,9 @@ class FoveatedPatcher(Patcher):
         patch_xy = self.kpe.out_coords.cartesian.detach().clone().to(torch.float32)
         # Cache fovea-centric (x, y) for trunk/cross-attn modulation (constant).
         self.register_buffer("_patch_xy", patch_xy, persistent=False)
+        if self._multi:  # FiLM gets every retina's patch centers, [R, N, 2]
+            patch_xy = torch.stack([k.out_coords.cartesian.detach().clone().to(torch.float32)
+                                    for _, k in geoms])
         self.conditioner = create_conditioner(
             cfg.conditioning,
             kpe_out=kpe_embed_dim,
@@ -275,7 +354,51 @@ class FoveatedPatcher(Patcher):
     def n_patches(self) -> int:
         return int(self._patch_rowcol.shape[0])
 
+    @property
+    def n_retinas(self) -> int:
+        return 1 + len(self.extra_kpes) if self._multi else 1
+
+    def geometry(self, retina: int) -> tuple[Any, Any]:
+        """``(RetinalTransform, KNN patch embedding)`` of retina ``retina``. Only retina 0's
+        embedding holds the kernel weight (``self.kpe.weight``)."""
+        if retina == 0:
+            return self.retina, self.kpe
+        return self.extra_retinas[retina - 1], self.extra_kpes[retina - 1]
+
+    def set_retinas(self, retinas: int | Tensor | None) -> None:
+        """Multi-retina patcher: pick the retina of each sample for the forwards that
+        follow, until the next call. An int applies to every sample, a ``[B]`` integer
+        tensor gives one retina per sample, ``None`` clears the choice (a forward then
+        fails). A rollout must keep one choice for all its glimpses."""
+        assert self._multi, "set_retinas: this patcher has a single retina"
+        if isinstance(retinas, Tensor):
+            retinas = retinas.detach().to("cpu", torch.long)
+            assert retinas.ndim == 1 and 0 <= int(retinas.min()) and int(retinas.max()) < self.n_retinas
+        elif retinas is not None:
+            assert 0 <= int(retinas) < self.n_retinas, f"retina {retinas} of {self.n_retinas}"
+            retinas = int(retinas)
+        self._active_retinas = retinas
+
+    def active_retina(self, sample: int) -> int:
+        """The retina the current choice gives sample ``sample`` (0 for a single retina)."""
+        if not self._multi:
+            return 0
+        a = self._active_retinas
+        assert a is not None, "no retinas set (set_retinas)"
+        return a if isinstance(a, int) else int(a[sample])
+
+    def _retina_ids(self, batch_size: int) -> Tensor:
+        a = self._active_retinas
+        assert a is not None, "multi-retina patcher: call set_retinas(...) before the forwards of a rollout"
+        if isinstance(a, int):
+            return torch.full((batch_size,), a, dtype=torch.long)
+        assert a.shape[0] == batch_size, f"set_retinas got {a.shape[0]} retinas for a batch of {batch_size}"
+        return a
+
     def patch_positions(self) -> Tensor:
+        if self._multi:
+            raise NotImplementedError(
+                "trunk token modulation reads one patch layout; not supported with multiple retinas")
         return self._patch_xy
 
     def _apply(self, fn: Callable[[Tensor], Tensor], recurse: bool = True) -> "FoveatedPatcher":
@@ -322,21 +445,25 @@ class FoveatedPatcher(Patcher):
                     except Exception:
                         pass
 
-        sampler = self.retina.sampler
         # Order matters less than coverage; SamplingCoords lives both on the
         # sampler and on the KNN patcher's in_coords / out_coords. With
         # sampler="pooling" the sampler is a KNNGridSampler which carries
         # additional `highres_coords` and a `pooler` submodule worth walking.
-        fovi_objs = (
-            self.retina,
-            sampler,
-            getattr(sampler, "coords", None),
-            getattr(sampler, "highres_coords", None),
-            getattr(sampler, "pooler", None),
-            self.kpe,
-            getattr(self.kpe, "in_coords", None),
-            getattr(self.kpe, "out_coords", None),
-        )
+        # Every retina's objects (one retina unless `cfg.retinas`).
+        fovi_objs: list[Any] = []
+        for i in range(self.n_retinas):
+            retina, kpe = self.geometry(i)
+            sampler = retina.sampler
+            fovi_objs += [
+                retina,
+                sampler,
+                getattr(sampler, "coords", None),
+                getattr(sampler, "highres_coords", None),
+                getattr(sampler, "pooler", None),
+                kpe,
+                getattr(kpe, "in_coords", None),
+                getattr(kpe, "out_coords", None),
+            ]
         for obj in fovi_objs:
             migrate(obj)
 
@@ -353,8 +480,9 @@ class FoveatedPatcher(Patcher):
                 except Exception:
                     pass
 
-    def pattern_stats(self) -> dict[str, int]:
-        """High-level characterization of the foveated sampling pattern, for logging.
+    def pattern_stats(self, retina: int = 0) -> dict[str, int]:
+        """High-level characterization of the foveated sampling pattern of retina
+        ``retina`` (0 = the only one, unless ``cfg.retinas``), for logging.
 
         ``n_patches`` / ``samples_per_patch`` (= the per-patch KNN member count
         ``kpe._k``, with outer rings padded; patches overlap, so this is not
@@ -364,12 +492,13 @@ class FoveatedPatcher(Patcher):
         scale, centered (the deploy window is per-forward ``scale * H``). See
         :func:`canvit.core.patcher.embed.count_unique_pixels`.
         """
+        _, kpe = self.geometry(retina)
         return {
             "n_patches": int(self.n_patches),
-            "samples_per_patch": int(self.kpe._k),
-            "n_padded": int(self.kpe.knn_indices_pad_mask.sum()),
+            "samples_per_patch": int(kpe._k),
+            "n_padded": int(kpe.knn_indices_pad_mask.sum()),
             "unique_pixels": count_unique_pixels(
-                self.kpe.in_coords.cartesian, self.cfg.pattern_reference_size
+                kpe.in_coords.cartesian, self.cfg.pattern_reference_size
             ),
         }
 
@@ -389,6 +518,10 @@ class FoveatedPatcher(Patcher):
         # [B] (squeeze collapses B=1 to 0-d / collides with the [h,w] case at
         # B=2); the [B, 2] form is unambiguous for every batch size.
         fix_size = torch.stack([fix_px, fix_px], dim=-1)  # [B, 2]
+        if self._multi:
+            patches, rowcol_b = self._embed_multi(image, fix_loc=fix_loc, fix_size=fix_size, scales=scales)
+            scene_pos = viewpoint.centers.view(B, 1, 2).to(torch.float32) + scales.view(B, 1, 1) * rowcol_b
+            return patches, scene_pos
         sensor = self.retina(image, fix_loc=fix_loc, fixation_size=fix_size)  # [B, 3, N_samples]
         sensor = self.conditioner.transform_sensor(sensor)  # +coord channels (CoordConv)
         patches = self.kpe(sensor)  # [B, N_patches, kpe_embed_dim]
@@ -408,3 +541,29 @@ class FoveatedPatcher(Patcher):
             + scales.view(B, 1, 1) * rowcol.view(1, -1, 2)
         )  # [B, N, 2]
         return patches, scene_pos
+
+    # Eager: the per-retina grouping depends on the data (which retinas a batch holds and
+    # how many samples each), which would make torch.compile recompile or break the graph.
+    @torch.compiler.disable
+    def _embed_multi(self, image: Tensor, *, fix_loc: Tensor, fix_size: Tensor,
+                     scales: Tensor) -> tuple[Tensor, Tensor]:
+        """Multi-retina tokens and visual-field positions: each sample through its own
+        retina's sampling and KNN routing, all through the one kernel ``self.kpe.weight``
+        (the same steps as fovi's KNN-conv forward), then FiLM conditioned on the retina.
+        Returns ``[B, N, embed_dim]`` tokens and ``[B, N, 2]`` (row, col) positions."""
+        ids = self._retina_ids(image.shape[0])  # [B], CPU
+        dev = image.device
+        parts, order = [], []
+        for i in torch.unique(ids).tolist():
+            idx = torch.nonzero(ids == i).squeeze(1)
+            idx_dev = idx.to(dev)
+            retina, kpe = self.geometry(i)
+            sensor = retina(image[idx_dev], fix_loc=fix_loc[idx_dev], fixation_size=fix_size[idx_dev])
+            feats = kpe._apply_local_rf(kpe._pad_and_gather_knns(sensor))  # [b, N, C * n_ref]
+            parts.append(F.linear(feats, self.kpe.weight, self.kpe.bias))  # [b, N, kpe_out]
+            order.append(idx)
+        patches = torch.cat(parts)[torch.argsort(torch.cat(order)).to(dev)]  # back to batch order
+        ids_dev = ids.to(dev)
+        patches = self.conditioner.modulate_kpe_output(patches, scale=scales, retina=ids_dev)  # FiLM
+        patches = self.embed_head(patches)
+        return patches, self._patch_rowcol_all[ids_dev]

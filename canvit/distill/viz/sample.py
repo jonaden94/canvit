@@ -137,6 +137,10 @@ def _extract_foveated_sample0(
     # Duck-type: foveated patcher has `retina` and `kpe` (KNNPartitioningPatchEmbedding).
     if not hasattr(patcher, "retina") or not hasattr(patcher, "kpe"):
         return None
+    # Sample 0's retina (the only one unless the patcher has several, `cfg.retinas`).
+    retina, kpe = patcher.retina, patcher.kpe
+    if getattr(patcher, "n_retinas", 1) > 1:
+        retina, kpe = patcher.geometry(patcher.active_retina(0))
 
     img0 = image[0:1]  # [1, 3, H, W]
     H = int(img0.shape[-1])
@@ -148,7 +152,7 @@ def _extract_foveated_sample0(
     fix_size_norm = scale0
     fix_loc = (viewpoint.centers[0:1].to(torch.float32) + 1.0) * 0.5  # [1, 2] in [0, 1]
     with torch.no_grad():
-        sensor = patcher.retina(img0, fix_loc=fix_loc, fixation_size=fix_size)  # [1, 3, N_samples]
+        sensor = retina(img0, fix_loc=fix_loc, fixation_size=fix_size)  # [1, 3, N_samples]
 
     # Per-sample RGB in [0, 1]. RetinalTransform output mirrors the ImageNet-
     # normalized image it consumed; denormalize so colors are display-ready.
@@ -160,20 +164,20 @@ def _extract_foveated_sample0(
     sample_colors = imagenet_denormalize_to_numpy(s_faux)[..., 0, :]  # actually [N_samples, 3]
     sample_colors = np.clip(np.asarray(sample_colors, dtype=np.float32), 0.0, 1.0)
 
-    sample_cart_rowcol = _as_numpy(patcher.retina.sampler.coords.cartesian_rowcol, dtype=np.float32)
-    raw_sizes = getattr(patcher.retina, "scatter_sizes", None)
+    sample_cart_rowcol = _as_numpy(retina.sampler.coords.cartesian_rowcol, dtype=np.float32)
+    raw_sizes = getattr(retina, "scatter_sizes", None)
     if raw_sizes is not None:
         sample_sizes = _as_numpy(raw_sizes, dtype=np.float32) * 4.0 + 1.5
     else:
         sample_sizes = np.full(sample_cart_rowcol.shape[0], 3.0, dtype=np.float32)
 
-    patch_cart_rowcol = _as_numpy(patcher.kpe.out_coords.cartesian_rowcol, dtype=np.float32)
-    knn_indices = _as_numpy(patcher.kpe.knn_indices)
-    knn_pad_mask = _as_numpy(patcher.kpe.knn_indices_pad_mask).astype(bool)
-    out_polar_r = _as_numpy(patcher.kpe.out_coords.polar[:, 0], dtype=np.float32)
+    patch_cart_rowcol = _as_numpy(kpe.out_coords.cartesian_rowcol, dtype=np.float32)
+    knn_indices = _as_numpy(kpe.knn_indices)
+    knn_pad_mask = _as_numpy(kpe.knn_indices_pad_mask).astype(bool)
+    out_polar_r = _as_numpy(kpe.out_coords.polar[:, 0], dtype=np.float32)
 
     cart_pad_rowcol: np.ndarray | None = None
-    pad_rowcol_attr = getattr(patcher.kpe.in_coords, "cartesian_pad_rowcol", None)
+    pad_rowcol_attr = getattr(kpe.in_coords, "cartesian_pad_rowcol", None)
     if pad_rowcol_attr is not None:
         cart_pad_rowcol = _as_numpy(pad_rowcol_attr, dtype=np.float32)
     else:
@@ -181,7 +185,7 @@ def _extract_foveated_sample0(
         # Real samples here are in the (row, col) = (-y, x) frame (the
         # `cartesian_rowcol` convention, xy_to_rowcol format='-11'); apply the
         # same map so pad markers/hulls align with the sample scatter.
-        pad_xy = getattr(patcher.kpe.in_coords, "cartesian_pad_coords", None)
+        pad_xy = getattr(kpe.in_coords, "cartesian_pad_coords", None)
         if pad_xy is not None:
             pad_xy = _as_numpy(pad_xy, dtype=np.float32)
             cart_pad_rowcol = np.stack([-pad_xy[:, 1], pad_xy[:, 0]], axis=1)

@@ -54,6 +54,16 @@ def create_patcher(
 
         cfg = foveated_config if foveated_config is not None else FoveatedPatcherConfig()
         patcher = FoveatedPatcher(cfg, embed_dim=backbone.embed_dim, device=device)
+        if patcher.n_retinas > 1:
+            log.info("Created multi-retina foveated patcher: %d retinas, fov=%.1f, kernel grid %dx%d, "
+                     "rf_interp=%s", patcher.n_retinas, cfg.fov, int(patcher.kpe.ref_grid_size),
+                     int(patcher.kpe.ref_grid_size), cfg.rf_interp)
+            for i, name in enumerate(patcher.retina_names):
+                st = patcher.pattern_stats(i)
+                log.info("  retina %d %s: n_patches=%d samples_per_patch=%d n_padded=%d unique_pixels=%d",
+                         i, name, st["n_patches"], st["samples_per_patch"], st["n_padded"],
+                         st["unique_pixels"])
+            return patcher
         st = patcher.pattern_stats()
         log.info(
             "Created foveated patcher: fov=%.1f cmf_a=%.4f resolution=%d "
