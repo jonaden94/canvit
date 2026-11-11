@@ -41,7 +41,8 @@ each task folder holds only what is specific to that task.**
 ```
 canvit/
 ├── core/        THE MODEL — canvas ViT, patchers, HF-hub classes, probes, teacher,
-│                standardizers, viewpoint, rope. Imports nothing from the layers below.
+│                standardizers, viewpoint, rope, foveation (the geometry ported from fovi).
+│                Imports nothing from the layers below.
 ├── harness/     entry point + shared primitives
 │                six flat files: run evaluate cli loop spec config;
 │                subpackages: rollout/ policy/ optim/ infra/ viz/
@@ -74,9 +75,15 @@ Plus `slurm/` (launchers), `scripts/bench/pt/` (inference benchmark), `scripts/d
 
 ```
 repos/
-├── canvit/   this repo                       LIVE
-└── fovi/     foveated-vision geometry        LIVE — the only sibling dependency
+├── canvit/   this repo                       LIVE — self-contained since 2026-11-12
+└── fovi/     foveated-vision geometry        kept for pre-port pinned runs only
 ```
+
+**fovi was ported into `canvit/core/foveation/` on 2026-11-12** (fovi 27b1bde, planar
+geometry, bit-identical: `claude_dev/fovi_port/`). canvit's code no longer imports fovi; new
+launchers pin `TRAIN_COMMIT` only. fovi stays on disk and in the venv (`fovi-legacy`
+dependency group) because launchers pinning a pre-port `TRAIN_COMMIT` + `FOVI_COMMIT` still
+`import fovi` — do not remove either.
 
 Four clones are kept **read-only, as fallback references. Do not edit them**, and prefer
 this repo's equivalent:
@@ -187,9 +194,9 @@ cap at **CUDA 12.8** (A100/MIG, driver 570.x), where a `cu130` build is GPU-dead
 Rebuild the cu126 env with:
 `UV_PROJECT_ENVIRONMENT=.venv-cu126 uv sync --no-group cuda --group cu126`
 
-`[tool.uv.sources]` links `fovi` as a **relative-path editable install**
-(`fovi = { path = "../fovi", editable = true }`), so the two repos must be cloned as
-siblings. Swap to `{ git = ... }` to install without it.
+`[tool.uv.sources]` links `fovi` (only for the default-on `fovi-legacy` group, see above) as a
+**relative-path editable install** (`fovi = { path = "../fovi", editable = true }`), so the
+two repos are cloned as siblings. Swap to `{ git = ... }` to install without it.
 
 # Datasets and env variables
 
@@ -222,6 +229,8 @@ the per-job `$TMPDIR/canvit_src`, prepending that snapshot to `PYTHONPATH` with
 - Legacy spellings still accepted: `PRETRAIN_COMMIT` (88 launchers set it) and
   `PYTORCH_COMMIT` (106) — see Gotchas.
 - **Workflow:** edit → commit/push → submit runs pinning the new hash.
+- `FOVI_COMMIT` matters only for a `TRAIN_COMMIT` from before the fovi port (2026-11-12);
+  on a later one it has no effect and the sbatch warns.
 
 # Guardrails
 

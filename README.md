@@ -200,16 +200,16 @@ either alone against a frozen model or jointly with the task.
 
 ## Repository layout
 
-Two repos are live:
-
 ```
 repos/
-├── fovi/               # foveated-vision library: cortical-magnification patch geometry
-└── canvit/             # this repo: the model + all training + all evaluation
+├── canvit/             # this repo: the model + all training + all evaluation
+└── fovi/               # foveated-vision library; kept for runs pinned before 2026-11-12
 ```
 
-The dependency direction is `fovi` → this repo. Each has its **own** uv-managed virtual
-environment.
+canvit is self-contained: the foveated geometry it used from `fovi` (fovi 27b1bde, planar
+visual field) was ported into [`canvit/core/foveation/`](canvit/core/foveation/) on
+2026-11-12, bit-identical (`claude_dev/fovi_port/`). `fovi` stays a sibling only for launchers
+that pin a pre-port `TRAIN_COMMIT` plus a `FOVI_COMMIT`: those snapshots still `import fovi`.
 
 Four further clones are kept **read-only, as fallback references** — do not edit them, and
 prefer this repo's equivalents:
@@ -238,17 +238,12 @@ torch is pinned in the `cuda` (default) and `cu126` dependency groups in
 ship sm_70 kernels, which the CUDA-13.x wheels dropped. Both share the same
 `[tool.uv.sources]`.
 
-`[tool.uv.sources]` links the one remaining sibling as a **relative-path editable install**
-(`fovi = { path = "../fovi", editable = true }`). Relative paths resolve on any machine as
-long as the repos are siblings, and the editable install means edits in the local `fovi`
-clone take effect immediately. To install *without* the sibling present, point that entry at
-the remote instead — `fovi = { git = "https://github.com/jonaden94/fovi.git" }` — and
-`uv sync`.
-
-Until 2026-09-03 the model was a second sibling (`canvit-pytorch = { path =
-"../CanViT-PyTorch", editable = true }`, with `fovi` arriving transitively through its
-`[fovi]` extra). It is now `canvit/core/` in this repo, so that source is gone and `fovi` is
-declared here directly.
+The default-on `fovi-legacy` dependency group installs the `fovi` sibling as a
+**relative-path editable install** (`fovi = { path = "../fovi", editable = true }` in
+`[tool.uv.sources]`), so the venv keeps fovi and its dependencies for the pre-port pinned
+launchers. canvit's own code does not import it. To install without the sibling present,
+point that entry at the remote — `fovi = { git = "https://github.com/jonaden94/fovi.git" }`
+— or drop the group (`--no-group fovi-legacy`) if you never run pre-port pins.
 
 ### Environment variables
 
@@ -519,8 +514,8 @@ but a single run must use **one** fixed version of the code. The launchers
 therefore pin each repo to an exact commit:
 
 ```bash
-TRAIN_COMMIT=<sha>     # this repo — the model AND the trainer
-FOVI_COMMIT=<sha>      # fovi
+TRAIN_COMMIT=<sha>     # this repo — the model, the trainer and (since 2026-11-12) the foveated geometry
+FOVI_COMMIT=<sha>      # fovi — ONLY for a TRAIN_COMMIT before the fovi port; no effect after it
 ```
 
 `harness_train.sbatch` extracts those commits with an offline `git archive`
@@ -631,7 +626,7 @@ are the record of how this repo came to hold everything:
 ## Troubleshooting
 
 **Errors loading a pretrained checkpoint** usually mean the model code and the checkpoint
-disagree. Re-sync the environment (`uv sync`) so `canvit/core/` and `fovi` are current.
+disagree. Re-sync the environment (`uv sync`) so `canvit/core/` is current.
 
 **`ModuleNotFoundError: canvit_pytorch`** means you are running code written against the
 pre-2026-09-03 layout. The model is `canvit.core` now; the old top-level package exists only

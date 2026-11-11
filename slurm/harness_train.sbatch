@@ -162,6 +162,24 @@ else
     fi
 fi
 
+# --- Where does the foveated GEOMETRY come from? -------------------------------------------
+# On 2026-11-12 the fovi code canvit used was ported into canvit/core/foveation/. A snapshot
+# that has that directory (or no pin at all: the editable install is the current clone) never
+# imports fovi, so FOVI_COMMIT does nothing there. An older snapshot still imports fovi, and
+# without FOVI_COMMIT gets the venv's editable fovi clone, i.e. its current HEAD.
+_POST_PORT=1
+if [ -n "${TRAIN_COMMIT:-}" ] && [ ! -d "$_CODE_DIR/canvit/canvit/core/foveation" ]; then
+    _POST_PORT=0
+fi
+if [ "$_POST_PORT" = 1 ] && [ -n "${FOVI_COMMIT:-}" ]; then
+    log "WARNING: FOVI_COMMIT=$FOVI_COMMIT has NO EFFECT on this job: its canvit carries the"
+    log "         foveated geometry itself (canvit/core/foveation/, pinned by TRAIN_COMMIT)."
+    log "         Drop FOVI_COMMIT from new launchers."
+elif [ "$_POST_PORT" = 0 ] && [ -z "${FOVI_COMMIT:-}" ]; then
+    log "WARNING: TRAIN_COMMIT=$TRAIN_COMMIT predates the fovi port and imports fovi, but"
+    log "         FOVI_COMMIT is not set -- foveated runs then use the venv's live fovi clone."
+fi
+
 export TORCHINDUCTOR_CACHE_DIR="$TMPDIR/torchinductor"
 export TRITON_CACHE_DIR="$TMPDIR/triton"
 export CUDA_CACHE_PATH="$TMPDIR/nv"

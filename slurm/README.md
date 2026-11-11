@@ -20,10 +20,11 @@ slurm/
 
 Copy the closest launcher from `runs/` and edit two things:
 
-1. **The pins.** `TRAIN_COMMIT` (this repo — model AND trainer) and `FOVI_COMMIT` snapshot
-   the code for the whole run (offline `git archive` → `$TMPDIR` → `PYTHONPATH`). A new
-   launcher sets those two and **must not set `PYTORCH_COMMIT`**, which pinned the model
-   back when it was a separate repo and has no effect on a post-merge pin.
+1. **The pins.** `TRAIN_COMMIT` (this repo — model, trainer and, since the 2026-11-12 fovi
+   port, the foveated geometry) snapshots the code for the whole run (offline `git archive`
+   → `$TMPDIR` → `PYTHONPATH`). A new launcher sets only that: **not `FOVI_COMMIT`**, which
+   pins fovi for pre-port commits only, and **not `PYTORCH_COMMIT`**, which pinned the model
+   back when it was a separate repo. Both have no effect on a current pin (the sbatch warns).
    `PRETRAIN_COMMIT` is the pre-rename spelling of `TRAIN_COMMIT`, still accepted.
    37 of the 55 launchers in `runs/` pin a pre-2026-07-31 commit via `PRETRAIN_COMMIT`; the
    other 18 (exp32 onward) already use `TRAIN_COMMIT`. Either way, bumping the pins to
