@@ -5,7 +5,7 @@ Everything here is submitted by hand — nothing in this tree runs automatically
 ```
 slurm/
 ├── harness_train.sbatch   THE launcher. Every new run goes through it.
-├── env.sh                 Grete job setup (sources .envrc.grete, GWDG proxy)
+├── env.sh                 Grete job setup (sources .envrc.grete, GWDG proxy); read at job START
 ├── submit.sh              convenience wrapper
 ├── runs/<group>/*.sh      per-experiment launchers — the copyable ones
 └── archive/               reproduction-only; see below
@@ -15,6 +15,21 @@ slurm/
 > after the *original* `slurm/` — the Nibi / Alliance Canada tooling — was deleted as
 > deprecated. Historical prose in `archive/` that says `slurm/…` may mean **that** deleted
 > folder, not this one.
+
+## What a job takes from your clone, and when
+
+The code is pinned (`TRAIN_COMMIT`, extracted from `.git` when the job starts), and the
+launcher and `.sbatch` are fixed at submission. Four things are NOT pinned and are read from
+the clone when the job (or each array task, or each run of a queue wrapper) starts:
+`slurm/env.sh` + `.envrc.grete`, the venv `.venv-cu126`, and `slurm/harness_train.sbatch`
+when a wrapper calls it with `bash` (`harness_sweep.sbatch` takes it from the commit
+instead). While jobs are queued or running, do not edit or re-sync these, and do not switch
+to a branch where they differ.
+
+**Several runs in one job: use `harness_sweep.sbatch`.** Never write a wrapper that runs
+`bash slurm/harness_train.sbatch` from the clone; if a wrapper is unavoidable, take the file
+from the pinned commit (`git show "$TRAIN_COMMIT:slurm/harness_train.sbatch"`), as
+`harness_sweep.sbatch` and `runs/exp36_1_policies_fovi/queue.sbatch` do.
 
 ## Starting a new run
 

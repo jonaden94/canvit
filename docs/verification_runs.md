@@ -61,7 +61,8 @@ so each artifact exists in exactly one place, and a path derived from your own c
 find nothing.
 
 All launchers pin `TRAIN_COMMIT` / `PYTORCH_COMMIT` / `FOVI_COMMIT`, so each job runs a
-frozen `git archive` snapshot and is immune to later edits of the clones. Pinning resolves
+frozen `git archive` snapshot and its code is immune to later edits of the clones (the
+environment setup and the venv are read at job start, see `slurm/README.md`). Pinning resolves
 the three repos as siblings of your clone (`canvit/`, `fovi/`, `CanViT-PyTorch/`), so it
 needs all three present. **Current code runs all four recipes too** — verified 2026-09-09,
 one short foreground run per task from these exact source checkpoints — so dropping the

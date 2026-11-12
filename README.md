@@ -522,7 +522,9 @@ FOVI_COMMIT=<sha>      # fovi — ONLY for a TRAIN_COMMIT before the fovi port; 
 (local object store only — no network, no SSH, works for private repos) into the
 job's `TMPDIR` and prepends them to `PYTHONPATH` with `PYTHONSAFEPATH=1`, so the
 snapshot **overrides** the editable install for that job. A submitted job is
-therefore immune to later edits or pulls of the clones. Both variables are
+therefore immune to later edits or pulls of the clones. This covers the *code* only: `slurm/env.sh`,
+`.envrc.grete` and the venv are read from the clone when a job starts — see
+`slurm/README.md` ("What a job takes from your clone, and when"). Both variables are
 optional and independent; omit them to use the environment's editable install.
 
 Two legacy spellings are still accepted, because dropping either would leave old launchers

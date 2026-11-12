@@ -221,7 +221,7 @@ The variables that matter: `LOGS_DIR`, `WEBDATASET_DIR`, `VAL_DIR`, `VAL_INDEX_D
 `IN1K_TRAIN_DIR` / `IN1K_VAL_DIR` are the exception: `.envrc.grete` does NOT set them, and
 `in1k/config.py`'s `_default_in1k_{train,val}_dir` fall back to hardcoded project paths.
 
-# Commit pinning — why editing the repo is safe during live jobs
+# Commit pinning — why editing the code is safe during live jobs
 
 The venvs are editable installs, so in principle a running job would pick up a mid-run edit.
 `slurm/harness_train.sbatch` neutralizes that: each run pins exact commits via
@@ -229,12 +229,21 @@ The venvs are editable installs, so in principle a running job would pick up a m
 the per-job `$TMPDIR/canvit_src`, prepending that snapshot to `PYTHONPATH` with
 `PYTHONSAFEPATH=1` so it wins over the cwd and the editable install.
 
-- You can **edit the repo freely** while pinned jobs are in flight. Only newly submitted
-  jobs that pin a new commit pick up changes.
+- You can **edit the code freely** while pinned jobs are in flight (not the few files read
+  at job start, listed below). Only newly submitted jobs that pin a new commit pick up changes.
 - `git archive` reads the local `.git` only — no network, no SSH, works for private repos,
   and does not touch HEAD or the working tree.
-- Launcher scripts and `.envrc.grete` are read at submit time, so editing them is always
-  safe.
+- What is fixed at SUBMIT time: the launcher script (`slurm/runs/...`) and the batch script
+  itself (Slurm stores a copy of the `.sbatch`). What a job reads from the clone when it (or
+  each array task) STARTS: `slurm/env.sh` and `.envrc.grete` (dataset paths, caches, HF token,
+  proxy), the venv `.venv-cu126` (a `uv sync` changes it for every later job start), and
+  `.git` (the pinned commits must exist). Queue wrappers that call `bash
+  slurm/harness_train.sbatch` per run (exp36_1 jobs 17232461/2, submitted before its fix) also read
+  THAT file from the clone at each run start; `harness_sweep.sbatch` avoids this by taking it
+  from `TRAIN_COMMIT` -- **multi-run jobs use `harness_sweep.sbatch`; a new wrapper must
+  never `bash slurm/harness_train.sbatch` from the clone**. So while jobs are queued or running, do not edit or `uv sync` these,
+  and do not switch to a branch where they differ (`git diff <a> <b> -- slurm/env.sh
+  .envrc.grete slurm/harness_train.sbatch pyproject.toml uv.lock` shows it).
 - Legacy spellings still accepted: `PRETRAIN_COMMIT` (88 launchers set it) and
   `PYTORCH_COMMIT` (106) — see Gotchas.
 - **Workflow:** edit → commit/push → submit runs pinning the new hash.
