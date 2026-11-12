@@ -190,6 +190,11 @@ class FoveatedPatcher(Patcher):
         device: torch.device | str = "cpu",
     ) -> None:
         super().__init__()
+        # Before the fovi port (2026-11-12) this constructor imported fovi, whose trainer
+        # module sets cudnn.benchmark = True for the whole process on import. Kept, so every
+        # run with this patcher still autotunes its cuDNN convolutions (speed, algorithm choice)
+        # exactly as before. Uniform-patcher runs never imported fovi and stay at the default.
+        torch.backends.cudnn.benchmark = True
         self.cfg = cfg
         self.embed_dim = embed_dim
         dev = torch.device(device) if isinstance(device, str) else device

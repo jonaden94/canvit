@@ -83,7 +83,10 @@ repos/
 geometry, bit-identical: `claude_dev/fovi_port/`). canvit's code no longer imports fovi; new
 launchers pin `TRAIN_COMMIT` only. fovi stays on disk and in the venv (`fovi-legacy`
 dependency group) because launchers pinning a pre-port `TRAIN_COMMIT` + `FOVI_COMMIT` still
-`import fovi` — do not remove either.
+`import fovi` — do not remove either. **Change the foveated geometry in
+`canvit/core/foveation/`, never in the fovi repo**: an edit there no longer reaches canvit.
+Older notes and memories that say "fovi commit X" or point at fovi source describe the
+pre-port state.
 
 Four clones are kept **read-only, as fallback references. Do not edit them**, and prefer
 this repo's equivalent:
