@@ -15,7 +15,7 @@ One repo, one package.
 Two entry points, and only two:
 
 ```bash
-python -m canvit.harness.run      <distill|ade20k|in1k> --preset <default|probe|finetune|policy_only|joint>
+python -m canvit.harness.run      <distill|ade20k|in1k|search> --preset <default|probe|finetune|policy_only|joint>
 python -m canvit.harness.evaluate <distill|ade20k|ade20k-dinov3|in1k> --cfg.eval-policy <policy>
 ```
 
@@ -24,9 +24,14 @@ python -m canvit.harness.evaluate <distill|ade20k|ade20k-dinov3|in1k> --cfg.eval
 | `distill` | passive→active dense distillation from DINOv3 — the pretraining objective | IN21k WebDataset shards + a val image folder |
 | `ade20k` | ADE20K segmentation probe / finetune | ADE20K (`$ADE20K_ROOT`) |
 | `in1k` | ImageNet-1k linear probe / full finetune | IN1k WebDataset + val image folder |
+| `search` | class-cued visual search on a frozen foveated CanViT: target-conditioned task head (heatmap + target present/absent) and policy, trained jointly by default | COCO-Search18 (`$COCO_SEARCH18_ROOT` or the `SearchConfig` default) |
 
-On top of any of the three, the **viewpoint-selection policy** can be trained by RL, alone
+On top of any of the first three, the **viewpoint-selection policy** can be trained by RL, alone
 against a frozen model (`policy_only`) or jointly with the task (`joint`).
+
+`search` (since 2026-11-10) has no standalone eval yet: `harness.evaluate` has no `search`
+subcommand, so it is measured only by validation during training. Its design and status are
+in `claude_dev/search/` (`01-summary.md` first).
 
 `--cfg.eval-policy` is **required** for standalone eval — no `auto` guess. A foveated model
 is only in-distribution at its training view scale, so pin it
@@ -49,6 +54,7 @@ canvit/
 ├── distill/     DINOv3 latent distillation: loss, model, probe, data/, viz/
 ├── ade20k/      ADE20K segmentation: data, metrics, rollout, viz
 ├── in1k/        ImageNet-1k: data, metrics, model, eval, rollout
+├── search/      COCO-Search18 visual search: config, data, head, loss, model, task, viz
 └── checkpoint/  checkpoint I/O and `to_hf` / `probe_to_hf` — publishing to the HF layout
 ```
 
