@@ -1,10 +1,10 @@
 """Standalone evaluation of a finished checkpoint — the counterpart of ``harness.run``.
 
     python -m canvit.harness.evaluate ade20k \
-        --ckpt logs/<group>/<run>/checkpoints/best.pt \
+        --opts.ckpt logs/<group>/<run>/checkpoints/best.pt \
         --cfg.model-repo <the backbone the probe was trained on> \
         --cfg.eval-policy fixation_grid --cfg.foveated-scale.fixed-scale 2.0 \
-        --out results/exp34-fixgrid.json
+        --opts.out results/exp34-fixgrid.json
 
 A training run measures ONE protocol — whatever ``eval_policy`` resolved to for that run.
 This re-measures a finished checkpoint under any protocol, without retraining, which is how
