@@ -35,7 +35,7 @@ NGPU=1
 TASK=distill
 
 # === config: exp32-fovi-teacherinit-seed.sh's, plus rf-interp bilinear ===
-CFG_WANDB_PROJECT=exp32_pretrain_lrdrop   # where exp32-s1..s5 actually logged (the jon_ in their launchers came later, d0ef952)
+CFG_WANDB_PROJECT=jon_exp32_pretrain_lrdrop   # where exp32-s1..s5 are (renamed server-side in d0ef952); s4 first logged to exp32_pretrain_lrdrop by mistake
 CFG_SEED=$SEED
 CFG_PEAK_LR=0.0004
 CFG_BATCH_SIZE_PER_GPU=64
