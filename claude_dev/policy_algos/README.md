@@ -39,3 +39,16 @@ default-feature qreg/pg/qprop (7-8).
 - 2026-11-13 ~04:00: implemented (`rl.py` AC/QTD/gae/ac_loss, `joint.py` episode_loss,
   `engine.py` deferred per-glimpse rewards + dense extra glimpses), 13 new tests
   (`harness/tests/test_policy_algos.py`), launcher `slurm/runs/exp36_1_policies_fovi/algos_in_job.sh`.
+- 04:00-04:35: GPU smoke tests of all 5 arms inside job 17284453 (60 steps, short eval): all exit
+  0. Speeds there (GPU shared with the oracle, so ~1.4x slower than alone): qreg 1.07 s/step,
+  a2c 1.4, ppo 2.3 (after faf7ac4's batched critic; 1.6/2.7 before), qtd 1.17, dense4 2.15.
+  Peak reserved GPU memory: ppo 15.2 GB, dense4 12.1 GB. Two jobs on one V100 gave ~1.5x total
+  throughput (the oracle slowed 15-30% while a training ran at ~72% of its solo speed).
+- 04:38: **runs launched**, pinned **59e76f1** (code = faf7ac4). Work queue
+  `logs/jon_exp36_1_policies_fovi/algos_queue/` (25 runs = 5 arms x seeds 0-4, seed-major,
+  rotating arm order; `todo/ claimed/ done/ failed/`, worker logs `worker-*.log`), drained by:
+  job **17288122** (jupyter V100, 48 h, `algos_queue_job.sbatch`: 2 workers, 2nd starts 15 min
+  later) and a 3rd worker in the owner's job **17284453** that starts when the pg-lnfeat sweep
+  there logs "sweep finished" (~18:00). That 3rd worker was started from a Claude session INSIDE
+  17284453: if that session's step ends, the worker and its current run die -- requeue a stale
+  `claimed/` entry by moving it back to `todo/`.
