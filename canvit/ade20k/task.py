@@ -80,6 +80,12 @@ class BoundAde20kTask:
     def step_loss(self, readout: Any) -> TaskLoss:
         return TaskLoss(combined=ce_loss(self._logits(readout), self.masks))
 
+    def per_image_loss_repeated(self, readout: Any, k: int) -> Tensor:
+        """``per_image_loss`` for a readout of B*k rows, each image's k rows consecutive
+        (``repeat_interleave``) -- the dense-QReg extra glimpses (policy-algos branch)."""
+        from canvit.ade20k.metrics import reward_ce
+        return reward_ce(self._logits(readout), self.masks.repeat_interleave(k, 0), score_res=self.reward_score_res)
+
     def per_image_loss(self, readout: Any) -> Tensor:
         """The POLICY REWARD's raw material (rollout.py:268/310/327) — nothing else reads
         it. Shared with `rl_train.ce_from_logits` via `reward_ce`, so the reward cannot

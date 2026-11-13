@@ -23,6 +23,10 @@ class QReg:
 
     prime_on_policy: float = 0.5  # fraction of state-advancing glimpses taken by the net's argmax (DAgger)
     dueling: bool = True  # Q(s,a) = V(s) + mean-zero A(s,a); argmax (deploy) unchanged
+    extra_candidates: int = 0
+    """Dense supervision (policy-algos branch): per policy glimpse, also glimpse K random
+    candidate cells from the SAME state (no_grad, discarded afterwards) and regress Q on
+    their measured rewards too -- K+1 labels per state instead of 1. 0 = the recipe."""
 
 
 @dataclass(frozen=True)
@@ -100,7 +104,54 @@ class VPG:
     lets advantage normalization absorb the level."""
 
 
-Objective = QReg | PG | VPG
+@dataclass(frozen=True)
+class AC:
+    """Actor-critic with multi-glimpse credit (policy-algos branch, 2026-11-13).
+
+    The SAME actor as :class:`PG` (one ViewpointScorer, softmax sampling over the
+    candidate grid, argmax deploy, entropy floor by dual ascent) and the SAME per-glimpse
+    reward (fractional probe-CE reduction), but credit is assigned over the WHOLE
+    trajectory instead of per glimpse:
+
+    * a learned state value ``V(s_t)`` from a SECOND ViewpointScorer of the actor's size
+      (``V = mean over its candidate map``: the whole U-Net is the value function, so the
+      critic has the capacity of Q-Prop's critic, not the 64-unit dueling ``vhead``);
+    * advantages by GAE(gamma, lambda) over the glimpses of the episode;
+    * ``ppo_epochs == 1``: A2C (one gradient step per rollout).
+      ``ppo_epochs > 1``: PPO-clip -- ``ppo_epochs`` passes over the rollout, the first
+      ``ppo_epochs-1`` as inner optimizer steps, the last through the harness's own step.
+
+    Defaults follow AdaptiveNN's PPO (``engine_ppo.py``): gamma 0.7, lambda 1.0, clip 0.2,
+    2 update passes, advantage normalized over the batch. Rewards are divided by a global
+    running std (no mean shift: a per-depth shift would leak across bootstrapped steps)."""
+
+    gamma: float = 0.7
+    gae_lambda: float = 1.0
+    ppo_epochs: int = 1
+    clip_eps: float = 0.2
+    value_weight: float = 1.0
+    normalize_advantage: bool = True
+    entropy_bonus: float = 0.01  # as PG: alpha init AND floor
+    entropy_target: float | None = 1.0
+    alpha_lr: float = 0.05
+
+
+@dataclass(frozen=True)
+class QTD:
+    """Multi-step Q-learning (policy-algos branch): QReg's net, epsilon-greedy rollout and
+    argmax deploy, but the regression target at the taken cell is the bootstrapped return
+    ``r_t + gamma * max_a Qbar(s_{t+1}, a)`` (the last glimpse: ``r_t``) instead of the
+    immediate reward alone. ``Qbar`` is a Polyak-averaged target copy of the scorer (DQN),
+    read through double-Q (argmax by the online net). Rewards are divided by a global running
+    std, not standardized per depth -- a per-depth shift would not cancel through the max."""
+
+    prime_on_policy: float = 0.5
+    dueling: bool = True
+    gamma: float = 1.0
+    target_tau: float = 0.01  # Polyak rate of the target net, per training step
+
+
+Objective = QReg | PG | VPG | AC | QTD
 
 
 @torch.no_grad()
@@ -133,6 +184,16 @@ class RunningNorm:
         if subtract_only:
             return x - mean
         return (x - mean) / (sq - mean**2).clamp_min(1e-4).sqrt()
+
+    @torch.no_grad()
+    def rescale(self, x: Tensor) -> Tensor:
+        """Update the same EMA, but return ``x / std`` with NO mean shift (AC / QTD)."""
+        self.count += 1
+        self.mean = self.m * self.mean + (1 - self.m) * x.mean()
+        self.sq = self.m * self.sq + (1 - self.m) * (x * x).mean()
+        bc = 1 - self.m**self.count
+        mean, sq = self.mean / bc, self.sq / bc
+        return x / (sq - mean**2).clamp_min(1e-8).sqrt()
 
 
 def qreg_loss(pred_all: Tensor, flat_idx: Tensor, target: Tensor) -> tuple[Tensor, dict[str, Tensor]]:
@@ -211,3 +272,50 @@ def vpg_loss(
         "adv_std": adv.detach().std(),
         "taken_logp": logp.detach().mean(),
     }
+
+
+@torch.no_grad()
+def gae(rewards: Tensor, values: Tensor, *, gamma: float, lam: float) -> tuple[Tensor, Tensor]:
+    """GAE over a finite episode that ENDS after the last glimpse (no bootstrap past it).
+    rewards/values [B, T] -> (advantages, returns) [B, T]; returns = advantages + values.
+    The same recursion as AdaptiveNN ``engine_ppo.py`` (nextnonterminal=0 at t=T-1)."""
+    B, T = rewards.shape
+    adv = torch.zeros_like(rewards)
+    last = torch.zeros(B, device=rewards.device, dtype=rewards.dtype)
+    for t in reversed(range(T)):
+        nxt = values[:, t + 1] if t + 1 < T else torch.zeros_like(last)
+        delta = rewards[:, t] + gamma * nxt - values[:, t]
+        last = delta + gamma * lam * last if t + 1 < T else delta
+        adv[:, t] = last
+    return adv, adv + values
+
+
+def ac_loss(
+    scores: Tensor,
+    flat_idx: Tensor,
+    old_logp: Tensor,
+    adv: Tensor,
+    values: Tensor,
+    returns: Tensor,
+    *,
+    clip_eps: float,
+    alpha: Tensor | float,
+    value_weight: float,
+) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
+    """Clipped-surrogate actor loss + value MSE + entropy, meaned over every (b, t).
+    scores [N, A] and values [N] carry grad; flat_idx/old_logp/adv/returns [N] are detached.
+    With old_logp == the current logp (first pass) the ratio is 1 and the clip is inactive,
+    so one pass is exactly A2C's ``-(adv * logp)`` gradient."""
+    logp_all = F.log_softmax(scores, dim=1)
+    logp = logp_all.gather(1, flat_idx[:, None]).squeeze(1)
+    entropy = -(logp_all.exp() * logp_all).sum(dim=1).mean()
+    ratio = (logp - old_logp).exp()
+    surr = torch.min(ratio * adv, ratio.clamp(1 - clip_eps, 1 + clip_eps) * adv)
+    value_loss = F.mse_loss(values, returns)
+    loss = -surr.mean() + value_weight * value_loss - alpha * entropy
+    return loss, entropy, {
+        "policy_entropy": entropy.detach(), "value_loss": value_loss.detach(),
+        "clip_frac": ((ratio - 1).abs() > clip_eps).float().mean().detach(),
+        "taken_logp": logp.detach().mean(), "value_mean": values.detach().mean(),
+    }
+

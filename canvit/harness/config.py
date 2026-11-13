@@ -88,7 +88,7 @@ class JointPolicyConfig:
     coverage — needs n_full_start_branches>=1 and n_random_start_branches>=1."""
 
     # Objective
-    objective: Literal["qreg", "pg", "vpg"] = "qreg"
+    objective: Literal["qreg", "pg", "vpg", "ac", "qtd"] = "qreg"
     """``qreg``/``pg``: the CanViT-PyTorch-RL recipes (per-glimpse fractional reward,
     EMA-standardized). ``vpg``: vanilla policy gradient with a learned V(s) baseline and a
     TERMINAL reward — the ``autoreg_tryout`` recipe (see :class:`~canvit.train.rl.VPG`).
@@ -116,6 +116,23 @@ class JointPolicyConfig:
     beyond this flag."""
     policy_warmup_steps: int = 0
     """Steps to ramp prime_on_policy 0 -> its target (0 = constant target from step 0)."""
+
+    # policy-algos branch (2026-11-13). See rl.AC / rl.QTD / rl.QReg.extra_candidates.
+    ac_gamma: float = 0.7
+    """``ac``: GAE discount over glimpses (AdaptiveNN's 0.7)."""
+    ac_lambda: float = 1.0
+    """``ac``: GAE lambda (AdaptiveNN's 1.0)."""
+    ppo_epochs: int = 1
+    """``ac``: passes over each rollout. 1 = A2C; >1 = PPO-clip (AdaptiveNN: 2)."""
+    ppo_clip: float = 0.2
+    ac_value_weight: float = 1.0
+    qtd_gamma: float = 1.0
+    """``qtd``: discount of the bootstrapped Q target over glimpses."""
+    qtd_target_tau: float = 0.01
+    """``qtd``: Polyak rate of the target net per training step."""
+    qreg_extra_candidates: int = 0
+    """``qreg``: dense supervision -- K extra random cells glimpsed (no_grad) per state and
+    regressed on, besides the taken one. 0 = the recipe; costs ~K more glimpse forwards."""
 
     # VPG only (objective="vpg"); ignored by qreg/pg. Defaults = autoreg exp12's values.
     vpg_entropy_bonus: float = 5e-3

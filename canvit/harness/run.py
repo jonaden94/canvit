@@ -286,6 +286,8 @@ def run(*, task: RunTask, spec: TrainSpec, settings: RunSettings) -> dict:
     # --- optimizer + scheduler (per trainable group, design D-E) -----------
     param_groups = task.trainable_param_groups(model=model, head=head, joint=joint, spec=spec)
     optimizer, scheduler = build_optimizer_and_scheduler(spec, param_groups)
+    if joint is not None:  # PPO's inner passes step this optimizer (policy-algos; unused otherwise)
+        joint.optimizer, joint.grad_clip = optimizer, settings.grad_clip
 
     # --- RESUME / SEED / FRESH (task-neutral), BEFORE loaders so distill's
     # model-owned normalizer arrives already-initialized from the checkpoint --------

@@ -303,6 +303,8 @@ def run_training_loop(
 
         optimizer.step()
         scheduler.step()
+        if joint is not None:
+            joint.after_optimizer_step()  # QTD target-net Polyak update; no-op otherwise
         t_gpu_total += time.perf_counter() - t1
 
         # Metrics that are EMA-smoothed before logging (train/loop.py logs ONLY EMAs

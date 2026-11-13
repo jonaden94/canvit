@@ -36,7 +36,7 @@ from canvit.core.policy import (
 )
 from canvit.harness.config import FoveatedScaleConfig, JointPolicyConfig
 from canvit.harness.policy.joint import JointPolicy
-from canvit.harness.policy.rl import PG, VPG, Objective, QReg
+from canvit.harness.policy.rl import AC, PG, QTD, VPG, Objective, QReg
 from canvit.harness.rollout.selector import PolicySelector, RandomSelector
 
 log = logging.getLogger(__name__)
@@ -81,7 +81,15 @@ def build_policy(
     vp_flat = cand.reshape(-1, 3).to(device)
 
     if rl.objective == "qreg":
-        obj: Objective = QReg(prime_on_policy=rl.prime_on_policy, dueling=rl.dueling)
+        obj: Objective = QReg(prime_on_policy=rl.prime_on_policy, dueling=rl.dueling,
+                              extra_candidates=rl.qreg_extra_candidates)
+    elif rl.objective == "ac":
+        obj = AC(gamma=rl.ac_gamma, gae_lambda=rl.ac_lambda, ppo_epochs=rl.ppo_epochs, clip_eps=rl.ppo_clip,
+                 value_weight=rl.ac_value_weight, entropy_bonus=rl.entropy_bonus,
+                 entropy_target=rl.entropy_target, alpha_lr=rl.alpha_lr)
+    elif rl.objective == "qtd":
+        obj = QTD(prime_on_policy=rl.prime_on_policy, dueling=rl.dueling, gamma=rl.qtd_gamma,
+                  target_tau=rl.qtd_target_tau)
     elif rl.objective == "vpg":
         obj = VPG(
             entropy_bonus=rl.vpg_entropy_bonus, reinforce_weight=rl.vpg_reinforce_weight,
@@ -118,6 +126,10 @@ def build_policy(
     # so the biased combination was what a plain `--rl.objective vpg` GOT, and a log line
     # is not enough to stop someone acting on the run's numbers. Opting in is one explicit
     # flag; there is no legitimate reason to want the biased gradient.
+    if isinstance(obj, AC) and rl.select_bn_eval:  # same reason as VPG's refusal below
+        raise ValueError("objective='ac' samples on-policy: pass --rl.no-select-bn-eval "
+                         "(select_bn_eval samples from an eval-BN forward but differentiates log pi "
+                         "of the train-BN one -- an off-policy, biased gradient).")
     if isinstance(obj, VPG) and rl.select_bn_eval:
         raise ValueError(
             "objective='vpg' requires --rl.no-select-bn-eval. With select_bn_eval=True the "
@@ -130,7 +142,7 @@ def build_policy(
     # VPG needs the value head unconditionally — that IS its baseline — so it is not the
     # user's `dueling` knob to turn off. QReg honors the knob; plain PG never gets one
     # (softmax is shift-invariant, so a V(s) it cannot train would be dead weight).
-    dueling = isinstance(obj, VPG) or (isinstance(obj, QReg) and obj.dueling)
+    dueling = isinstance(obj, VPG) or (isinstance(obj, (QReg, QTD)) and obj.dueling)
     scorer = ViewpointScorer(
         canvas_dim=canvit.cfg.canvas_dim, width=rl.width, n_scale=n_scale, scales=scales,
         centers_per_axis=rl.centers_per_axis, block_layers=rl.block_layers, groups=feature_groups,
@@ -157,6 +169,23 @@ def build_policy(
         ).to(device)
         critic.train()
 
+    # AC value function: a second ViewpointScorer of the ACTOR'S size (no dueling head);
+    # V(s) = the mean of its candidate map (JointPolicy._value). Rides the `policy` param
+    # group and the sidecar exactly like the Q-Prop critic above.
+    if isinstance(obj, AC):
+        critic = ViewpointScorer(
+            canvas_dim=canvit.cfg.canvas_dim, width=rl.width, n_scale=n_scale, scales=scales,
+            centers_per_axis=rl.centers_per_axis, block_layers=rl.block_layers, groups=feature_groups,
+            dueling=False, action_space=action_space, readout=rl.policy_readout,
+            local_dim=canvit.local_dim,
+        ).to(device)
+        critic.train()
+    # QTD target net: a frozen copy of the scorer, Polyak-updated after each step.
+    target_net: ViewpointScorer | None = None
+    if isinstance(obj, QTD):
+        import copy
+        target_net = copy.deepcopy(scorer).requires_grad_(False)
+
     encoder = StateEncoder(encode_model, canvas_grid=canvas_grid, feature_groups=feature_groups)
 
     random_sel = RandomSelector(
@@ -164,8 +193,8 @@ def build_policy(
     )
     policy_sel = PolicySelector(
         net=scorer, encoder=encoder, vp_flat=vp_flat, fallback=random_sel,
-        mode="argmax" if isinstance(obj, QReg) else "sample",  # PG and VPG are both on-policy
-        prime_on_policy=rl.prime_on_policy if isinstance(obj, QReg) else 1.0,
+        mode="argmax" if isinstance(obj, (QReg, QTD)) else "sample",  # PG, VPG, AC sample on-policy
+        prime_on_policy=rl.prime_on_policy if isinstance(obj, (QReg, QTD)) else 1.0,
         feats_detached=rl.feats_detached, select_bn_eval=rl.select_bn_eval, generator=generator,
     )
 
@@ -174,9 +203,9 @@ def build_policy(
         rl_weight=rl.rl_weight, keep_random_branch=rl.keep_random_branch,
         target_momentum=rl.target_momentum, device=device,
         prime_target=rl.prime_on_policy, prime_warmup=rl.policy_warmup_steps,
-        critic=critic,
+        critic=critic, target_net=target_net,
     )
-    if isinstance(obj, PG) and obj.entropy_target is not None:
+    if isinstance(obj, (PG, AC)) and obj.entropy_target is not None:
         jp.log_alpha = torch.tensor(math.log(obj.entropy_bonus), device=device)
     return jp
 
