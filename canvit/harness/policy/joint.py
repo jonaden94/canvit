@@ -280,27 +280,36 @@ class JointPolicy:
             return self.rl_weight * self._qtd_loss(scores=scores, flat_idx=flat_idx, feats=feats, r=r)
         assert isinstance(obj, AC)
         alpha = obj.entropy_bonus if self.log_alpha is None else self.log_alpha.exp()
+        feats_all = torch.cat(feats, dim=0)  # [T*B, ...], glimpse-major
+
+        def values_now() -> Tensor:  # ONE critic forward over the whole episode -> [B, T]
+            return self._value(feats_all).reshape(T, B).t()
+
+        values = values_now()  # with grad; the critic is unchanged until the first step below
         with torch.no_grad():
-            v_old = torch.stack([self._value(f) for f in feats], dim=1)  # [B, T]
+            v_old = values.detach()
             adv, ret = gae(r, v_old, gamma=obj.gamma, lam=obj.gae_lambda)
             if obj.normalize_advantage:
                 adv = (adv - adv.mean()) / (adv.std() + 1e-8)
             old_logp = torch.log_softmax(scores.detach(), dim=2).gather(2, flat_idx[..., None]).squeeze(2)
 
-        def one_pass(sc: Tensor) -> tuple[Tensor, Tensor, dict]:
-            values = torch.stack([self._value(f) for f in feats], dim=1)
+        def one_pass(sc: Tensor, vals: Tensor) -> tuple[Tensor, Tensor, dict]:
             return ac_loss(sc.reshape(B * T, A), flat_idx.reshape(-1), old_logp.reshape(-1),
-                           adv.reshape(-1), values.reshape(-1), ret.reshape(-1),
+                           adv.reshape(-1), vals.reshape(-1), ret.reshape(-1),
                            clip_eps=obj.clip_eps, alpha=alpha, value_weight=obj.value_weight)
 
         def fresh_scores() -> Tensor:  # per glimpse, so BatchNorm sees the rollout's own batches
             return torch.stack([self.scorer(f.float()).reshape(B, -1) for f in feats], dim=1)
 
+        # Pass 1 reuses the rollout's own grad-carrying scores and the values above (nothing
+        # has stepped yet, so they ARE the current net's); later passes recompute both.
+        sc, vals = scores, values
         for _ in range(obj.ppo_epochs - 1):  # PPO inner passes: own optimizer steps
-            loss, _, _ = one_pass(fresh_scores())
+            loss, _, _ = one_pass(sc, vals)
             (self.rl_weight * loss).backward()
             self._clip_and_step()
-        loss, entropy, metrics = one_pass(scores if obj.ppo_epochs == 1 else fresh_scores())
+            sc, vals = fresh_scores(), values_now()
+        loss, entropy, metrics = one_pass(sc, vals)
         if self.log_alpha is not None:
             assert obj.entropy_target is not None
             entropy_floor_step(log_alpha=self.log_alpha, entropy=entropy.detach(), target=obj.entropy_target,
