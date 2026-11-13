@@ -165,6 +165,15 @@ class JointPolicyConfig:
     Exact one-cell-per-score alignment needs ``centers_per_axis=32`` (the POLICY_GRID the
     features arrive on); coarser grids interpolate a 2x2 neighbourhood. autoreg's heatmap
     was defined ON its state grid, so 32 is the faithful setting."""
+    policy_levels: int = 6
+    """U-Net depth under ``unet``: resolutions 32, 16, ... down to ``32 >> (levels-1)``. 6 (the
+    historical net) pools to a 1x1 bottleneck; 3 stops at 8x8, where a 7x7 depthwise kernel
+    already spans 28 of the 32 canvas cells. Unused under ``local``."""
+    policy_input_norm: Literal["bn", "none"] = "bn"
+    """The scorer Frontend's input normalization. ``bn`` (historical): a per-channel
+    BatchNorm2d, so the scorer forward differs between train (batch stats) and eval (running
+    stats). ``none``: no normalization -- the scorer has no BatchNorm left; meant for inputs
+    that arrive normalized (``ln_feat`` is a per-token channel LayerNorm)."""
     feature_groups: tuple[str, ...] | None = None
     """What the scorer LOOKS AT, overriding the task's own set. ``None`` (default) = the
     task's default: the full probe-entropy set for ade20k, ``INTRINSIC_GROUPS`` (probe-free)

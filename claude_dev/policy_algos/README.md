@@ -61,3 +61,39 @@ default-feature qreg/pg/qprop (7-8).
   after pg-lnfeat, ~15:30; log `algos_queue_ac/worker-17284453-ac.log`); 17288122's two workers keep
   the qreg/qtd/dense4 queue. Estimate (pg-lnfeat solo runs at 0.44 s/step): AC queue ~22 h, ends ~Nov 14
   midday, 17284453 ends Nov 15 01:52.
+
+## Scorer architecture ablation on pg-lnfeat (owner's request 2026-11-13 afternoon)
+
+pg-lnfeat ties every other arm (t4 0.452), so the owner asked whether the scorer needs its
+architecture. Two findings from reading `core/policy/net.py`:
+- The U-Net pools 32 -> 16 -> 8 -> 4 -> 2 -> 1. With 7x7 depthwise kernels one 8x8-level kernel
+  already spans 28 of the 32 canvas cells, so global context exists by the 8x8 level; at 2x2 and
+  1x1 the block is mostly zero padding (at 1x1 a per-channel MLP). Those two levels + their
+  decoder stages are ~1.7M of the 5.37M parameters.
+- BatchNorm is NOT gone: the Frontend's first layer is a per-channel `BatchNorm2d` over the
+  input (the body is LayerNorm). So even with `--rl.no-select-bn-eval` (which made PG
+  on-policy in TRAINING) the scorer computes a different function at eval (running stats)
+  than in training (batch stats). With `ln_feat` input -- already a per-token channel
+  LayerNorm, no affine -- the BN has nothing to equalize, and the per-channel affine it adds
+  is absorbed by the next 1x1 conv, so removing it (not replacing it by a LayerNorm, which
+  would only repeat the input LayerNorm) costs no expressiveness.
+
+New scorer options (defaults = the historical net, bit-identical: same state_dict and same
+forward as the pre-change code, train and eval mode): `--rl.policy-levels N` (U-Net bottoms
+out at 32 >> (N-1); default 6) and `--rl.policy-input-norm none` (default `bn`). Tests:
+`core/tests/test_policy_arch_options.py` + `test_policy_levels_and_input_norm_reach_the_scorer_and_train`.
+
+| arm | change vs pg-lnfeat | params |
+|---|---|---|
+| `pg-lnfeat-lev4` | U-Net down to 4x4 | 3.63M |
+| `pg-lnfeat-lev3` | U-Net down to 8x8 | 2.76M |
+| `pg-lnfeat-local` | no U-Net (`--rl.policy-readout local`), score = own cell only | 0.18M |
+| `pg-lnfeat-nobn` | no input BatchNorm -> no BatchNorm anywhere, no train/eval gap | 5.37M |
+
+Launcher `slurm/runs/exp36_1_policies_fovi/pg_arch_ablation.sh`, 5 seeds, one run per V100,
+on a SELF-REQUEUEING queue job (`chain_queue.sh`, owner's request: no manual resubmission).
+The jupyter QOS allows 2 submitted jobs per user and the owner keeps one, so a job cannot
+pre-submit a successor; instead it requeues itself (same id, fresh 2-day limit) when its
+workers stop for lack of walltime with work left. Verified on a CPU test job: `scontrol
+requeue` from inside the batch script works (rc 0); the job restarted ~10 min later with
+SLURM_RESTART_COUNT=1 and a fresh time limit (job 17298388).

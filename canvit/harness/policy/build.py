@@ -147,6 +147,7 @@ def build_policy(
         canvas_dim=canvit.cfg.canvas_dim, width=rl.width, n_scale=n_scale, scales=scales,
         centers_per_axis=rl.centers_per_axis, block_layers=rl.block_layers, groups=feature_groups,
         dueling=dueling, action_space=action_space, readout=rl.policy_readout,
+        levels=rl.policy_levels, input_norm=rl.policy_input_norm,
         local_dim=canvit.local_dim,
     ).to(device)
     if isinstance(obj, VPG) and obj.value_bias_init is not None:
@@ -165,6 +166,7 @@ def build_policy(
             canvas_dim=canvit.cfg.canvas_dim, width=rl.width, n_scale=n_scale, scales=scales,
             centers_per_axis=rl.centers_per_axis, block_layers=rl.block_layers, groups=feature_groups,
             dueling=rl.dueling, action_space=action_space, readout=rl.policy_readout,
+        levels=rl.policy_levels, input_norm=rl.policy_input_norm,
             local_dim=canvit.local_dim,
         ).to(device)
         critic.train()
@@ -177,6 +179,7 @@ def build_policy(
             canvas_dim=canvit.cfg.canvas_dim, width=rl.width, n_scale=n_scale, scales=scales,
             centers_per_axis=rl.centers_per_axis, block_layers=rl.block_layers, groups=feature_groups,
             dueling=False, action_space=action_space, readout=rl.policy_readout,
+        levels=rl.policy_levels, input_norm=rl.policy_input_norm,
             local_dim=canvit.local_dim,
         ).to(device)
         critic.train()

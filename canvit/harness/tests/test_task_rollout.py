@@ -595,6 +595,34 @@ def test_autoreg_style_policy_trains_end_to_end():
     assert joint.policy_selector.vp_flat.shape == (32 * 32, 3)  # heatmap ON the state grid
 
 
+def test_policy_levels_and_input_norm_reach_the_scorer_and_train():
+    """`policy_levels` / `policy_input_norm` (2026-11-13 architecture ablation) are reachable
+    from the config, the defaults build the historical net, and a shallower, BatchNorm-free
+    scorer trains end to end on the foveated fixation grid."""
+    from torch import nn
+
+    seg = _seg_foveated()
+    seg.requires_grad_(False)
+    seg.eval()
+    default = _vpg_joint(canvit=seg.canvit, encode_model=seg, groups=ADE_GROUPS)
+    assert len(default.scorer.enc) == 6 and isinstance(default.scorer.frontend.bn, nn.BatchNorm2d)
+    torch.manual_seed(1)
+    joint = _vpg_joint(canvit=seg.canvit, encode_model=seg, groups=ADE_GROUPS,
+                       feature_groups=("ln_feat",), policy_levels=3, policy_input_norm="none")
+    assert len(joint.scorer.enc) == 3 and len(joint.scorer.dec) == 2
+    assert not any(isinstance(m, nn.modules.batchnorm._BatchNorm) for m in joint.scorer.modules())
+    task = BoundAde20kTask(seg=seg, masks=_seg_masks(), canvas_grid=_G)
+    _zero_grads(seg, joint.scorer)
+    r = run_rollout(
+        model=seg, images=torch.randn(_B, 3, _IMG, _IMG), task=task, selector=_fov_selector(),
+        bptt=BpttSpec(mode="none", horizon=4), branches=[ViewpointType.FULL],
+        canvas_grid_size=_G, amp_ctx=torch.enable_grad(), joint=joint,
+    )
+    assert torch.isfinite(r.total_loss)
+    assert _has_grad(joint.scorer)
+    assert _no_grad(seg)
+
+
 def test_vpg_refuses_select_bn_eval_but_qreg_still_gets_it():
     """`select_bn_eval` defaults True (it reproduces the qband checkpoints for QReg/PG), but
     for VPG it means sampling from one distribution and differentiating log pi of another.

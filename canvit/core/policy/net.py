@@ -41,6 +41,7 @@ DEFAULT_POLICY_REPO = resolve_canvit_repo("qpolicy-ade20k-c64-t5-qband-2026-07-0
 
 ActionSpace = Literal["safebox", "fixation"]
 Readout = Literal["unet", "local"]
+InputNorm = Literal["bn", "none"]
 
 
 def candidate_viewpoints(scales: tuple[float, ...], centers_per_axis: int) -> Tensor:
@@ -103,12 +104,16 @@ class Frontend(nn.Module):
 
     def __init__(
         self, canvas_dim: int, width: int, *, groups: tuple[str, ...] = FEATURE_GROUPS,
-        local_dim: int | None = None,
+        local_dim: int | None = None, input_norm: InputNorm = "bn",
     ):
         super().__init__()
         self.groups = groups
         self.sizes = group_sizes(canvas_dim, groups, local_dim)
-        self.bn = nn.BatchNorm2d(sum(self.sizes))
+        # "none": no input normalization at all -- the scorer then has NO BatchNorm, so its
+        # training (batch stats) and eval (running stats) forwards are the same function.
+        # Meant for inputs that arrive normalized already (ln_feat: a channel-wise LayerNorm
+        # per token); the per-channel affine the BN would add is absorbed by the 1x1 proj.
+        self.bn = nn.BatchNorm2d(sum(self.sizes)) if input_norm == "bn" else nn.Identity()
         self.proj = nn.ModuleList([nn.Conv2d(sz, width, 1) for sz in self.sizes])
         self.norm = nn.ModuleList([LayerNorm2d(width) for _ in self.sizes])
         self.gate = nn.Parameter(torch.ones(len(self.sizes)))
@@ -180,18 +185,24 @@ class ViewpointScorer(  # pyright: ignore[reportIncompatibleMethodOverride]  # S
         action_space: ActionSpace = "safebox",
         readout: Readout = "unet",
         local_dim: int | None = None,
+        levels: int = 6,
+        input_norm: InputNorm = "bn",
     ):
         super().__init__()
         scales, groups = tuple(scales), tuple(groups)  # config.json round-trips tuples as lists
         assert len(scales) == n_scale, "need one entry in `scales` per scale channel"
         self.action_space: ActionSpace = action_space
         self.readout: Readout = readout
-        self.frontend = Frontend(canvas_dim, width, groups=groups, local_dim=local_dim)
+        self.frontend = Frontend(canvas_dim, width, groups=groups, local_dim=local_dim, input_norm=input_norm)
         # 'local' skips the U-Net entirely -- do not INSTANTIATE it either, or the unused
         # params would ride in the optimizer and the published state_dict.
+        # `levels`: U-Net resolutions 32, 16, ... down to 32 >> (levels-1); 6 (default, the
+        # historical net) bottoms out at 1x1. With 7x7 depthwise kernels the receptive field
+        # is already global by the 8x8 level (levels=3).
+        assert 1 <= levels <= 6, "levels: 1 (no pooling) .. 6 (pool 32 -> 1)"
         if readout == "unet":
-            self.enc = nn.ModuleList([_stage(width, width, block_layers) for _ in range(6)])  # 32,16,8,4,2,1
-            self.dec = nn.ModuleList([_stage(2 * width, width, block_layers) for _ in range(5)])  # ->2,4,8,16,32
+            self.enc = nn.ModuleList([_stage(width, width, block_layers) for _ in range(levels)])
+            self.dec = nn.ModuleList([_stage(2 * width, width, block_layers) for _ in range(levels - 1)])
         else:
             self.enc = self.dec = None
         if action_space == "fixation":
@@ -219,14 +230,15 @@ class ViewpointScorer(  # pyright: ignore[reportIncompatibleMethodOverride]  # S
             d = h
         else:
             skips = []
+            n = len(self.enc)
             for i, enc in enumerate(self.enc):
                 h = enc(h)
                 skips.append(h)
-                if i < 5:
+                if i < n - 1:
                     h = F.avg_pool2d(h, 2)
-            d = skips[5]  # 1x1 global bottleneck
+            d = skips[n - 1]  # the bottleneck (1x1 at the default levels=6)
             for j in range(len(self.dec)):
-                d = self.dec[j](torch.cat([F.interpolate(d, scale_factor=2, mode="nearest"), skips[4 - j]], dim=1))
+                d = self.dec[j](torch.cat([F.interpolate(d, scale_factor=2, mode="nearest"), skips[n - 2 - j]], dim=1))
         b = d.shape[0]
         vals = [
             self.head(F.grid_sample(d, self.sb_grids[k].expand(b, -1, -1, -1), align_corners=False) + self.scale_emb[k])
