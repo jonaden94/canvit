@@ -52,3 +52,12 @@ default-feature qreg/pg/qprop (7-8).
   there logs "sweep finished" (~18:00). That 3rd worker was started from a Claude session INSIDE
   17284453: if that session's step ends, the worker and its current run die -- requeue a stale
   `claimed/` entry by moving it back to `todo/`.
+- 08:40: job 17288122 started 05:41. qreg-lnfeat-s0 done (159 min, sharing the GPU). **a2c-s0 and
+  ppo-s0 OOMed at their first training step**: the co-running qreg process had grown its PyTorch
+  cache to 17.3 GB (a process's cache is never released to the other process) and AC needs ~14.4 GB.
+  Non-AC pairs fit (qtd 17.4 + dense4 11.4 GB). Fix, no code change: the 10 a2c/ppo runs moved to a
+  separate queue `algos_queue_ac/` (failed s0 retries reset as fresh entries; their dead run dirs are
+  `*.failed-<ts>`, their W&B runs show as crashed), drained by ONE solo worker in 17284453 (starts
+  after pg-lnfeat, ~15:30; log `algos_queue_ac/worker-17284453-ac.log`); 17288122's two workers keep
+  the qreg/qtd/dense4 queue. Estimate (pg-lnfeat solo runs at 0.44 s/step): AC queue ~22 h, ends ~Nov 14
+  midday, 17284453 ends Nov 15 01:52.
