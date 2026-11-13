@@ -57,5 +57,6 @@ for s in 0 1 2 3 4; do   # seed-major, rotating arm order
 done > "$TMP/spec.txt"
 
 bash "$HERE/chain_queue.sh" init "$Q" "$TMP/env.sh" "$TMP/spec.txt"
-bash "$Q/chain_queue.sh" submit "$Q"
 rm -rf "$TMP"
+# the jupyter QOS allows 2 submitted jobs per user; when both are taken, submit later by hand
+bash "$Q/chain_queue.sh" submit "$Q" || echo "submit failed (jupyter slots full?) -- later: bash $Q/chain_queue.sh submit $Q"
