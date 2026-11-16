@@ -132,3 +132,39 @@ Reading:
 - So the ~0.09 gap to the oracle is not closed by the RL algorithm or by scorer capacity/shape.
 - The chain job 17313163 drained all 20 ablation runs in 23 h, so its self-requeue was not
   needed (the mechanism was tested separately with job 17298388).
+
+## Follow-up (owner's go 2026-11-16): data limit or supervision limit?
+
+The algorithm and architecture arms all plateau at t4 ~0.452 vs the oracle's ~0.54. Is that plateau a
+limit of the 20k training images, or of how sparse the supervision is?
+
+**1. Train vs val** (no training). The final (step-9000) checkpoints of pg-lnfeat and qreg-dense4-lnfeat
+s0-4 are evaluated on 2000 TRAINING images and on val. The greedy GT oracle and the random grid are run
+on the same 2000 training images. Compare the share of the random->oracle gap each policy captures on
+train vs on val. A much larger share on train means the policy is data-limited.
+Caveat: the probe was trained on these training images too, so absolute train numbers are higher. The
+gap share is the comparable quantity.
+- `policy_eval.py` runs a checkpoint through the training-time validation (`task.evaluate(joint=...)`)
+  on any ADE20K root. The standalone `harness.evaluate` cannot deploy a policy (it passes no joint).
+  Gate: best.pt of pg-lnfeat-s0 on val reproduces its logged step-7000 eval exactly (V100).
+- Training subsets are symlink roots, `logs/jon_exp36_1_policies_fovi/ade20k_subsets/` (README there).
+  `trainsub2000` has 2000 training images as its `validation` split.
+- Outputs: `logs/jon_exp36_1_policies_fovi/trainval/*.json` (policies) and `logs/jon_exp36_1_oracle_train/`
+  (oracle, `merge.txt`).
+
+**2. Training arms** (`slurm/runs/exp36_1_policies_fovi/followup_queue.sh`, 5 seeds each):
+
+| arm | change vs anchor | anchor |
+|---|---|---|
+| pg-lnfeat-nobn-aug | `--cfg.augment` (dinov3 ADE20K recipe: rescale 0.5-2, 512 crop, flip, photometric) | pg-lnfeat-nobn |
+| pg-lnfeat-nobn-frac50 / -frac25 | trains on a fixed 50 % / 25 % of the training images | pg-lnfeat-nobn |
+| qreg-dense16-lnfeat | 16 extra candidates per state | qreg-dense4-lnfeat |
+
+- dense32 was dropped. It runs out of memory on a 32 GB V100 (512 glimpses in one forward) and would
+  take ~14 h/run even if chunked. Measured: dense4 1.17 s/step, dense16 2.6 s/step (~7 h/run, 22 GB).
+- Augmented masks are uint8. The policy reward rejected them, and aug-s0 died at step 0. Fixed in
+  6927612; the ADE20K digests are unchanged. The queue is pinned to 6927612. Chain job 17336157 was
+  requeued once to pick up the new pin, cutting frac25-s0 after 20 min; it reruns.
+- Compute: chain `logs/jon_exp36_1_policies_fovi/chain_followup/` (job 17336157, self-renewing), plus a
+  detached worker inside the owner's jupyter job 17334601 (`chain_followup/local/`). That worker runs
+  step 1 first, then drains the same queue. It never requeues.
