@@ -70,7 +70,11 @@ def make_ade20k_loaders(cfg: Ade20kConfig) -> tuple[DataLoader, DataLoader]:
 
         def train_transform(img: Image.Image, mask: Image.Image) -> tuple[Tensor, Tensor]:
             img_t, mask_t = _train_aug(img, mask)
-            return img_t, mask_t.squeeze(0)
+            # dinov3's pipeline yields uint8 masks; the val transform (and the RL protocol's
+            # unaugmented train split) int64. The probe loss casts for itself, but the policy
+            # reward (`per_image_ce`) feeds the mask straight to cross_entropy, which rejects
+            # uint8 -- every augmented policy run died at step 0 (2026-11-16). Same values.
+            return img_t, mask_t.squeeze(0).long()
 
         train_ds = ADE20kDataset(root=cfg.ade20k_root, split="training",
                                  joint_transform=train_transform)
