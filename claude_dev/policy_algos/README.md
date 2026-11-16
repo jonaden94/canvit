@@ -97,3 +97,38 @@ pre-submit a successor; instead it requeues itself (same id, fresh 2-day limit) 
 workers stop for lack of walltime with work left. Verified on a CPU test job: `scontrol
 requeue` from inside the batch script works (rc 0); the job restarted ~10 min later with
 SLURM_RESTART_COUNT=1 and a fresh time limit (job 17298388).
+
+## Final results (all runs done 2026-11-15; 0 failed)
+
+ADE20K val mIoU, mean ± SE over seeds. "best" = the best of each run's evals (steps 1000-8000)
+per glimpse count; "@8000" = the last eval. t0 (no policy) = 0.3767 for every arm; random-grid t4
+0.430, held-out GT oracle t4 ~0.54 ([[policy-gt-oracle]] in memory).
+
+| arm | n | best t1 | best t2 | best t3 | best t4 | t4 @8000 |
+|---|---|---|---|---|---|---|
+| **qreg-dense4-lnfeat** | 5 | **0.4212** | **0.4403** | **0.4480** | **0.4532±0.0006** | **0.4514±0.0008** |
+| pg-lnfeat-lev3 | 5 | 0.4192 | 0.4373 | 0.4474 | 0.4526±0.0006 | 0.4508±0.0014 |
+| pg-lnfeat | 5 | 0.4198 | 0.4369 | 0.4468 | 0.4523±0.0004 | 0.4510±0.0010 |
+| qprop | 8 | 0.4203 | 0.4380 | 0.4468 | 0.4523±0.0004 | 0.4496±0.0006 |
+| qprop-lnfeat | 8 | 0.4200 | 0.4381 | 0.4463 | 0.4521±0.0006 | 0.4506±0.0005 |
+| pg-lnfeat-nobn | 5 | 0.4188 | 0.4376 | 0.4465 | 0.4520±0.0012 | 0.4507±0.0014 |
+| pg-lnfeat-lev4 | 5 | 0.4193 | 0.4361 | 0.4460 | 0.4519±0.0003 | 0.4506±0.0009 |
+| pg-lnfeat-local | 5 | 0.4176 | 0.4355 | 0.4449 | 0.4519±0.0003 | 0.4488±0.0014 |
+| qreg | 7 | 0.4209 | 0.4382 | 0.4464 | 0.4519±0.0003 | 0.4504±0.0002 |
+| pg | 8 | 0.4199 | 0.4377 | 0.4459 | 0.4509±0.0003 | 0.4501±0.0006 |
+| a2c-lnfeat | 5 | 0.4189 | 0.4364 | 0.4451 | 0.4508±0.0005 | 0.4487±0.0010 |
+| qreg-lnfeat | 5 | 0.4195 | 0.4387 | 0.4463 | 0.4508±0.0007 | 0.4482±0.0004 |
+| qtd-lnfeat | 5 | 0.4182 | 0.4356 | 0.4444 | 0.4500±0.0007 | 0.4458±0.0010 |
+| ppo-lnfeat | 5 | 0.4172 | 0.4345 | 0.4435 | 0.4497±0.0008 | 0.4451±0.0018 |
+
+Reading:
+- Algorithms: only dense QReg (4 extra scored candidates per step) beats the pg-lnfeat baseline,
+  clearly at t1-t3 (+0.003 at t2, ~5 SE), within noise at t4. A2C, PPO and multi-step Q are at or
+  below the simple baselines; PPO/qtd also lose most by the last eval (less stable).
+- Architecture: none of the 4 changes moves t4 beyond noise (all within ±0.0007 of 0.4523). The
+  U-Net bottleneck can stop at 8x8 (lev3, 2.8M params) or 4x4 at no cost; dropping the input BN
+  costs nothing (and removes the train/eval difference); a purely LOCAL 0.18M-param readout
+  reaches the same t4 but is ~0.002 lower at t1-t3 -- global context helps the early glimpses only.
+- So the ~0.09 gap to the oracle is not closed by the RL algorithm or by scorer capacity/shape.
+- The chain job 17313163 drained all 20 ablation runs in 23 h, so its self-requeue was not
+  needed (the mechanism was tested separately with job 17298388).
