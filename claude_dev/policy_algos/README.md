@@ -168,3 +168,36 @@ gap share is the comparable quantity.
 - Compute: chain `logs/jon_exp36_1_policies_fovi/chain_followup/` (job 17336157, self-renewing), plus a
   detached worker inside the owner's jupyter job 17334601 (`chain_followup/local/`). That worker runs
   step 1 first, then drains the same queue. It never requeues.
+
+### Follow-up results (2026-11-17; dense16 n=4, s4 still running)
+
+**Train vs val.** Final checkpoints, mean of 5 seeds. "Share" = the fraction of the random->oracle gap
+closed. The oracle and random grid on the 2000 training images: t1-t4 0.5246/0.5578/0.5784/0.5901 and
+0.4469/0.4577/0.4675/0.4721.
+
+| | share t1 | t2 | t3 | t4 |
+|---|---|---|---|---|
+| pg-lnfeat, training images | 0.17 | 0.20 | 0.17 | 0.16 |
+| pg-lnfeat, val | 0.21 | 0.23 | 0.21 | 0.18 |
+| dense4, training images | 0.19 | 0.22 | 0.18 | 0.18 |
+| dense4, val | 0.25 | 0.25 | 0.21 | 0.18 |
+
+There is no overfitting: the share is not larger on the images the policy trained on.
+
+**Training arms** (best over evals; ± = SE):
+
+| arm | n | t1 | t2 | t3 | t4 | t4 @8000 |
+|---|---|---|---|---|---|---|
+| pg-lnfeat-nobn (anchor) | 5 | 0.4188 | 0.4376 | 0.4465 | 0.4520±0.0012 | 0.4507±0.0014 |
+| + augmentation | 5 | 0.4171 | 0.4361 | 0.4455 | 0.4513±0.0004 | 0.4494±0.0010 |
+| 50 % of training images | 5 | 0.4188 | 0.4363 | 0.4457 | 0.4514±0.0006 | 0.4498±0.0007 |
+| 25 % of training images | 5 | 0.4189 | 0.4358 | 0.4455 | 0.4513±0.0006 | 0.4500±0.0008 |
+| qreg-dense4-lnfeat (anchor) | 5 | 0.4212 | 0.4403 | 0.4480 | 0.4532±0.0006 | 0.4514±0.0008 |
+| qreg-dense16-lnfeat | 4 | 0.4223 | 0.4417 | 0.4488 | 0.4539±0.0004 | 0.4517±0.0006 |
+
+**Reading.** The policy is not data-limited: a quarter of the images gives the same result, and
+augmentation does not help. Denser supervision helps only marginally: 4x more labels (dense4 ->
+dense16) adds ~+0.001 per t, about 1-2 SE. So algorithm, architecture, data and supervision density are
+all ruled out as the lever. What remains is information: the oracle knows from the labels where the
+probe is wrong, and a policy can only infer that from the canvas. For this frozen backbone and probe,
+~0.454 at t4 looks like the practical ceiling.
