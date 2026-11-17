@@ -88,7 +88,7 @@ class JointPolicyConfig:
     coverage — needs n_full_start_branches>=1 and n_random_start_branches>=1."""
 
     # Objective
-    objective: Literal["qreg", "pg", "vpg", "ac", "qtd"] = "qreg"
+    objective: Literal["qreg", "pg", "vpg", "ac", "qtd", "sac"] = "qreg"
     """``qreg``/``pg``: the CanViT-PyTorch-RL recipes (per-glimpse fractional reward,
     EMA-standardized). ``vpg``: vanilla policy gradient with a learned V(s) baseline and a
     TERMINAL reward — the ``autoreg_tryout`` recipe (see :class:`~canvit.train.rl.VPG`).
@@ -133,6 +133,15 @@ class JointPolicyConfig:
     qreg_extra_candidates: int = 0
     """``qreg``: dense supervision -- K extra random cells glimpsed (no_grad) per state and
     regressed on, besides the taken one. 0 = the recipe; costs ~K more glimpse forwards."""
+    sac_gamma: float = 0.99
+    """``sac``: discount of the soft Bellman target (the paper's 0.99)."""
+    sac_target_tau: float = 0.005
+    """``sac``: Polyak rate of the target critics per training step (Haarnoja et al.)."""
+    sac_target_entropy: float | None = None
+    """``sac``: entropy the temperature steers the policy to, in nats. None = the paper's
+    0.98 * log|A| (5.43 nats for 256 cells: near uniform); PG's own target is 1.0."""
+    sac_alpha_init: float = 1.0
+    """``sac``: initial temperature (SAC's 1.0); then a dual step at ``alpha_lr`` per step."""
 
     # VPG only (objective="vpg"); ignored by qreg/pg. Defaults = autoreg exp12's values.
     vpg_entropy_bonus: float = 5e-3

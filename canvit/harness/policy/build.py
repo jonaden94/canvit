@@ -35,8 +35,8 @@ from canvit.core.policy import (
     fixation_candidates,
 )
 from canvit.harness.config import FoveatedScaleConfig, JointPolicyConfig
-from canvit.harness.policy.joint import JointPolicy
-from canvit.harness.policy.rl import AC, PG, QTD, VPG, Objective, QReg
+from canvit.harness.policy.joint import JointPolicy, TwinCritic
+from canvit.harness.policy.rl import AC, PG, QTD, SAC, VPG, Objective, QReg
 from canvit.harness.rollout.selector import PolicySelector, RandomSelector
 
 log = logging.getLogger(__name__)
@@ -90,6 +90,13 @@ def build_policy(
     elif rl.objective == "qtd":
         obj = QTD(prime_on_policy=rl.prime_on_policy, dueling=rl.dueling, gamma=rl.qtd_gamma,
                   target_tau=rl.qtd_target_tau)
+    elif rl.objective == "sac":
+        # The paper's target entropy is 0.98 * log|A| (Christodoulou 2019, Table 2): with 256
+        # candidates that is 5.43 of a maximum 5.55 nats, i.e. a near-uniform training policy.
+        target_entropy = (0.98 * math.log(vp_flat.shape[0]) if rl.sac_target_entropy is None
+                          else rl.sac_target_entropy)
+        obj = SAC(gamma=rl.sac_gamma, target_tau=rl.sac_target_tau, target_entropy=target_entropy,
+                  alpha_init=rl.sac_alpha_init, alpha_lr=rl.alpha_lr)
     elif rl.objective == "vpg":
         obj = VPG(
             entropy_bonus=rl.vpg_entropy_bonus, reinforce_weight=rl.vpg_reinforce_weight,
@@ -183,11 +190,24 @@ def build_policy(
             local_dim=canvit.local_dim,
         ).to(device)
         critic.train()
-    # QTD target net: a frozen copy of the scorer, Polyak-updated after each step.
-    target_net: ViewpointScorer | None = None
-    if isinstance(obj, QTD):
+    # SAC: twin soft-Q critics, each a ViewpointScorer of the ACTOR'S size (no dueling head:
+    # the whole map is Q(s, .)), riding `critic` like the AC value net above.
+    if isinstance(obj, SAC):
+        def _q() -> ViewpointScorer:
+            return ViewpointScorer(
+                canvas_dim=canvit.cfg.canvas_dim, width=rl.width, n_scale=n_scale, scales=scales,
+                centers_per_axis=rl.centers_per_axis, block_layers=rl.block_layers, groups=feature_groups,
+                dueling=False, action_space=action_space, readout=rl.policy_readout,
+                levels=rl.policy_levels, input_norm=rl.policy_input_norm,
+                local_dim=canvit.local_dim,
+            ).to(device)
+        critic = TwinCritic(_q(), _q()).train()
+    # QTD target net: a frozen copy of the scorer; SAC's: of the twin critic. Polyak-updated
+    # after each step (JointPolicy.after_optimizer_step).
+    target_net: torch.nn.Module | None = None
+    if isinstance(obj, (QTD, SAC)):
         import copy
-        target_net = copy.deepcopy(scorer).requires_grad_(False)
+        target_net = copy.deepcopy(scorer if isinstance(obj, QTD) else critic).requires_grad_(False)
 
     encoder = StateEncoder(encode_model, canvas_grid=canvas_grid, feature_groups=feature_groups)
 
@@ -210,6 +230,8 @@ def build_policy(
     )
     if isinstance(obj, (PG, AC)) and obj.entropy_target is not None:
         jp.log_alpha = torch.tensor(math.log(obj.entropy_bonus), device=device)
+    if isinstance(obj, SAC):
+        jp.log_alpha = torch.tensor(math.log(obj.alpha_init), device=device)
     return jp
 
 

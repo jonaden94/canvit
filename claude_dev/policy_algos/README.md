@@ -201,3 +201,35 @@ dense16) adds ~+0.001 per t, about 1-2 SE. So algorithm, architecture, data and 
 all ruled out as the lever. What remains is information: the oracle knows from the labels where the
 probe is wrong, and a policy can only infer that from the canvas. For this frozen backbone and probe,
 ~0.454 at t4 looks like the practical ceiling.
+
+## SAC-Discrete (owner's request 2026-11-17)
+
+`--rl.objective sac` (`rl.SAC`, `rl.sac_loss`, `JointPolicy._sac_loss`) implements SAC-Discrete
+(Christodoulou 2019, arXiv 1910.07207), Algorithm 1:
+- critics: twin soft-Q `ViewpointScorer`s of the actor's size (`joint.TwinCritic`) with Polyak targets;
+- soft value: the exact expectation over pi (eq. 10);
+- actor: the expected objective over all cells (eq. 12);
+- temperature: a dual step toward the target entropy (eq. 11).
+
+Departures from the paper, all chosen for comparability with the other arms:
+- No replay buffer: one update per rollout on that rollout's own transitions, the same data and
+  update budget as PG.
+- Rewards are divided by a running std, as for AC/QTD.
+- Target critics are Polyak-averaged with tau 0.005 (Haarnoja et al.), not hard-copied every 8000
+  steps (the paper's Atari setting is nearly our whole run).
+
+The second paper (SD-SAC, Zhou et al. TMLR 2024, arXiv 2209.10081) fixes long-horizon Atari failure
+modes: entropy collapse under deceptive rewards and twin-min underestimation. It is not implemented.
+
+The actor is pg-lnfeat's scorer (5.37M parameters, ln_feat input, no input BN), so the anchor is
+pg-lnfeat-nobn. Two arms, 5 seeds each (`slurm/runs/exp36_1_policies_fovi/sac_queue.sh`, queue
+`chain_sac`):
+
+| arm | target entropy |
+|---|---|
+| sac-lnfeat-nobn | the paper's 0.98 * log 256 = 5.43 nats (max 5.55: near-uniform while training) |
+| sac-ent1-lnfeat-nobn | 1.0 nat, PG's own entropy target |
+
+Checks: 4 new tests in `test_policy_algos.py`, including a hand-computed loss and the actor
+gradient = the expected-objective gradient. All 9 digests (8 task + rollout parity) are identical
+to 7f3d16c on the same node. Smoke: 1.3 s/step vs pg's 0.43 (~3.5 h/run), 21.5 GB peak.

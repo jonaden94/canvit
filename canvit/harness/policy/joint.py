@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 
 import torch
 import torch.distributed as dist
-from torch import Tensor
+from torch import Tensor, nn
 
 from canvit.core.policy import (
     ViewpointScorer,
@@ -35,6 +35,8 @@ from canvit.harness.policy.rl import (
     AC,
     PG,
     QTD,
+    SAC,
+    SAC_ALPHA_MIN,
     VPG,
     Objective,
     QReg,
@@ -44,10 +46,25 @@ from canvit.harness.policy.rl import (
     gae,
     pg_loss,
     qreg_loss,
+    sac_loss,
     vpg_loss,
 )
 from canvit.harness.rollout.selector import PolicySelector, RandomSelector
 from canvit.harness.rollout.viewpoint import ViewpointType
+
+
+class TwinCritic(nn.Module):
+    """SAC's two soft-Q critics as ONE module, so they ride ``JointPolicy.critic`` -- the
+    policy param group, the sidecar, DDP sync -- exactly like the Q-Prop / AC critic.
+    forward(feats [N, C, H, W]) -> (Q1, Q2), each [N, A]."""
+
+    def __init__(self, q1: ViewpointScorer, q2: ViewpointScorer):
+        super().__init__()
+        self.q1, self.q2 = q1, q2
+
+    def forward(self, feats: Tensor) -> tuple[Tensor, Tensor]:
+        n = feats.shape[0]
+        return self.q1(feats).reshape(n, -1), self.q2(feats).reshape(n, -1)
 
 
 @dataclass
@@ -70,16 +87,17 @@ class JointPolicy:
     running: dict[int, RunningNorm] = field(default_factory=dict)
     log_alpha: Tensor | None = None
     last_step: dict = field(default_factory=dict)  # detached per-step policy metrics for logging
-    target_net: ViewpointScorer | None = None
-    """QTD only: the Polyak-averaged target copy of ``scorer``."""
+    target_net: nn.Module | None = None
+    """QTD: the Polyak-averaged target copy of ``scorer``. SAC: of ``critic`` (the twin)."""
     optimizer: object | None = None
     """Set by ``run()`` after the optimizer exists. Only AC with ppo_epochs > 1 uses it,
     for its inner PPO passes; every other objective ignores it."""
     grad_clip: float = 1.0
-    critic: ViewpointScorer | None = None
-    """Q-Prop only (PG objective, obj.qprop=True); None for every other objective/config
-    (qreg, vpg, plain pg) -- every method below that branches on `self.critic is not None`
-    is therefore an exact no-op for anything that isn't a qprop run."""
+    critic: nn.Module | None = None
+    """Q-Prop (PG objective, obj.qprop=True) and AC: a ViewpointScorer; SAC: a
+    :class:`TwinCritic`. None for every other objective/config (qreg, qtd, vpg, plain pg)
+    -- every method below that branches on `self.critic is not None` is therefore an exact
+    no-op for those."""
 
     def branch_selector(self, t0_type: ViewpointType) -> tuple[object, bool]:
         """(selector, is_policy_branch) for a branch with this t0 type. Policy
@@ -153,7 +171,7 @@ class JointPolicy:
         """True => the reward is TERMINAL, so ``run_rollout`` must buffer the per-step
         policy aux and call :meth:`trajectory_loss` once at rollout end instead of
         :meth:`glimpse_loss` inside the loop (VPG). False => the historical inline path."""
-        return isinstance(self.objective, (VPG, AC, QTD))
+        return isinstance(self.objective, (VPG, AC, QTD, SAC))
 
     @property
     def needs_step_rewards(self) -> bool:
@@ -161,7 +179,7 @@ class JointPolicy:
         ``run_rollout`` then measures it every glimpse exactly as the inline path does,
         buffers it with the state features, and calls :meth:`episode_loss`. VPG (terminal
         reward only) keeps its own historical path."""
-        return isinstance(self.objective, (AC, QTD))
+        return isinstance(self.objective, (AC, QTD, SAC))
 
     @property
     def extra_candidates(self) -> int:
@@ -278,6 +296,8 @@ class JointPolicy:
         r = self._norm(-1).rescale(rewards.reshape(-1)).reshape(B, T)  # global scale, no shift
         if isinstance(obj, QTD):
             return self.rl_weight * self._qtd_loss(scores=scores, flat_idx=flat_idx, feats=feats, r=r)
+        if isinstance(obj, SAC):
+            return self.rl_weight * self._sac_loss(scores=scores, flat_idx=flat_idx, feats=feats, r=r)
         assert isinstance(obj, AC)
         alpha = obj.entropy_bonus if self.log_alpha is None else self.log_alpha.exp()
         feats_all = torch.cat(feats, dim=0)  # [T*B, ...], glimpse-major
@@ -332,15 +352,41 @@ class JointPolicy:
         self.last_step = {"q_sel": m["q_sel"].detach(), "td_target": y.mean(), "boot_mean": boot[:, :-1].mean()}
         return loss
 
+    def _sac_loss(self, *, scores: Tensor, flat_idx: Tensor, feats: list[Tensor], r: Tensor) -> Tensor:
+        obj = self.objective
+        assert isinstance(obj, SAC) and self.critic is not None and self.target_net is not None
+        assert self.log_alpha is not None
+        B, T, A = scores.shape
+
+        def bta(q: Tensor, t: int) -> Tensor:  # [t*B, A] glimpse-major -> [B, t, A]
+            return q.reshape(t, B, A).transpose(0, 1)
+
+        q1, q2 = self.critic(torch.cat(feats, dim=0).float())  # ONE forward per critic over the episode
+        with torch.no_grad():
+            if T > 1:
+                t1, t2 = self.target_net(torch.cat(feats[1:], dim=0).float())
+                t1, t2 = bta(t1, T - 1), bta(t2, T - 1)
+            else:
+                t1 = t2 = scores.new_zeros(B, 0, A)
+        alpha = self.log_alpha.exp()
+        loss, entropy, metrics = sac_loss(scores, bta(q1, T), bta(q2, T), t1, t2, flat_idx, r,
+                                          alpha=alpha, gamma=obj.gamma)
+        entropy_floor_step(log_alpha=self.log_alpha, entropy=entropy.detach(), target=obj.target_entropy,
+                           alpha_lr=obj.alpha_lr, alpha_min=SAC_ALPHA_MIN)
+        self.last_step = metrics | {"alpha": alpha}
+        return loss
+
     @torch.no_grad()
     def after_optimizer_step(self) -> None:
-        """QTD: Polyak-update the target net (called by the loop after every optimizer step).
-        A no-op for every other objective."""
+        """Polyak-update the target net (called by the loop after every optimizer step):
+        QTD's tracks the scorer, SAC's the twin critic. A no-op for every other objective."""
         if self.target_net is None:
             return
+        src = self.critic if isinstance(self.objective, SAC) else self.scorer
+        assert src is not None
         tau = self.objective.target_tau  # type: ignore[union-attr]
-        for pt, p in zip(self.target_net.parameters(), self.scorer.parameters()):
+        for pt, p in zip(self.target_net.parameters(), src.parameters()):
             pt.lerp_(p, tau)
-        for bt, b in zip(self.target_net.buffers(), self.scorer.buffers()):
+        for bt, b in zip(self.target_net.buffers(), src.buffers()):
             bt.copy_(b)
 

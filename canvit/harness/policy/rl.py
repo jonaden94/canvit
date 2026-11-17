@@ -151,7 +151,37 @@ class QTD:
     target_tau: float = 0.01  # Polyak rate of the target net, per training step
 
 
-Objective = QReg | PG | VPG | AC | QTD
+@dataclass(frozen=True)
+class SAC:
+    """Discrete soft actor-critic (policy-algos branch, 2026-11-17): SAC-Discrete,
+    Christodoulou 2019 (arXiv 1910.07207), Algorithm 1.
+
+    * actor: the scorer; pi(.|s) = softmax(scores) over the candidate grid, SAMPLED during
+      training, argmax at deploy (as PG);
+    * critics: two ViewpointScorers of the actor's size, each Q(s, .) over every candidate
+      (eq. i), with Polyak-averaged target copies; the soft value is the exact expectation
+      V(s) = pi(s)^T [min_i Qbar_i(s) - alpha log pi(s)] (eq. 10);
+    * critic loss 1/2 (Q_i(s_t, a_t) - y_t)^2, y_t = r_t + gamma V(s_{t+1}) (the last glimpse
+      ends the episode: y = r); actor loss pi(s)^T [alpha log pi(s) - min_i Q_i(s)] (eq. 12);
+      alpha by a dual step on log(alpha) toward ``target_entropy`` (eq. 11).
+
+    Departures from Algorithm 1, both for comparability with the other arms: NO replay
+    buffer (each rollout's transitions get one update, the data and update budget of PG),
+    and rewards divided by a running std (as AC/QTD). The target nets are Polyak-averaged
+    (Haarnoja et al.'s tau) rather than hard-copied every 8000 steps (the paper's Atari
+    setting, longer than our whole run)."""
+
+    gamma: float = 0.99
+    target_tau: float = 0.005
+    target_entropy: float = 1.0  # nats; build_policy resolves the paper's 0.98 * log|A| default
+    alpha_init: float = 1.0
+    alpha_lr: float = 0.05
+
+
+SAC_ALPHA_MIN = 1e-4  # SAC has no entropy floor; this only keeps log(alpha) finite
+
+
+Objective = QReg | PG | VPG | AC | QTD | SAC
 
 
 @torch.no_grad()
@@ -288,6 +318,40 @@ def gae(rewards: Tensor, values: Tensor, *, gamma: float, lam: float) -> tuple[T
         last = delta + gamma * lam * last if t + 1 < T else delta
         adv[:, t] = last
     return adv, adv + values
+
+
+def sac_loss(
+    scores: Tensor,
+    q1: Tensor,
+    q2: Tensor,
+    q1_tgt_next: Tensor,
+    q2_tgt_next: Tensor,
+    flat_idx: Tensor,
+    r: Tensor,
+    *,
+    alpha: Tensor | float,
+    gamma: float,
+) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
+    """SAC-Discrete actor + twin-critic loss over a WHOLE episode, meaned over (b, t).
+
+    scores [B, T, A] (grad -> actor), q1/q2 [B, T, A] (grad -> critics), q*_tgt_next
+    [B, T-1, A] the TARGET critics at s_1..s_{T-1} (no grad), flat_idx [B, T] the taken
+    cells, r [B, T] the (scaled) rewards. The episode ends after the last glimpse."""
+    logp = F.log_softmax(scores, dim=2)
+    p = logp.exp()
+    with torch.no_grad():  # soft Bellman target, eq. (10): exact expectation over pi(.|s_{t+1})
+        v_next = (p[:, 1:] * (torch.min(q1_tgt_next, q2_tgt_next) - alpha * logp[:, 1:])).sum(dim=2)
+        y = r.clone()
+        y[:, :-1] += gamma * v_next
+    qa1 = q1.gather(2, flat_idx[..., None]).squeeze(2)
+    qa2 = q2.gather(2, flat_idx[..., None]).squeeze(2)
+    critic_loss = 0.5 * (F.mse_loss(qa1, y) + F.mse_loss(qa2, y))
+    actor_loss = (p * (alpha * logp - torch.min(q1, q2).detach())).sum(dim=2).mean()  # eq. (12)
+    entropy = -(p * logp).sum(dim=2).mean()
+    return actor_loss + critic_loss, entropy, {
+        "policy_entropy": entropy.detach(), "critic_loss": critic_loss.detach(),
+        "actor_loss": actor_loss.detach(), "q_sel": qa1.detach().mean(), "td_target": y.mean(),
+    }
 
 
 def ac_loss(

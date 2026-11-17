@@ -1,4 +1,4 @@
-"""policy-algos branch: AC (A2C / PPO-clip), QTD (multi-step Q-learning) and dense QReg.
+"""policy-algos branch: AC (A2C / PPO-clip), QTD (multi-step Q-learning), dense QReg and SAC-Discrete.
 
 Unit checks on the new math (GAE, the clipped surrogate) plus rollouts through the real
 engine on a tiny CPU ADE20K model, in the production cell (frozen backbone + probe,
@@ -6,6 +6,8 @@ policy only, bptt='none'): every new objective must train exactly the policy mod
 owns and leave the task net untouched -- and must not change what the old objectives do.
 """
 
+
+import math
 
 import pytest
 import torch
@@ -16,8 +18,8 @@ from canvit.ade20k.task import BoundAde20kTask
 from canvit.core import CanViTForSemanticSegmentation
 from canvit.harness.config import FoveatedScaleConfig, JointPolicyConfig
 from canvit.harness.policy import build_policy
-from canvit.harness.policy.joint import JointPolicy
-from canvit.harness.policy.rl import AC, PG, QTD, VPG, QReg, ac_loss, gae
+from canvit.harness.policy.joint import JointPolicy, TwinCritic
+from canvit.harness.policy.rl import AC, PG, QTD, SAC, VPG, QReg, ac_loss, gae, sac_loss
 from canvit.harness.rollout import run_rollout
 from canvit.harness.rollout.selector import RandomSelector
 from canvit.harness.rollout.viewpoint import ViewpointType
@@ -90,7 +92,7 @@ def _jp(obj):
 
 def test_dispatch_flags():
     for obj, defers, steps in [(QReg(), False, False), (PG(), False, False), (VPG(), True, False),
-                               (AC(), True, True), (QTD(), True, True)]:
+                               (AC(), True, True), (QTD(), True, True), (SAC(), True, True)]:
         assert _jp(obj).defers_credit is defers, obj
         assert _jp(obj).needs_step_rewards is steps, obj
     assert _jp(QReg()).extra_candidates == 0
@@ -241,3 +243,80 @@ def test_old_objectives_are_unchanged_by_the_new_plumbing():
         joint = _joint(seg, **kw)
         assert joint.target_net is None and joint.extra_candidates == 0 and not joint.defers_credit
         assert joint.critic is None
+
+
+# --- SAC-Discrete ------------------------------------------------------------------------
+
+def test_sac_loss_matches_hand_computation():
+    """Soft Bellman target with the exact expectation (eq. 10), the twin min, and the
+    expected actor objective (eq. 12) on a 1-episode, 2-glimpse, 2-cell example."""
+    scores = torch.tensor([[[0.0, 1.0], [2.0, 0.0]]], requires_grad=True)       # [B=1, T=2, A=2]
+    q1 = torch.tensor([[[1.0, 3.0], [0.5, 2.0]]], requires_grad=True)
+    q2 = torch.tensor([[[2.0, 2.0], [1.0, 1.0]]], requires_grad=True)
+    t1, t2 = torch.tensor([[[4.0, 1.0]]]), torch.tensor([[[3.0, 2.0]]])          # targets at s_1
+    idx, r = torch.tensor([[1, 0]]), torch.tensor([[0.5, 0.25]])
+    alpha, gamma = 0.3, 0.9
+    loss, ent, m = sac_loss(scores, q1, q2, t1, t2, idx, r, alpha=alpha, gamma=gamma)
+    p1 = torch.softmax(torch.tensor([2.0, 0.0]), 0)
+    v1 = (p1 * (torch.tensor([3.0, 1.0]) - alpha * p1.log())).sum()
+    y = torch.tensor([0.5 + gamma * v1, 0.25])                                   # last glimpse: y = r
+    critic = 0.5 * (((torch.tensor([3.0, 0.5]) - y) ** 2).mean() + ((torch.tensor([2.0, 1.0]) - y) ** 2).mean())
+    lp = torch.log_softmax(scores.detach(), 2)
+    qmin = torch.min(q1, q2).detach()
+    actor = (lp.exp() * (alpha * lp - qmin)).sum(2).mean()
+    torch.testing.assert_close(loss, actor + critic)
+    torch.testing.assert_close(m["td_target"], y.mean())
+    # the actor gradient is the expected-objective gradient; the critics' loss never reaches it
+    g_s, g_q1 = torch.autograd.grad(loss, (scores, q1))
+    s2 = scores.detach().clone().requires_grad_(True)
+    lp2 = torch.log_softmax(s2, 2)
+    g_ref, = torch.autograd.grad((lp2.exp() * (alpha * lp2 - qmin)).sum(2).mean(), s2)
+    torch.testing.assert_close(g_s, g_ref)
+    assert g_q1[0, 0, 0] == 0 and g_q1[0, 1, 1] == 0  # only the taken cells are regressed
+
+
+def test_sac_builds_twin_critics_and_trains_actor_and_critics_only():
+    torch.manual_seed(1)
+    seg = _seg()
+    joint = _joint(seg, objective="sac", select_bn_eval=False)
+    assert isinstance(joint.objective, SAC) and joint.policy_selector.mode == "sample"
+    assert isinstance(joint.critic, TwinCritic) and joint.critic.q1.vhead is None
+    n_act = joint.policy_selector.vp_flat.shape[0]
+    assert math.isclose(joint.objective.target_entropy, 0.98 * math.log(n_act))  # the paper's default
+    assert all(not p.requires_grad for p in joint.target_net.parameters())
+    a0 = float(joint.log_alpha)
+    r = _rollout(seg, joint)
+    assert torch.isfinite(r.total_loss)
+    assert _has_grad(joint.scorer) and _has_grad(joint.critic.q1) and _has_grad(joint.critic.q2)
+    assert _no_grad(joint.target_net) and _no_grad(seg)
+    for k in ("policy_entropy", "critic_loss", "actor_loss", "alpha", "td_target", "reward_frac"):
+        assert k in r.policy_metrics, k
+    assert float(joint.log_alpha) != a0  # the temperature took its dual step
+
+
+def test_sac_polyak_tracks_the_critic_and_target_entropy_override():
+    seg = _seg()
+    joint = _joint(seg, objective="sac", select_bn_eval=False, sac_target_entropy=1.0)
+    assert joint.objective.target_entropy == 1.0
+    tgt0 = [p.clone() for p in joint.target_net.parameters()]
+    with torch.no_grad():
+        for p in joint.critic.parameters():
+            p.add_(1.0)
+    joint.after_optimizer_step()
+    for t0, t1, c in zip(tgt0, joint.target_net.parameters(), joint.critic.parameters()):
+        torch.testing.assert_close(t1, t0 + 0.005 * (c - t0))
+
+
+def test_sac_sidecar_roundtrip():
+    seg = _seg()
+    a = _joint(seg, objective="sac", select_bn_eval=False)
+    with torch.no_grad():
+        for p in list(a.critic.parameters()) + list(a.target_net.parameters()):
+            p.add_(0.5)
+    a.log_alpha.fill_(-1.25)
+    b = _joint(seg, objective="sac", select_bn_eval=False)
+    b.load_state_dict(a.state_dict())
+    for x, y in zip(list(a.critic.parameters()) + list(a.target_net.parameters()),
+                    list(b.critic.parameters()) + list(b.target_net.parameters())):
+        assert torch.equal(x, y)
+    assert float(b.log_alpha) == -1.25
