@@ -46,6 +46,7 @@ from canvit.ade20k.config import Ade20kConfig
 from canvit.ade20k.dinov3_baseline import DinoV3BaselineOpts
 from canvit.distill.config import Config as DistillConfig
 from canvit.in1k.config import In1kConfig
+from canvit.scanpath.evaluate import ScanpathConfig
 
 log = logging.getLogger(__name__)
 
@@ -244,16 +245,31 @@ class Ade20kDinoV3Eval:
         return evaluate_dinov3(self.cfg, self.opts)
 
 
+@dataclass
+class ScanpathEval:
+    """Human scanpaths: teacher-forced likelihood of each human fixation given the earlier ones
+    (claude_dev/scanpath/00-design.md). Its own ``run()``, like ``ade20k-dinov3``: the baseline
+    models have no checkpoint to restore, so ``evaluate()``'s strict reload does not apply."""
+
+    cfg: ScanpathConfig = field(default_factory=ScanpathConfig)
+    out: Path | None = None
+
+    def run(self) -> dict[str, Any]:
+        from canvit.scanpath.evaluate import run
+        return run(self.cfg)
+
+
 Command = Annotated[Ade20kEval, tyro.conf.subcommand("ade20k")] | \
     Annotated[Ade20kDinoV3Eval, tyro.conf.subcommand("ade20k-dinov3")] | \
     Annotated[In1kEval, tyro.conf.subcommand("in1k")] | \
-    Annotated[DistillEval, tyro.conf.subcommand("distill")]
+    Annotated[DistillEval, tyro.conf.subcommand("distill")] | \
+    Annotated[ScanpathEval, tyro.conf.subcommand("scanpath")]
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     cmd = tyro.cli(Command)  # pyright: ignore[reportArgumentType]
-    if isinstance(cmd, Ade20kDinoV3Eval):
+    if isinstance(cmd, (Ade20kDinoV3Eval, ScanpathEval)):
         record, out = cmd.run(), cmd.out
     else:
         task, task_name = cmd.build()

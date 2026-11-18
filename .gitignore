@@ -40,6 +40,7 @@ slurm/canvit_train_state.venv-cu126/
 /papers
 _info_policy_gradient
 claude_dev/policy_oracle/scanpaths.ipynb
+claude_dev/scanpath/status.ipynb
 
 # scripts/bench/pt writes fresh timing runs here; only baselines/ is committed
 scripts/bench/pt/results/
