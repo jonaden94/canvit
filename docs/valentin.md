@@ -73,3 +73,8 @@ docs/          docs for humans
 **Missing so far:**
 - No standalone evaluation for search yet: `harness.evaluate` has no `search` subcommand, so search is evaluated only during training.
 - No comparison with **human scanpaths** (e.g. scanpath similarity, fixation-map metrics). COCO-Search18 has the human fixations; the other datasets don't.
+
+> *AI edit (Claude Opus 5.5, 2026-11-18):* in progress on branch `scanpath-eval`:
+> `python -m canvit.harness.evaluate scanpath` scores a model on human scanpaths (teacher-forced likelihood,
+> pysaliency conventions; COCO-Search18 benchmark metrics to follow). Code `canvit/scanpath/`, design and
+> status `claude_dev/scanpath/00-design.md`.
