@@ -1,5 +1,14 @@
 # policy-algos: new policy-learning algorithms on the exp36_1 setup (started 2026-11-13)
 
+**Bottom line (2026-11-19, all runs done).** Nothing closes the gap to the GT oracle (held-out t4
+~0.54). Six learning rules end at t4 0.450-0.454 best-over-evals, 5 seeds each: PG, QReg, dense
+QReg, A2C, PPO and SAC-Discrete (multi-step Q is at 0.450). Four scorer changes are all within noise
+(3 or 4 U-Net levels, no input BN, local readout). So are 25-50 % of the training data and
+augmentation. The only gain is dense QReg (extra glimpsed candidates regressed per state): clearly
+better at t1-t3, ~+0.001-0.002 at t4. The policy does not overfit and is not data-limited. The
+limit is what can be inferred from the canvas, so ~0.454 at t4 is the practical ceiling for this
+frozen backbone + probe. Details: Final results, Follow-up results, SAC results below.
+
 **Why.** exp36_1 found QReg, on-policy PG, Q-Prop and canvas-only Q-Prop tied (t4 ≈ 0.452 mIoU),
 while a greedy ground-truth oracle on the same frozen model reaches 0.544, and its held-out A/B
 variant suggests most of that gap is real (`claude_dev/policy_oracle/`). So: do other ways of
