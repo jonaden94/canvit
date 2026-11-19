@@ -169,7 +169,7 @@ gap share is the comparable quantity.
   detached worker inside the owner's jupyter job 17334601 (`chain_followup/local/`). That worker runs
   step 1 first, then drains the same queue. It never requeues.
 
-### Follow-up results (2026-11-17; dense16 n=4, s4 still running)
+### Follow-up results (2026-11-17; dense16 s4 added 2026-11-19)
 
 **Train vs val.** Final checkpoints, mean of 5 seeds. "Share" = the fraction of the random->oracle gap
 closed. The oracle and random grid on the 2000 training images: t1-t4 0.5246/0.5578/0.5784/0.5901 and
@@ -193,7 +193,7 @@ There is no overfitting: the share is not larger on the images the policy traine
 | 50 % of training images | 5 | 0.4188 | 0.4363 | 0.4457 | 0.4514±0.0006 | 0.4498±0.0007 |
 | 25 % of training images | 5 | 0.4189 | 0.4358 | 0.4455 | 0.4513±0.0006 | 0.4500±0.0008 |
 | qreg-dense4-lnfeat (anchor) | 5 | 0.4212 | 0.4403 | 0.4480 | 0.4532±0.0006 | 0.4514±0.0008 |
-| qreg-dense16-lnfeat | 4 | 0.4223 | 0.4417 | 0.4488 | 0.4539±0.0004 | 0.4517±0.0006 |
+| qreg-dense16-lnfeat | 5 | 0.4218 | 0.4413 | 0.4488 | 0.4540±0.0003 | 0.4517±0.0005 |
 
 **Reading.** The policy is not data-limited: a quarter of the images gives the same result, and
 augmentation does not help. Denser supervision helps only marginally: 4x more labels (dense4 ->
@@ -233,3 +233,34 @@ pg-lnfeat-nobn. Two arms, 5 seeds each (`slurm/runs/exp36_1_policies_fovi/sac_qu
 Checks: 4 new tests in `test_policy_algos.py`, including a hand-computed loss and the actor
 gradient = the expected-objective gradient. All 9 digests (8 task + rollout parity) are identical
 to 7f3d16c on the same node. Smoke: 1.3 s/step vs pg's 0.43 (~3.5 h/run), 21.5 GB peak.
+
+### SAC results (all 10 runs done 2026-11-18, 0 failed)
+
+Best over evals; ± = SE; n = 5 each.
+
+| arm | t1 | t2 | t3 | t4 | t4 @8000 |
+|---|---|---|---|---|---|
+| pg-lnfeat-nobn (anchor) | 0.4188 | 0.4376 | 0.4465 | 0.4520±0.0012 | 0.4507±0.0014 |
+| sac-ent1-lnfeat-nobn (1.0 nat) | 0.4185 | 0.4366 | 0.4464 | 0.4523±0.0003 | 0.4504±0.0003 |
+| sac-lnfeat-nobn (5.43 nats) | 0.4134 | 0.4317 | 0.4422 | 0.4482±0.0006 | 0.4470±0.0012 |
+| qreg-dense16-lnfeat (best arm) | 0.4218 | 0.4413 | 0.4488 | 0.4540±0.0003 | 0.4517±0.0005 |
+
+Mean t4 per eval step (0, 1000, ..., 8000):
+
+| arm | 0 | 1k | 2k | 3k | 4k | 5k | 6k | 7k | 8k |
+|---|---|---|---|---|---|---|---|---|---|
+| pg-lnfeat-nobn | .4068 | .4466 | .4481 | .4488 | .4481 | .4490 | .4497 | .4487 | .4507 |
+| sac-ent1 | .4068 | .4505 | .4506 | .4506 | .4514 | .4502 | .4500 | .4493 | .4504 |
+| sac (paper target) | .4068 | .4109 | .4284 | .4394 | .4390 | .4418 | .4446 | .4460 | .4470 |
+
+End-of-training diagnostics (last logged step, all seeds): policy entropy 5.38-5.48 vs target 5.43,
+alpha 0.30-0.34 (paper target); 0.78-1.30 vs 1.0, alpha 0.016-0.021 (1.0 nat). Q(s,a) tracks the
+TD target in both arms. The method runs as intended.
+
+**Reading.** At PG's entropy target, SAC equals PG at every t. It only gets there sooner (plateau by
+step 1000), which does not change the endpoint. At the paper's target it samples near-uniformly while
+training. Its critic then learns about near-random sequences, not the greedy ones that are deployed,
+so it is 0.004 lower at t4 and still rising at 8000. SAC is the sixth learning rule to plateau at
+~0.452-0.454 (PG, QReg, dense QReg, A2C, PPO, SAC). This supports the follow-up's conclusion: the
+ceiling comes from the information on the canvas, not from the learning rule.
+
