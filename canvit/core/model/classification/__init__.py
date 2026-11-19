@@ -103,7 +103,7 @@ class CanViTForImageClassification(
         # dataclasses that asdict() flattened — a foveated config arrives with
         # foveated_patcher as a plain dict and fails deep in the patcher otherwise.
         cfg = rebuild_canvit_config(model_config)
-        self.canvit = CanViT(backbone=create_backbone(backbone_name), cfg=cfg)
+        self.canvit = CanViT(backbone=create_backbone(backbone_name, recurrence=cfg.recurrence), cfg=cfg)
         # Kept so a training checkpoint of this wrapper can record enough to rebuild
         # itself (the trainers' `model_config`); __init__ takes it but nothing else
         # retained it, leaving the arch recoverable only from the source HF repo.

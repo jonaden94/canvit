@@ -171,10 +171,12 @@ class CanViTForPretraining(CanViT):
         # ``patch_stride`` (overlapping patches: stride < patch_size) lives OUTSIDE
         # model_config and is needed to rebuild the patch-embed conv. None ->
         # create_backbone defaults to patch_size, so non-overlapping models are unaffected.
-        backbone = create_backbone(ckpt["backbone_name"], patch_stride=ckpt.get("patch_stride"))
+        cfg = rebuild_pretraining_config(ckpt["model_config"])
+        backbone = create_backbone(ckpt["backbone_name"], patch_stride=ckpt.get("patch_stride"),
+                                   recurrence=cfg.recurrence)
         model = cls(
             backbone=backbone,
-            cfg=rebuild_pretraining_config(ckpt["model_config"]),
+            cfg=cfg,
             backbone_name=ckpt["backbone_name"],
             canvas_patch_grid_sizes=ckpt["canvas_patch_grid_sizes"],
         )

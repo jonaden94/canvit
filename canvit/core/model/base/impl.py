@@ -191,6 +191,16 @@ class CanViT(nn.Module):
             )
         self.patcher = patcher
 
+        # The backbone's trunk shape (recurrent or not) must match what the config — which
+        # is what checkpoints serialize — says, or a reload would rebuild a different model.
+        assert backbone.recurrence == cfg.recurrence, (
+            f"backbone recurrence {backbone.recurrence} != cfg.recurrence {cfg.recurrence}; "
+            "build the backbone with create_backbone(..., recurrence=cfg.recurrence)"
+        )
+
+        # n_blocks is the COMPUTATIONAL depth (block evaluations), also for a recurrent
+        # backbone — the read/write schedule and the modulation are per step, not per
+        # parameterised block.
         n_blocks = backbone.n_blocks
         local_dim = backbone.embed_dim
         canvas_dim = cfg.canvas_dim
@@ -380,9 +390,13 @@ class CanViT(nn.Module):
         write_idx = 0
         write_snapshots: list[Tensor] = []
 
+        # reViT depth gates [n_blocks, E] (image-independent, tiny); None unless the
+        # backbone has an expert bank. run_block(t) == blocks[t](...) without recurrence.
+        gates = self.backbone.depth_gates()
+
         for block_idx in range(self.backbone.n_blocks):
             block_mod = mod.block[block_idx] if mod is not None else None
-            local = self.backbone.blocks[block_idx](local, local_rope_backbone, block_mod)
+            local = self.backbone.run_block(block_idx, local, local_rope_backbone, block_mod, gates)
 
             if read_idx < len(self.read_after_blocks) and block_idx == self.read_after_blocks[read_idx]:
                 read_mod = mod.read[read_idx] if (mod is not None and mod.read) else None

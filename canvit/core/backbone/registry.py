@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass, replace
 from typing import Literal
 
+from canvit.core.backbone.recurrence import RecurrenceConfig
 from canvit.core.backbone.vit import ViTBackbone
 
 log = logging.getLogger(__name__)
@@ -59,11 +60,19 @@ REGISTRY: dict[str, BackboneConfig] = {
 }
 
 
-def create_backbone(name: BackboneName, patch_stride: int | None = None) -> ViTBackbone:
+def create_backbone(
+    name: BackboneName,
+    patch_stride: int | None = None,
+    recurrence: RecurrenceConfig | None = None,
+) -> ViTBackbone:
     """Create a ViT backbone by name (random weights).
 
     ``patch_stride`` (default = patch_size) sets the patch-embed conv stride;
     a smaller value makes the uniform patcher's patches overlap.
+
+    ``recurrence`` (default None = off) turns the trunk into a bViT / reViT recurrent
+    backbone; see ``canvit.core.backbone.recurrence``. Callers that build a ``CanViT``
+    pass ``cfg.recurrence`` here — ``CanViT`` asserts the two agree.
     """
     if name not in REGISTRY:
         available = ", ".join(sorted(REGISTRY))
@@ -79,6 +88,7 @@ def create_backbone(name: BackboneName, patch_stride: int | None = None) -> ViTB
         layerscale_init=cfg.layerscale_init,
         modulated=cfg.modulated,
         patch_stride=patch_stride,
+        recurrence=recurrence,
     )
     log.info(
         "Created %s: %d blocks, embed_dim=%d, modulated=%s",

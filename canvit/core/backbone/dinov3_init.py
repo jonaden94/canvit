@@ -31,6 +31,15 @@ def load_dinov3_weights_into_backbone(backbone: nn.Module, hf_teacher_model: nn.
     Returns a summary dict: ``{"copied": int, "skipped": [(key, reason), ...],
     "n_blocks": int}``. Raises if the teacher/backbone dims are incompatible.
     """
+    rec = getattr(backbone, "recurrence", None)
+    if rec is not None and rec.enabled:
+        # A shared block (bViT) has no DINOv3 counterpart — copying layers 0..n_templates-1
+        # would be an arbitrary choice — and a reViT expert bank has no `mlp.fc1` keys, so
+        # the key-dropping below would SILENTLY skip every FFN. Refuse instead.
+        raise ValueError(
+            "DINOv3 init is undefined for a recurrent (bViT / reViT) backbone; "
+            "train it from random init (init_backbone_from_teacher=False)."
+        )
     t = dict(hf_teacher_model.named_parameters())
     sd = backbone.state_dict()
 

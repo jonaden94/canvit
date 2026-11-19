@@ -29,6 +29,7 @@ from typing import Any
 
 import torch
 
+from canvit.core.backbone import ViTBackbone
 from canvit.harness.infra import ddp
 from canvit.harness.infra.checkpoint import save_checkpoint
 from canvit.harness.optim.ema import EMATracker
@@ -199,6 +200,14 @@ def run_training_loop(
     _scorer_ids = {id(p) for p in joint.scorer.parameters()} if joint is not None else set()
     trainable = [p for g in optimizer.param_groups for p in g["params"] if id(p) not in _scorer_ids]
     core = getattr(model, "module", model)
+    # reViT (recurrent backbone with a depth-routed expert FFN bank): its auxiliary losses
+    # depend on parameters only, so they are added ONCE per optimizer step, here rather
+    # than in any task's loss. None for every other backbone (incl. bViT) -> no-op.
+    _backbone = getattr(getattr(core, "canvit", core), "backbone", None)
+    rec_backbone = (
+        _backbone if isinstance(_backbone, ViTBackbone) and _backbone.router is not None
+        and any(p.requires_grad for p in _backbone.router.parameters()) else None
+    )
     ema = EMATracker(ema_alpha) if ema_alpha > 0 else None
     last: dict = {}
 
@@ -282,6 +291,14 @@ def run_training_loop(
             task_weight=spec.task_weight, collect_viz=do_viz, viz_task=(task if do_viz else None),
             joint=joint,
         )
+        rec_terms: dict[str, torch.Tensor] = {}
+        if rec_backbone is not None:
+            # Same value on every rank (parameter-only), so the AllReduce mean below keeps
+            # exactly one copy of its gradient. fp32, outside autocast (see aux_losses).
+            aux = rec_backbone.recurrence_aux_loss()
+            assert aux is not None
+            aux_total, rec_terms = aux
+            aux_total.backward()
         # DDP: average gradients across ranks BEFORE clipping (design §9 — nothing is
         # DDP-wrapped, so every trainable module is synced by hand here). Clipping first
         # and averaging after is a different operation and would drift from 1-GPU.
@@ -338,6 +355,11 @@ def run_training_loop(
                 last[k] = float(v)
         for k, v in gnorms.items():
             last[f"grad_norm/{k}"] = v
+        for k, v in rec_terms.items():
+            last[f"recurrence/aux_{k}"] = float(v)
+        if rec_backbone is not None and is_log:
+            for k, v in rec_backbone.recurrence_stats().items():
+                last[f"recurrence/{k}"] = v
 
         if result.viz is not None and run_dir is not None:
             try:  # viz is a diagnostic — never let a plotting error kill training

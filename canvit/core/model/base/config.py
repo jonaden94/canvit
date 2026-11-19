@@ -5,6 +5,7 @@ import typing
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from canvit.core.backbone.recurrence import RecurrenceConfig
 from canvit.core.modulation import ViTModulationConfig
 from canvit.core.patcher import FoveatedPatcherConfig, PatcherName, SquarePatcherConfig
 
@@ -46,6 +47,12 @@ class CanViTConfig:
     # (no MLP) for that block, e.g. [2, 0] = a 2×-MLP block then an attention-only block.
     n_canvas_self_attn_blocks: int = 0
     canvas_self_attn_mlp_ratios: list[float] = field(default_factory=list)
+    # Single-block recurrence of the ViT trunk: bViT (one shared block looped) or reViT
+    # (shared block + depth-programmed FFN experts). Disabled by default (current
+    # behavior, no new params). The backbone must be built with the same config
+    # (`create_backbone(..., recurrence=cfg.recurrence)`; enforced at construction).
+    # See canvit.core.backbone.recurrence.
+    recurrence: RecurrenceConfig = field(default_factory=RecurrenceConfig)
 
     def __post_init__(self) -> None:
         is_convex = self.canvas_update_mode == "convex"
@@ -119,6 +126,10 @@ def coerce_nested_configs(model_config: dict) -> dict[str, Any]:
     if isinstance(model_config.get("vit_modulation"), dict):
         model_config = {**model_config,
                         "vit_modulation": _coerce(ViTModulationConfig, model_config["vit_modulation"])}
+    # Absent in checkpoints that predate it -> the dataclass default (off), as intended.
+    if isinstance(model_config.get("recurrence"), dict):
+        model_config = {**model_config,
+                        "recurrence": _coerce(RecurrenceConfig, model_config["recurrence"])}
     return model_config
 
 

@@ -36,7 +36,8 @@ def load_student_backbone(cfg: Config, teacher: DINOv3Teacher | None = None) -> 
     seeded from the already-loaded DINOv3 ``teacher`` (backbone only; see
     ``load_dinov3_weights_into_backbone``). A later resume / seed_ckpt overwrites this.
     """
-    backbone = create_backbone(cfg.backbone_name, patch_stride=cfg.patch_stride)
+    backbone = create_backbone(cfg.backbone_name, patch_stride=cfg.patch_stride,
+                               recurrence=cfg.model.recurrence)
     if cfg.init_backbone_from_teacher:
         if teacher is None:
             raise ValueError("init_backbone_from_teacher=True but no teacher was provided.")

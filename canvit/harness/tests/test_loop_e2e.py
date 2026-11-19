@@ -82,6 +82,41 @@ def test_loop_trains_probe_and_checkpoint_roundtrips(tmp_path):
         assert torch.allclose(p, q), f"restored head mismatch at {n}"
 
 
+def test_loop_adds_revit_aux_loss_when_backbone_trains(tmp_path):
+    """A reViT backbone (recurrence + expert bank) that trains gets its auxiliary losses
+    from the loop (once per step) and logs them; the router learns."""
+    from canvit.core import CanViTConfig
+    from canvit.core.backbone import RecurrenceConfig
+    from canvit.core.model.base.config import serialize_canvit_config
+
+    rec = RecurrenceConfig(enabled=True, n_experts=4)
+    torch.manual_seed(0)
+    seg = CanViTForSemanticSegmentation(
+        backbone_name="vits16", model_config=serialize_canvit_config(CanViTConfig(recurrence=rec)),
+        num_classes=NUM_CLASSES)
+    go = GroupOptim(lr=1e-3, schedule=ScheduleSpec(kind="warmup_constant", warmup_steps=1))
+    spec = TrainSpec.finetune(bptt=BpttSpec(mode="full", horizon=2), optim={"backbone": go, "head": go})
+    apply_requires_grad(model=seg, head=seg.head, joint=None, spec=spec)
+    opt, sched = build_optimizer_and_scheduler(
+        spec, {"backbone": list(seg.canvit.parameters()), "head": list(seg.head.parameters())})
+    selector = RandomSelector(is_foveated=False, foveated_scale=FoveatedScaleConfig(), min_viewpoint_scale=0.05)
+    router = seg.canvit.backbone.router
+    assert router is not None
+    before = router.fc2.weight.detach().clone()
+    logged: list[dict] = []
+    run_training_loop(
+        task=_StubAdeTask(), model=seg, head=seg.head, optimizer=opt, scheduler=sched,
+        selector=selector, spec=spec, branches=[ViewpointType.FULL], canvas_grid=_G,
+        device=torch.device("cpu"), train_batches=_batches(), n_steps=2,
+        task_name="ade20k", model_config={}, ckpt_dir=tmp_path, log_every=1,
+        on_log=lambda step, m: logged.append(dict(m)),
+    )
+    assert not torch.equal(before, router.fc2.weight)
+    for k in ("recurrence/aux_bal", "recurrence/aux_z", "recurrence/aux_div",
+              "recurrence/gate_max", "recurrence/w_cos_max"):
+        assert k in logged[-1], k
+
+
 def test_best_checkpoint_tracks_max_and_leaves_latest_alone(tmp_path):
     """`best.pt` follows the maximum of the task's best_metric, and must NOT steal the
     `latest.pt` pointer — otherwise a resumed array task restarts from the best step."""

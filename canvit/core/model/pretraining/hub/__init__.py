@@ -142,9 +142,11 @@ class CanViTForPretrainingHFHub(
         # rebuilt here — it is NOT in model_config (it's a top-level training
         # field). ``None`` -> create_backbone defaults to patch_size, so every
         # non-overlapping checkpoint is byte-for-byte unaffected.
+        cfg = rebuild_pretraining_config(model_config)
         super().__init__(
-            backbone=create_backbone(backbone_name, patch_stride=patch_stride),
-            cfg=rebuild_pretraining_config(model_config),
+            backbone=create_backbone(backbone_name, patch_stride=patch_stride,
+                                     recurrence=cfg.recurrence),
+            cfg=cfg,
             backbone_name=backbone_name,
             canvas_patch_grid_sizes=canvas_patch_grid_sizes,
         )
