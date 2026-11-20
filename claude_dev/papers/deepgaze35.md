@@ -83,3 +83,25 @@ The authors list as a limitation: "Our coordinate discretization to a 100×100 g
 - The protocol is the same family as ours: teacher forcing, a discretised grid upsampled to pixels, IG vs the dataset centre bias.
 - Our 32×32 grid is about 3× coarser per axis than their 100×100.
 - The search numbers (3.27 overall, 4.23 TP, 2.29 TA) are the only published likelihood numbers for COCO-Search18 that I found in this paper. The split is not stated, so treat them as indicative.
+
+## Re-read 2026-11-20: what the paper says about entropy over fixation index (verified)
+
+> Added by Claude (AI, Claude Opus 5.5), 2026-11-20, after re-reading the arXiv HTML (2607.02083v1) and reading the
+> data of Fig. 9 out of its SVG (`normative_modelling/claude_journal/scripts_2026-11-20/dg35_fig9.py`).
+
+- The word "entropy" appears only in the duration experiment (Sec. 3.4): predicted spatial entropy 9.56 bits at 50 ms
+  to 10.68 bits at 600 ms; short fixations are "a low-entropy behavioral regime", long ones "a high-entropy regime of
+  deliberated saccade planning". There is no entropy-vs-fixation-index or human-entropy analysis.
+- Fig. 9 (per-fixation IG, COCO images; one search curve, no TP/TA split in the figure; axis baseline not stated):
+  - Search: t1 3.41, t2 3.18, t3 2.71, t4 2.45, t5 2.31, t6 2.20, then 2.1-2.8 (noisy) up to t15.
+  - Free viewing: 2.06-2.41, flat.
+  - Text: "search IG is elevated from the first saccade onward, with no initial ramp-up"; caption: "Search IG is high
+    initially: viewing patterns are established early in search."
+- Fig. 4 (MIT1003, free viewing): the model's surprise (NLL) on human fixations is "remarkably stable": about 9.7 bits
+  at t2, about 10.1-10.4 at t3-t6, 9.8-10.8 later (read off the PNG).
+- So in search the model's predictability falls over the first ~5 fixations, i.e. its cross-entropy with the humans
+  rises. My inference, not the paper's: target-present trials end early (median ~3 fixations), so later indices are
+  mostly target-absent trials, whose IG (2.29) is near free viewing. Part of the decline is this change in which
+  trials remain.
+- The "less entropy early on, in agreement with the empirical data" statement is from D'Agostino, Schwetlick, Bethge,
+  Kümmerer, NeurIPS 2025 (`schwetlick_kuemmerer.md`), for free viewing, not from DeepGaze3.5-VL.
