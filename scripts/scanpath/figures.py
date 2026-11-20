@@ -216,9 +216,16 @@ def main() -> None:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--scandiff-runs", type=Path,
                     default=Path("/mnt/lustre-grete/usr/u13879/normative_modelling/external/scandiff_driver/runs"))
-    ap.add_argument("--results", type=Path, default=Path(os.environ.get(
-        "SCANPATH_RESULTS_DIR", "/mnt/lustre-grete/usr/u13879/normative_modelling/canvit_outputs/scanpath_eval")))
+    ap.add_argument("--results", type=Path, default=None,
+                    help="evaluation records; default $SCANPATH_RESULTS_DIR, else $LOGS_DIR/scanpath_eval")
     a = ap.parse_args()
+    if a.results is None:
+        if root := os.environ.get("SCANPATH_RESULTS_DIR"):
+            a.results = Path(root)
+        elif logs := os.environ.get("LOGS_DIR"):
+            a.results = Path(logs) / "scanpath_eval"
+        else:
+            raise SystemExit("set --results, SCANPATH_RESULTS_DIR or LOGS_DIR (source .envrc)")
     (a.out / "figures").mkdir(parents=True, exist_ok=True)
     (a.out / "tables").mkdir(parents=True, exist_ok=True)
     _, _, sv, fv = load_coco_search18(ScanpathConfig())

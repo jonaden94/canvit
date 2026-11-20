@@ -6,7 +6,8 @@
 # Written by Claude (AI, Claude Opus 5.5), 2026-11-20.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-OUT="${SCANPATH_RESULTS_DIR:-/mnt/lustre-grete/usr/u13879/normative_modelling/canvit_outputs/scanpath_eval}"
+# Results: $SCANPATH_RESULTS_DIR, else $LOGS_DIR/scanpath_eval (logs/ is gitignored, as for every run).
+OUT="${SCANPATH_RESULTS_DIR:-${LOGS_DIR:?set LOGS_DIR (source .envrc) or SCANPATH_RESULTS_DIR}/scanpath_eval}"
 PY=.venv-cu126/bin/python
 mkdir -p "$OUT"
 
