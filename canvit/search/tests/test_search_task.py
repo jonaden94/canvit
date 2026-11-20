@@ -271,3 +271,46 @@ def test_target_present_only_runs_without_a_presence_head(fake_cs18):
     a = task.evaluate(model=model, head=head, val_loader=task.build_val_loader(), device=torch.device("cpu"),
                       step=0, joint=None)
     assert "presence_acc_t2_random" not in a and a["correct_found_t2_random"] == a["found_t2_random"]
+
+
+_MULTI = {"patcher_name": "foveated", "foveated_patcher": {
+    **_FOVEATED["foveated_patcher"], "fov": 50, "rf_interp": "bilinear",
+    "retinas": [[0.75, 32, 3, False], [2.2, 32, 3, False]]}}
+
+
+class _TinyMultiTask(SearchRunTask):
+    """A random tiny MULTI-retina backbone, through the real retina check of build_model."""
+
+    def build_model(self, device, prior_model_config=None):
+        from canvit.search.task import fix_backbone_retina
+        torch.manual_seed(0)
+        c = self.cfg
+        model = CanViTForVisualSearch(backbone_name="vits16", model_config=_MULTI,
+                                      n_classes=len(self._classes()), cond_dim=c.cond_dim, kind=c.head,
+                                      width=c.head_width, block_layers=c.head_block_layers,
+                                      presence=c.condition == "both").to(device)
+        fix_backbone_retina(model, c.retina, "tiny-multi")
+        self.model = model
+        return model, model.head
+
+
+def test_multi_retina_backbone_trains_and_evaluates_through_the_fixed_retina(fake_cs18):
+    root, _ = fake_cs18
+    task = _TinyMultiTask(_cfg(root, retina="cmf2.2_res32_cps3"), rl=_rl())
+    last = _run(task)                                            # 2 training steps + one eval
+    assert torch.isfinite(torch.tensor(last["total_loss"]))
+    patcher = task.model.canvit.patcher
+    assert patcher.retina_names == ["cmf0.75_res32_cps3", "cmf2.2_res32_cps3"]
+    assert patcher.fixed_retina == 1 and patcher.active_retina(0) == 1
+
+
+def test_retina_choice_is_required_for_multi_and_refused_for_single(fake_cs18):
+    root, _ = fake_cs18
+    for bad in (None, "cmf9_res1_cps1"):
+        with pytest.raises(ValueError, match="multi-retina backbone"):
+            _TinyMultiTask(_cfg(root, retina=bad), rl=_rl()).build_model(torch.device("cpu"))
+    from canvit.search.task import fix_backbone_retina
+    model, _ = _TinyTask(_cfg(root), rl=_rl()).build_model(torch.device("cpu"))
+    with pytest.raises(ValueError, match="needs a multi-retina backbone"):
+        fix_backbone_retina(model, "cmf0.75_res32_cps3", "tiny")
+    fix_backbone_retina(model, None, "tiny")                     # single retina, no choice: fine

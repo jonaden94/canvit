@@ -120,6 +120,7 @@ Task config, `--cfg.<name>` (dashes, e.g. `--cfg.presence-loss ce`):
 | option | default | choices / meaning |
 |---|---|---|
 | `model_repo` | required | the foveated backbone |
+| `retina` | None | a multi-retina backbone is used through this one retina (fixed for training and eval), by name, e.g. `cmf0.75_res65_cps6`; required for such a backbone, refused otherwise |
 | `condition` | `both` | `tp` = target-present only (no presence head) |
 | `split` | 1 | 2 = the dataset's split2 (needs `condition tp`) |
 | `scene_size` | 512 | scene side in px |

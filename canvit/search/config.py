@@ -85,6 +85,10 @@ class SearchConfig:
     model_repo: str | None = None
     """The pretrained FOVEATED CanViT: an HF repo id, a local HF dir or a training ``.pt``.
     Required (there is no published foveated search backbone to default to)."""
+    retina: str | None = None
+    """A MULTI-RETINA backbone is used through this one retina, by name as the backbone's patcher
+    lists it (e.g. ``cmf0.75_res65_cps6``). Required for such a backbone, refused for a
+    single-retina one."""
     canvas_grid: int | None = None
     """None = scene_size // patch_size (32 for ViT-B/16 at 512 px)."""
     foveated_scale: FoveatedScaleConfig = field(default_factory=_fixed_scale_2)

@@ -38,6 +38,22 @@ from .loss import (
 
 log = logging.getLogger(__name__)
 
+
+def fix_backbone_retina(model: Any, retina: str | None, model_repo: Any) -> None:
+    """``--cfg.retina``: a multi-retina backbone is used through the named retina only (fixed
+    for training AND eval, so the engine draws none); required for such a backbone, refused
+    for a single-retina one."""
+    patcher = model.canvit.patcher
+    if getattr(patcher, "n_retinas", 1) > 1:
+        names = patcher.retina_names
+        if retina not in names:
+            raise ValueError(f"{model_repo} is a multi-retina backbone: choose one retina with "
+                             f"--cfg.retina, one of {names} (got {retina!r}).")
+        patcher.fix_retina(names.index(retina))
+        log.info("multi-retina backbone: fixed to retina %d (%s)", names.index(retina), retina)
+    elif retina is not None:
+        raise ValueError(f"--cfg.retina {retina!r} needs a multi-retina backbone; {model_repo} has one retina.")
+
 POLICY_FEATURE_GROUPS: tuple[str, ...] = ("ln_feat",)  # the plain canvas, no handcrafted maps
 
 
@@ -182,6 +198,7 @@ class SearchRunTask:
         if not consumes_full_image(model):
             raise ValueError(f"the search task supports FOVEATED backbones only; {c.model_repo} has patcher "
                              f"{getattr(model.canvit.cfg, 'patcher_name', '?')!r}.")
+        fix_backbone_retina(model, c.retina, c.model_repo)
         fs = c.foveated_scale
         log.warning("foveated view scale: mode=%s fixed_scale=%s -- this MUST match the backbone's "
                     "pretraining scale or every glimpse is out of distribution.", fs.mode, fs.fixed_scale)
