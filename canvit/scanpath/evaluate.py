@@ -68,6 +68,12 @@ class ScanpathConfig:
     device: str = "cuda"
     ckpt: Path | None = None
     """A run's harness ``.pt`` (its policy is read from the ``.policy.pt`` beside it)."""
+    source_geometry: Literal["fovi-27b1bde", "fovi-c399d3b"] | None = None
+    """REQUIRED for the CanViT models: the foveation geometry the run was trained with. Our episode builds
+    fovi 27b1bde's (= canvit.core.foveation since the port, 2d4c032); c399d3b builds different patches (KNN k
+    rule, planar geometry; docs/q_policy_foveated.md) that canvit cannot reproduce, so it is refused. A checkpoint
+    does not record it: read the run's launcher (``FOVI_COMMIT``) or its SLURM log ("Pinned fovi -> ..."); a run
+    pinned to a canvit commit after the port has 27b1bde. No default, so the choice is always on the record."""
     source: PolicySource = field(default_factory=SearchSource)
     """The task the run trained, with its own flags (``cfg.source:<task> --cfg.source.cfg.* --cfg.source.rl.*``,
     ``sources.py``): the model and policy are rebuilt with the training constructors and loaded strictly."""
@@ -145,6 +151,20 @@ def scores(model, stimuli, fixations, centre_bias) -> dict[str, float]:
     return out
 
 
+def check_source_geometry(geometry: str | None) -> None:
+    """Refuse a CanViT run whose foveation geometry is undeclared or not the one our episode builds (design §13)."""
+    if geometry is None:
+        raise ValueError("--cfg.source-geometry is required for a CanViT model: fovi-27b1bde (the geometry of "
+                         "canvit.core.foveation, every run pinned to a canvit commit after the fovi port 2d4c032, "
+                         "and FOVI_COMMIT=27b1bde runs such as exp39 search) or fovi-c399d3b. The checkpoint does "
+                         "not record it: see the run's launcher FOVI_COMMIT or its SLURM log ('Pinned fovi -> ...').")
+    if geometry != "fovi-27b1bde":
+        raise ValueError(f"--cfg.source-geometry {geometry}: this run was trained on patches canvit no longer builds "
+                         "(fovi c399d3b: other KNN k rule and field geometry; the port kept only 27b1bde). Scoring it "
+                         "here would feed it different input than in training. Use a run trained on fovi 27b1bde or "
+                         "later (owner decision 2026-11-20: the paper uses new-geometry runs only).")
+
+
 def build_model(cfg: ScanpathConfig, stimuli, fixations, centre_bias, device: torch.device):
     if cfg.model == "uniform":
         return pysaliency.UniformModel()
@@ -153,6 +173,7 @@ def build_model(cfg: ScanpathConfig, stimuli, fixations, centre_bias, device: to
     from .canvit_models import CanViTModel, PolicyEpisode, precompute
     if cfg.ckpt is None:
         raise ValueError(f"--cfg.model {cfg.model} needs --cfg.ckpt (a run's .pt)")
+    check_source_geometry(cfg.source_geometry)
     task = cfg.source.task()
     c = task.cfg
     task_scene = getattr(c, "scene_size", None) or getattr(c, "scene_resolution", None)
@@ -191,4 +212,4 @@ def run(cfg: ScanpathConfig) -> dict[str, Any]:
     }
 
 
-__all__ = ["ScanpathConfig", "clip_to_stimuli", "run", "scores", "select"]
+__all__ = ["ScanpathConfig", "check_source_geometry", "clip_to_stimuli", "run", "scores", "select"]

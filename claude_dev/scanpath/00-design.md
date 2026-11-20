@@ -282,3 +282,17 @@ Plan (proposed 2026-11-20, owner: "sounds good"):
    fixation map per step kept apart from the task heads, one selection site, a preset-locations switch
    (= our teacher forcing); its IoR was a heuristic-only mask; `render_policy_stats` (saccade length/angle
    distributions) is worth porting for comparing CanViT's saccades with humans'.
+
+## 13. Foveation geometry of the evaluated run (owner decisions, 2026-11-20)
+
+fovi c399d3b and 27b1bde build different foveated patches from the same config (27b1bde: upstream's minimum
+full-coverage KNN k, 46 -> 47 for the exp32-fovi patcher, and planar geometry; commits 45e7cc0, 5446c38,
+`docs/q_policy_foveated.md`). Weight shapes are unchanged, so an old checkpoint loads strictly and silently sees
+different input. canvit's port (`claude_dev/fovi_port/`) kept only 27b1bde, and a checkpoint does not record its
+geometry: provenance `git_commit` is `git rev-parse HEAD` in the job's cwd (the clone, not the pinned snapshot),
+and `FOVI_COMMIT` appears only in the SLURM log (`harness_train.sbatch`: "Pinned fovi -> ...").
+
+Decisions (Valentin, 2026-11-20): (a) scoring a CanViT model requires `--cfg.source-geometry
+{fovi-27b1bde,fovi-c399d3b}` (no default; written into the record's protocol); c399d3b is refused. (b) The paper
+uses runs trained on the new geometry only. exp39 search (FOVI_COMMIT=27b1bde) qualifies; exp36_1 / policy-algos
+ADE20K policies, the exp34 probe and the policy oracle (c399d3b) do not.

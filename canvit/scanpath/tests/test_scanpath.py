@@ -172,3 +172,19 @@ def test_flat_density_has_nss_zero(fake_search):
     _, _, sv, fv = fake_search
     fx = fv[fv.scanpath_history_length > 0][:20]
     assert np.allclose(DensitySaliencyMap(pysaliency.UniformModel()).NSSs(sv, fx), 0.0)
+
+
+def test_canvit_models_need_the_new_foveation_geometry_declared():
+    from pathlib import Path
+
+    from canvit.scanpath.evaluate import ScanpathConfig, build_model
+    for geometry, match in ((None, "source-geometry is required"), ("fovi-c399d3b", "no longer builds")):
+        cfg = ScanpathConfig(model="canvit_policy", ckpt=Path("run.pt"), source_geometry=geometry)
+        with pytest.raises(ValueError, match=match):
+            build_model(cfg, None, None, None, torch.device("cpu"))  # refused before anything is loaded
+    import tyro
+
+    from canvit.harness.evaluate import Command
+    cmd = tyro.cli(Command, args=["scanpath", "--cfg.model", "canvit_policy",  # pyright: ignore
+                                  "--cfg.source-geometry", "fovi-27b1bde"])
+    assert cmd.cfg.source_geometry == "fovi-27b1bde"
