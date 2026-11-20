@@ -165,3 +165,10 @@ def test_cli_takes_the_policys_task_with_its_training_flags():
     assert cmd.cfg.source.cfg.canvas_grid == 8 and cmd.cfg.source.rl.width == 32
     default = tyro.cli(Command, args=["scanpath"])  # pyright: ignore
     assert isinstance(default.cfg.source, SearchSource) and default.cfg.source.rl.centers_per_axis == 32
+
+
+def test_flat_density_has_nss_zero(fake_search):
+    from canvit.scanpath.models import DensitySaliencyMap
+    _, _, sv, fv = fake_search
+    fx = fv[fv.scanpath_history_length > 0][:20]
+    assert np.allclose(DensitySaliencyMap(pysaliency.UniformModel()).NSSs(sv, fx), 0.0)

@@ -76,7 +76,12 @@ class DensitySaliencyMap(pysaliency.ScanpathSaliencyMapModel):
         self.model = model
 
     def conditional_saliency_map(self, stimulus, x_hist, y_hist, t_hist, attributes=None, out=None):
-        return np.exp(self.model.conditional_log_density(stimulus, x_hist, y_hist, t_hist, attributes=attributes))
+        d = np.exp(self.model.conditional_log_density(stimulus, x_hist, y_hist, t_hist, attributes=attributes))
+        # A flat density is not exactly flat after exp(log): pysaliency's NSS then divides rounding noise by a
+        # ~1e-22 std and returns +-1 (seen for UniformModel, 2026-11-20). Make it exactly constant -> NSS 0.
+        if d.max() - d.min() <= 1e-9 * d.max():
+            d = np.full_like(d, d.mean())
+        return d
 
 
 def without_start_fixations(fixations):
