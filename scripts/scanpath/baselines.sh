@@ -18,8 +18,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 from canvit.scanpath.evaluate import ScanpathConfig, load_coco_search18
 from canvit.scanpath.models import fit_centre_bias
 st, ft, _, _ = load_coco_search18(ScanpathConfig())
-fit = fit_centre_bias(st, ft, n_images=60, bandwidths=tuple(10.0 ** np.arange(-2.0, -0.79, 0.2)),
-                      epss=(1e-12, 1e-7, 1e-3))
+fit = fit_centre_bias(st, ft, n_images=60, bandwidths=(0.01, 0.016, 0.025, 0.04, 0.063),
+                      epss=(1e-7, 1e-4))
 json.dump(fit, open(sys.argv[1], "w"), indent=1)
 print("centre bias fit:", fit)
 EOF

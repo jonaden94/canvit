@@ -249,3 +249,30 @@ policies (D1). The CanViT models have not run on real checkpoints (group access)
   training (one softmax temperature fitted on the train split, as DeepGaze-style comparisons do).
   **[OPEN] D5:** keep 2.11 for search performance and calibrate for the eval, or train a
   human-matched variant (~4.2-4.6 nats).
+
+## 12. Human biases in the policies (owner decisions, 2026-11-20)
+
+Owner: biases shape the policy in RL training AND at inference, so both routes are wanted; the evaluation
+must work for any task's policy (reconstruction/distill, ADE20K, IN1k, search, future tasks), not only search.
+
+Biases to model (sources: `claude_dev/papers/schwetlick_kuemmerer.md` = D'Agostino, Schwetlick, Bethge &
+Kümmerer, "What Moves the Eyes", NeurIPS 2025, which extends SceneWalk-X using DeepGaze III):
+- temperature over the trial (fixation-index dependent);
+- saccadic momentum (continue the previous direction; stronger after long saccades and later in the trial);
+- cardinal attention bias with a leftward asymmetry early on, adapting over time;
+- saccade-amplitude distribution, inhibition / facilitation of return (SceneWalk);
+- the centre bias (already a pysaliency baseline).
+
+Plan (proposed 2026-11-20, owner: "sounds good"):
+1. Each bias is written ONCE, as a small module in `canvit/core/policy/` (no harness imports, as `core/`
+   requires): a log-prior over the G x G grid given the history (previous fixations, fixation index), with
+   a few parameters.
+2. (a) Inference / evaluation first: `scores / T(t) + sum_k w_k log prior_k(history)`, parameters fitted on
+   the human TRAINING split by pysaliency log-likelihood. Measures how many bits each bias adds over CanViT.
+   Lives in `canvit/scanpath/` (the teacher-forced `_episode` already passes every step's scores through
+   one place).
+3. (b) Training: one optional hook in the shared `PolicySelector` that adds the prior to the scores before
+   choosing, behind a config flag that defaults off (so the parity and pinning digests stay unchanged), as
+   the existing cue-conditioning hook does. Shared code: agree the hook with Jonathan first.
+4. Prerequisite: a task-agnostic episode (any task's policy + optional cue), see the review of FoAViS/autoreg
+   and canvit's per-task model/policy construction (in progress).

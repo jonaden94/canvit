@@ -1,6 +1,6 @@
 > Written by Claude (AI, Claude Opus 5.5), 2026-11-18, from https://bethgelab.github.io/what-moves-the-eyes/ , https://neurips.cc/virtual/2025/loc/san-diego/poster/117056 , https://mlanthology.org/neurips/2025/dagostino2025neurips-moves/ , https://github.com/bethgelab/what-moves-the-eyes (README and source code), https://www.frontiersin.org/journals/psychology/articles/10.3389/fpsyg.2024.1389609/full , https://arxiv.org/abs/2112.11067 (abstract only).
 
-# Lisa Schwetlick and Matthias Kümmerer
+# D'Agostino, Schwetlick, Bethge & Kümmerer: "What Moves the Eyes" (NeurIPS 2025)
 
 The owner wrote "Schwittlick". The author is **Lisa Schwetlick** (Univ. Potsdam, Engbert lab; now EPFL).
 

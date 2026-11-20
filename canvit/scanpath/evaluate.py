@@ -31,7 +31,7 @@ from canvit.harness.config import JointPolicyConfig
 from canvit.search.config import SearchConfig, search_policy_config
 
 from .data import coco_search18, make_scanpath_loader
-from .models import DensitySaliencyMap, fit_centre_bias
+from .models import DensitySaliencyMap, fit_centre_bias, without_start_fixations
 
 log = logging.getLogger(__name__)
 
@@ -177,7 +177,8 @@ def run(cfg: ScanpathConfig) -> dict[str, Any]:
         fit = fit_centre_bias(st, ft)
     else:
         fit = {"bandwidth": cfg.centre_bias_bandwidth, "eps": cfg.centre_bias_eps}
-    centre_bias = CrossvalidatedBaselineModel(stimuli, fixations, bandwidth=fit["bandwidth"], eps=fit["eps"],
+    centre_bias = CrossvalidatedBaselineModel(stimuli, without_start_fixations(fixations), bandwidth=fit["bandwidth"],
+                                              eps=fit["eps"],
                                               memory_cache_size=4)  # see scores(): fixations sorted by stimulus
     model = build_model(cfg, stimuli, fixations, centre_bias, device)
     metrics = scores(model, stimuli, fixations, centre_bias)

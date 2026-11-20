@@ -79,12 +79,23 @@ class DensitySaliencyMap(pysaliency.ScanpathSaliencyMapModel):
         return np.exp(self.model.conditional_log_density(stimulus, x_hist, y_hist, t_hist, attributes=attributes))
 
 
+def without_start_fixations(fixations):
+    """The fixations with a history: the start fixation of every scanpath is forced to the display centre,
+    so in a centre bias it is a spike at one pixel, not viewing behaviour. Kept out of the centre bias's
+    KDE and of its fit (measured 2026-11-20: it cost ~0.15 bits/fix and made the fit pick the narrowest
+    bandwidth on the grid)."""
+    return fixations[fixations.scanpath_history_length > 0]
+
+
 def fit_centre_bias(stimuli, fixations, *, n_images: int = 200, seed: int = 0,
-                    bandwidths=tuple(10.0 ** np.arange(-2.2, -0.79, 0.2)),
-                    epss=tuple(10.0 ** np.arange(-14, -1.9, 3.0))) -> dict[str, float]:
+                    bandwidths=(0.01, 0.016, 0.025, 0.04, 0.063),
+                    epss=(1e-7, 1e-4)) -> dict[str, float]:
     """Grid search of ``CrossvalidatedBaselineModel(bandwidth, eps)``: mean log-likelihood (bits/fix)
     of the fixations on ``n_images`` random training stimuli, each scored by the KDE of all OTHER
-    training stimuli. Returns the best ``{"bandwidth", "eps", "ll"}``; warns at a grid edge."""
+    training stimuli; start fixations excluded throughout (:func:`without_start_fixations`). Returns the
+    best ``{"bandwidth", "eps", "ll"}``; warns at a grid edge. Grouping the leave-out by photo instead of
+    stimulus (a photo can be a stimulus under several cues) changed the held-out score by <= 0.01 bits."""
+    fixations = without_start_fixations(fixations)
     rng = np.random.default_rng(seed)
     pick = rng.choice(len(stimuli), size=min(n_images, len(stimuli)), replace=False)
     sub = fixations[np.isin(fixations.n, pick)]
@@ -103,4 +114,5 @@ def fit_centre_bias(stimuli, fixations, *, n_images: int = 200, seed: int = 0,
     return best
 
 
-__all__ = ["DensitySaliencyMap", "GridScanpathModel", "fit_centre_bias", "grid_log_density"]
+__all__ = ["DensitySaliencyMap", "GridScanpathModel", "fit_centre_bias", "grid_log_density",
+           "without_start_fixations"]
