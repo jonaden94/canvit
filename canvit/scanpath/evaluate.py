@@ -78,8 +78,15 @@ class ScanpathConfig:
 
 
 def load_coco_search18(cfg: ScanpathConfig):
+    """pysaliency's COCO-Search18 split1 ``(stimuli_train, fixations_train, stimuli_val, fixations_val)``, with
+    off-stimulus fixations clipped onto the stimulus in BOTH splits (the centre bias is fitted on train, and
+    pysaliency's KDE refuses negative positions)."""
     files = {name: d / name for d in cfg.release_dirs for name in RELEASE_FILES if (d / name).exists()}
-    return coco_search18(cfg.data_location, files)
+    st, ft, sv, fv = coco_search18(cfg.data_location, files)
+    ft, n_train = clip_to_stimuli(st, ft)
+    fv, n_val = clip_to_stimuli(sv, fv)
+    log.info("clipped off-stimulus fixations onto the stimulus: %d train, %d validation", n_train, n_val)
+    return st, ft, sv, fv
 
 
 def select(fixations, *, condition: str, limit: int | None):
@@ -159,7 +166,6 @@ def run(cfg: ScanpathConfig) -> dict[str, Any]:
     st, ft, sv, fv = load_coco_search18(cfg)
     stimuli, fixations = (st, ft) if cfg.part == "train" else (sv, fv)
     fixations = select(fixations, condition=cfg.condition, limit=cfg.limit_scanpaths)
-    fixations, clipped = clip_to_stimuli(stimuli, fixations)
     if cfg.centre_bias_bandwidth is None or cfg.centre_bias_eps is None:
         fit = fit_centre_bias(st, ft)
     else:
@@ -171,7 +177,8 @@ def run(cfg: ScanpathConfig) -> dict[str, Any]:
         "task": "scanpath",
         "model": cfg.model,
         "protocol": {k: (str(v) if isinstance(v, Path) else v) for k, v in asdict(replace(cfg)).items()}
-        | {"centre_bias": fit, "clipped_fixations": clipped, "pysaliency": getattr(pysaliency, "__version__", "?")},
+        | {"centre_bias": fit, "off_stimulus_fixations": "clipped at load",
+           "pysaliency": getattr(pysaliency, "__version__", "?")},
         "metrics": metrics,
         "evaluated_at": datetime.now(UTC).isoformat(),
     }
