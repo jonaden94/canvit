@@ -1,7 +1,7 @@
 #!/bin/bash
 # exp36_1 follow-up (owner's go 2026-11-16): is the ~0.452 t4 plateau a DATA limit or a
 # SUPERVISION limit? Training arms (step 1, the train-vs-val eval + oracle on training images,
-# runs separately: claude_dev/policy_algos/README.md):
+# runs separately: canvit_claude/canvit/policy_algos/README.md):
 #
 #   pg-lnfeat-nobn-aug      pg-lnfeat-nobn + ADE20K train augmentation (dinov3 recipe: rescale
 #                           0.5-2, 512 crop, flip, photometric); val unchanged (squish)
