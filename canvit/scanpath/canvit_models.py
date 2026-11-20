@@ -82,9 +82,12 @@ class SearchEpisode:
         return nullcontext()
 
     @torch.no_grad()
-    def run(self, batch: dict, n: int) -> dict[str, Tensor]:
-        """Glimpses at the anchor and the human fixations 1..n-1; returns ``policy`` (if loaded) and
-        ``heatmap`` logits, each [B, n, G*G], row t-1 read after the glimpse at fixation t-1."""
+    def _episode(self, batch: dict, n: int, next_xy) -> tuple[dict[str, Tensor], Tensor]:
+        """The deploy rollout over glimpses 0..n-1, except that glimpse t >= 1 lands at
+        ``next_xy(t, scores)`` ([B, 2] scene (x, y)), where ``scores`` [B, G*G] are the policy's scores for
+        fixation t (None without a policy). Returns the ``policy`` (if loaded) and ``heatmap`` logits, each
+        [B, n, G*G] (row t-1 read after glimpse t-1, i.e. the prediction for fixation t), and the centres
+        of glimpses 0..n-1 [B, n, 2] (x, y)."""
         from canvit.harness.rollout.engine import _to_vp
         from canvit.harness.rollout.eval_viewpoints import deploy_selector
         from canvit.harness.rollout.viewpoint import ViewpointType
@@ -94,13 +97,13 @@ class SearchEpisode:
         B, cg = images.shape[0], self.task.canvas_grid(model)
         if (cue < 0).any():
             raise ValueError("the search model needs a cue on every trial; this dataset has free-viewing trials")
-        human = batch["fix"].nan_to_num(0.0)  # rows shorter than t: any finite centre, ignored downstream
         sel = deploy_selector(self.joint) if self.joint is not None else self.task._random_selector()
         ctx = sel.start_rollout(t0_type=ViewpointType.FULL, batch_size=B, device=images.device)
         if self.joint is not None:
             embed = self.task._policy_embed(model)
             ctx.cond = lambda: embed(cue)
         out: dict[str, list[Tensor]] = {"heatmap": []} | ({"policy": []} if self.joint is not None else {})
+        centres: list[Tensor] = []
         state = None
         # ONE select per glimpse, as in the deploy rollout: the encoder keeps a rolling reference,
         # so a second call per glimpse would shift every later feature. The select at step t reads
@@ -111,21 +114,47 @@ class SearchEpisode:
                 break
             named = sel.select(vp_type=ViewpointType.FULL if t == 0 else ViewpointType.RANDOM, ctx=ctx, t=t,
                                batch_size=B, device=images.device, state=state)
-            if t > 0 and self.joint is not None:
-                out["policy"].append(sel.last_aux["scores"].float().reshape(B, -1))
+            scores = sel.last_aux["scores"].float().reshape(B, -1) if t > 0 and self.joint is not None else None
+            if scores is not None:
+                out["policy"].append(scores)
             if t == n:
                 break
             vp = _to_vp(named)
             if t > 0:
-                xy = clamp_to_content(human[:, t], batch["content"])
+                xy = next_xy(t, scores)
                 vp = Viewpoint(centers=xy.flip(-1).to(vp.centers.dtype), scales=vp.scales)  # (y, x)
+            centres.append(vp.centers.flip(-1).float())
             if state is None:
                 state = model.init_state(batch_size=B, canvas_grid_size=cg)
             with self._amp():
                 state = model.canvit(image=images, state=state, viewpoint=vp).state
             heat, _ = model.head(_canvas_hidden(model, state, cg).float(), cue)
             out["heatmap"].append(heat.float().reshape(B, -1))
-        return {k: torch.stack(v, 1) for k, v in out.items()}
+        return {k: torch.stack(v, 1) for k, v in out.items()}, torch.stack(centres, 1)
+
+    def run(self, batch: dict, n: int) -> dict[str, Tensor]:
+        """Teacher forcing: glimpses at the anchor and the HUMAN fixations 1..n-1 (clamped onto the image);
+        returns the logits of :meth:`_episode`."""
+        human = batch["fix"].nan_to_num(0.0)  # rows shorter than t: any finite centre, ignored downstream
+        return self._episode(batch, n, lambda t, scores: clamp_to_content(human[:, t], batch["content"]))[0]
+
+    def sample(self, batch: dict, n: int, *, temperature: float, generator: torch.Generator | None = None) -> Tensor:
+        """The model's OWN scanpath of n fixations (the anchor + n-1 chosen) [B, n, 2] scene (x, y): fixation t
+        is the centre of a cell drawn from softmax(scores / temperature); temperature 0 = the argmax, i.e. the
+        deploy rollout. Needs the policy."""
+        if self.joint is None:
+            raise ValueError("sampling scanpaths needs the policy (<ckpt>.policy.pt)")
+
+        def draw(t, scores):
+            g = int(round(scores.shape[1] ** 0.5))
+            if temperature == 0:
+                idx = scores.argmax(1)
+            else:
+                idx = torch.multinomial(torch.softmax(scores / temperature, 1), 1, generator=generator).squeeze(1)
+            c = (torch.arange(g, device=scores.device, dtype=torch.float32) + 0.5) * (2.0 / g) - 1.0
+            return torch.stack([c[idx % g], c[idx // g]], -1)  # cell (row, col) = (idx // g, idx % g)
+
+        return self._episode(batch, n, draw)[1]
 
 
 def _check_view_scale(payload: dict, search_cfg) -> None:

@@ -83,6 +83,10 @@ def load_coco_search18(cfg: ScanpathConfig):
     pysaliency's KDE refuses negative positions)."""
     files = {name: d / name for d in cfg.release_dirs for name in RELEASE_FILES if (d / name).exists()}
     st, ft, sv, fv = coco_search18(cfg.data_location, files)
+    # Do not keep decoded images: the centre bias looks stimuli up by pixel hash (`stimulus_ids.index`), which
+    # decodes EVERY stimulus once; with pysaliency's default cache that kept all 4326 training images (~22 GB,
+    # the OOM of 2026-11-20). The hashes themselves stay cached.
+    st.cached = sv.cached = False
     ft, n_train = clip_to_stimuli(st, ft)
     fv, n_val = clip_to_stimuli(sv, fv)
     log.info("clipped off-stimulus fixations onto the stimulus: %d train, %d validation", n_train, n_val)
@@ -123,6 +127,9 @@ def clip_to_stimuli(stimuli, fixations):
 def scores(model, stimuli, fixations, centre_bias) -> dict[str, float]:
     """pysaliency's per-fixation scores of ``model`` on the fixations with a history, averaged."""
     fx = fixations[fixations.scanpath_history_length > 0]
+    # Stimulus by stimulus, so a model with a small map cache (the centre bias) computes each map once; no
+    # average depends on the order (per-image means group by fx.n).
+    fx = fx[np.argsort(fx.n, kind="stable")]
     uniform = pysaliency.UniformModel()
     ll_model = model.log_likelihoods(stimuli, fx) / np.log(2)
     per_fix = {
@@ -170,7 +177,8 @@ def run(cfg: ScanpathConfig) -> dict[str, Any]:
         fit = fit_centre_bias(st, ft)
     else:
         fit = {"bandwidth": cfg.centre_bias_bandwidth, "eps": cfg.centre_bias_eps}
-    centre_bias = CrossvalidatedBaselineModel(stimuli, fixations, bandwidth=fit["bandwidth"], eps=fit["eps"])
+    centre_bias = CrossvalidatedBaselineModel(stimuli, fixations, bandwidth=fit["bandwidth"], eps=fit["eps"],
+                                              memory_cache_size=4)  # see scores(): fixations sorted by stimulus
     model = build_model(cfg, stimuli, fixations, centre_bias, device)
     metrics = scores(model, stimuli, fixations, centre_bias)
     return {

@@ -68,6 +68,23 @@ def test_forcing_the_policys_own_choices_reproduces_the_deploy_rollout(fake_cs18
     assert torch.equal(forced.argmax(-1), cell[..., 1] * CG + cell[..., 0])
 
 
+def test_sampling_at_temperature_zero_is_the_deploy_rollout(fake_cs18):
+    ep = _episode(fake_cs18[0])
+    batch = _batch(torch.zeros(B, 3, 2))
+    centres, _ = _deploy(ep, batch["image"], batch["cue"], n=3)
+    assert torch.allclose(ep.sample(batch, 3, temperature=0.0), centres, atol=1e-6)
+
+
+def test_sampling_is_seeded_and_spreads_with_temperature(fake_cs18):
+    ep = _episode(fake_cs18[0])
+    batch = _batch(torch.zeros(B, 4, 2))
+    a = ep.sample(batch, 4, temperature=5.0, generator=torch.Generator().manual_seed(0))
+    b = ep.sample(batch, 4, temperature=5.0, generator=torch.Generator().manual_seed(0))
+    c = ep.sample(batch, 4, temperature=5.0, generator=torch.Generator().manual_seed(1))
+    assert torch.equal(a, b) and not torch.equal(a, c)
+    assert torch.equal(a[:, 0], torch.zeros(B, 2))  # fixation 0 is the centre anchor
+
+
 def test_human_fixations_change_the_later_predictions(fake_cs18):
     ep = _episode(fake_cs18[0])
     a = torch.tensor([[[0.0, 0.0], [0.6, 0.6], [0.0, 0.0]]]).repeat(B, 1, 1)

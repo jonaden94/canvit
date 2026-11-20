@@ -91,7 +91,8 @@ def fit_centre_bias(stimuli, fixations, *, n_images: int = 200, seed: int = 0,
     best = {"ll": -np.inf}
     for bw in bandwidths:
         for eps in epss:
-            m = CrossvalidatedBaselineModel(stimuli, fixations, bandwidth=bw, eps=eps)
+            # memory_cache_size: pysaliency otherwise keeps every 14 MB map of every grid point (OOM at 20 GB)
+            m = CrossvalidatedBaselineModel(stimuli, fixations, bandwidth=bw, eps=eps, memory_cache_size=4)
             ll = float(m.information_gain(stimuli, sub, baseline_model=pysaliency.UniformModel()))
             log.info("centre bias bandwidth=%.4f eps=%.0e: %.4f bits/fix over uniform", bw, eps, ll)
             if ll > best["ll"]:
