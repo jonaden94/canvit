@@ -69,10 +69,38 @@ def example_trials(stimuli, fix, out: Path) -> None:
     plt.close(fig)
 
 
-def human_entropy(stimuli, fix, mask, t_max=6, sigma_cells=1.5) -> dict[int, tuple[float, float, float, int]]:
-    """Per fixation index t: (median, q25, q75, n) over stimuli of the entropy (nats) of a Gaussian KDE of the
-    subjects' fixation t, integrated over the policy's 32x32 grid on the displayed image (leave nobody out: this
-    is the spread of the group, an upper bound on one person's)."""
+K_SUBJECTS = 4  # subjects per entropy estimate, the same at every t (see human_entropy)
+
+
+def kde_entropy(pts: np.ndarray, hw: tuple[int, int], sigma_cells: float = 1.5) -> float:
+    """Entropy (nats) of a Gaussian KDE of ``pts`` [n, 2] (pixels), integrated over the policy's 32x32 grid on
+    the displayed image, with a 0.1% uniform floor."""
+    h, w = hw
+    xe, ye = np.linspace(0, w, G + 1), np.linspace(0, h, int(round(G * h / w)) + 1)
+    s = sigma_cells * w / G
+    mx = np.diff(norm.cdf((xe[None] - pts[:, :1]) / s), axis=1)
+    my = np.diff(norm.cdf((ye[None] - pts[:, 1:]) / s), axis=1)
+    m = (my[:, :, None] * mx[:, None, :]).sum(0)
+    m = 0.999 * m / m.sum() + 0.001 / m.size
+    return float(-(m * np.log(m)).sum())
+
+
+def kde_range(hw: tuple[int, int], k: int = K_SUBJECTS) -> tuple[float, float]:
+    """What this estimator can return for k points: all at one place (floor) and spread far apart (ceiling)."""
+    h, w = hw
+    floor = kde_entropy(np.full((k, 2), [w / 2, h / 2]), hw)
+    spread = np.array([[w * (i + 1) / (k + 1), h / 2 + (-1) ** i * h / 4] for i in range(k)])
+    return floor, kde_entropy(spread, hw)
+
+
+def human_entropy(stimuli, fix, mask, t_max=6, k=K_SUBJECTS, draws=5, seed=0) -> dict[int, tuple]:
+    """Per fixation index t: (median, q25, q75, n_stimuli) over stimuli of the entropy (nats) of the subjects'
+    fixation t (``kde_entropy``). EVERY estimate uses exactly k subjects: only stimuli with >= k subjects still
+    searching at t enter, k of them drawn ``draws`` times and the entropies averaged. Using all subjects instead
+    made the curve look flat (other session, 2026-11-20): searchers drop from 10 per stimulus at t=1 to a median
+    of 4 at t=6, and a KDE of n points has a ceiling that grows with n
+    (claude_journal/scripts_2026-11-20/entropy_n.py)."""
+    rng = np.random.default_rng(seed)
     sp = fix.scanpaths
     lengths = np.asarray(sp.length)
     out = {}
@@ -80,18 +108,13 @@ def human_entropy(stimuli, fix, mask, t_max=6, sigma_cells=1.5) -> dict[int, tup
         Hs = []
         for i in np.unique(sp.n[mask]):
             rows = np.flatnonzero((sp.n == i) & mask & (lengths > t))
-            if len(rows) < 3:
+            if len(rows) < k:
                 continue
-            h, w = stimuli.sizes[int(i)]
             pts = np.array([[sp.xs[r][t], sp.ys[r][t]] for r in rows])
-            xe, ye = np.linspace(0, w, G + 1), np.linspace(0, h, int(round(G * h / w)) + 1)
-            s = sigma_cells * w / G
-            mx = np.diff(norm.cdf((xe[None] - pts[:, :1]) / s), axis=1)
-            my = np.diff(norm.cdf((ye[None] - pts[:, 1:]) / s), axis=1)
-            m = (my[:, :, None] * mx[:, None, :]).sum(0)
-            m = 0.999 * m / m.sum() + 0.001 / m.size
-            Hs.append(-(m * np.log(m)).sum())
-        if len(Hs) >= 10:
+            hw = tuple(int(v) for v in stimuli.sizes[int(i)])
+            Hs.append(np.mean([kde_entropy(pts[rng.choice(len(rows), k, replace=False)], hw)
+                               for _ in range(draws)]))
+        if len(Hs) >= 30:  # fewer stimuli: too noisy to plot (target present has 27 at t=5)
             out[t] = (float(np.median(Hs)), float(np.percentile(Hs, 25)), float(np.percentile(Hs, 75)), len(Hs))
     return out
 
@@ -99,23 +122,29 @@ def human_entropy(stimuli, fix, mask, t_max=6, sigma_cells=1.5) -> dict[int, tup
 def entropy_figure(stimuli, fix, out: Path) -> dict:
     tp = present_mask(fix)
     res = {"target present": human_entropy(stimuli, fix, tp), "target absent": human_entropy(stimuli, fix, ~tp)}
-    fig, ax = plt.subplots(figsize=(5.2, 3.0))
-    for (name, e), c, dy in zip(res.items(), (TP, TA), (-0.3, 0.3)):  # present below, absent above its line
+    floor, ceiling = kde_range(tuple(int(v) for v in stimuli.sizes[0]))
+    fig, (ax, axn) = plt.subplots(2, 1, figsize=(5.2, 4.0), sharex=True, height_ratios=(3, 1))
+    ax.axhspan(floor, ceiling, color="#e6e5e1", lw=0)
+    ax.text(1, ceiling + 0.08, f"range of the estimator for {K_SUBJECTS} subjects (shaded)", color=MUTED,
+            fontsize=8, va="bottom")
+    for (name, e), c, dy in zip(res.items(), (TP, TA), (-0.25, 0.25)):  # present below, absent above its line
         t = np.array(list(e))
-        med, q25, q75 = (np.array([v[k] for v in e.values()]) for k in range(3))
-        ax.fill_between(t, q25, q75, color=c, alpha=0.15, lw=0)
+        med, q25, q75, n = (np.array([v[k] for v in e.values()]) for k in range(4))
+        ax.fill_between(t, q25, q75, color=c, alpha=0.18, lw=0)
         ax.plot(t, med, marker="o", ms=4, color=c, label=name)
         ax.text(t[-1], med[-1] + dy, name, color=INK, ha="right", va="center", fontsize=8)
+        axn.plot(t, n, marker="o", ms=3, color=c, lw=1.5)
     ax.axhline(POLICY_TARGET, color=MUTED, ls="--", lw=1)
     ax.text(1, POLICY_TARGET + 0.12, f"search policy target {POLICY_TARGET} nats", color=MUTED, fontsize=8)
     ax.axhline(np.log(G * 20), color=MUTED, ls=":", lw=1)
     ax.text(1, np.log(G * 20) + 0.12, "uniform on the image", color=MUTED, fontsize=8)
-    ax.set(xlabel="fixation index t", ylabel="entropy (nats), median and IQR", ylim=(0, 7.2),
-           xlim=(0.8, max(max(e) for e in res.values()) + 0.2))
+    ax.set(ylabel="entropy (nats)\nmedian and IQR", ylim=(0, 7.4))
     ax.legend(frameon=False, loc="lower right", fontsize=8)
+    axn.set(xlabel="fixation index t", ylabel="stimuli", xlim=(0.8, max(max(e) for e in res.values()) + 0.2),
+            ylim=(0, None))
     fig.savefig(out / "human_entropy.pdf")
     plt.close(fig)
-    return res
+    return res | {"kde_range": (floor, ceiling)}
 
 
 def tfp_figure(stimuli, fix, out: Path, max_fix=6) -> tuple[np.ndarray, float]:
@@ -195,16 +224,22 @@ def main() -> None:
     stats = {"validation_stimuli": len(sv), "scanpaths_tp": int(tp.sum()), "scanpaths_ta": int((~tp).sum()),
              "median_length_tp": float(np.median(np.asarray(fv.scanpaths.length)[tp])),
              "median_length_ta": float(np.median(np.asarray(fv.scanpaths.length)[~tp])),
-             "entropy": {k: {t: v[0] for t, v in e.items()} for k, e in ent.items()},
+             "entropy": {k: {t: v[0] for t, v in e.items()} for k, e in ent.items() if k != "kde_range"},
+             "entropy_n_stimuli": {k: {t: v[3] for t, v in e.items()} for k, e in ent.items() if k != "kde_range"},
+             "kde_range_nats": list(ent["kde_range"]),
              "tfp_curve": [round(float(c), 4) for c in curve], "tfp_auc": auc}
     (a.out / "tables" / "numbers.json").write_text(json.dumps(stats, indent=1))
     ent_tp, ent_ta = (stats["entropy"][k] for k in ("target present", "target absent"))
+    floor, ceiling = ent["kde_range"]
     macros = {  # the numbers the text quotes, so none is typed by hand
         "nStimVal": stats["validation_stimuli"], "nTP": stats["scanpaths_tp"], "nTA": stats["scanpaths_ta"],
         "medLenTP": f"{stats['median_length_tp']:.0f}", "medLenTA": f"{stats['median_length_ta']:.0f}",
         "tfpAUC": f"{auc:.2f}", "tfpOne": f"{curve[1]:.2f}", "tfpThree": f"{curve[3]:.2f}", "tfpSix": f"{curve[6]:.2f}",
         "entTPone": f"{ent_tp[1]:.1f}", "entTPmin": f"{min(ent_tp.values()):.1f}",
         "entTAmin": f"{min(ent_ta.values()):.1f}", "entTAmax": f"{max(ent_ta.values()):.1f}",
+        "entTPlast": f"{ent_tp[max(ent_tp)]:.1f}", "entTAone": f"{ent_ta[1]:.1f}",
+        "entTAlast": f"{ent_ta[max(ent_ta)]:.1f}", "entTlast": max(ent_tp),
+        "kSubj": K_SUBJECTS, "entFloor": f"{floor:.1f}", "entCeil": f"{ceiling:.1f}",
     }
     (a.out / "tables" / "numbers.tex").write_text(
         "% Generated by canvit scripts/scanpath/figures.py -- do not edit by hand.\n"
