@@ -28,7 +28,14 @@ from pysaliency.baseline_utils import CrossvalidatedBaselineModel
 from pysaliency.utils import average_values
 
 from .data import coco_search18, make_scanpath_loader
-from .models import DensitySaliencyMap, fit_centre_bias, without_start_fixations
+from .models import (
+    DensitySaliencyMap,
+    GridScanpathModel,
+    fit_centre_bias,
+    fit_temperature,
+    policy_entropy,
+    without_start_fixations,
+)
 from .sources import PolicySource, SearchSource
 
 log = logging.getLogger(__name__)
@@ -75,6 +82,12 @@ class ScanpathConfig:
     does not record it: read the run's launcher (``FOVI_COMMIT``) or its SLURM log ("Pinned fovi -> ..."); a run
     pinned to a canvit commit after the port has 27b1bde. No default, so the choice is always on the record."""
     source: PolicySource = field(default_factory=SearchSource)
+    save_predictions: Path | None = None
+    """CanViT models: write the predicted maps here (``.npz``, ``GridScanpathModel.save``), e.g. for figures."""
+    fit_temperature_scanpaths: int = 0
+    """CanViT models, DIAGNOSTIC: > 0 runs the model on this many TRAINING scanpaths (same condition), fits one
+    global softmax temperature and one per fixation index by log-likelihood there, and reports the tempered
+    likelihoods on the evaluated split under ``diagnostics``. Never fed back into training (owner, 2026-11-20)."""
     """The task the run trained, with its own flags (``cfg.source:<task> --cfg.source.cfg.* --cfg.source.rl.*``,
     ``sources.py``): the model and policy are rebuilt with the training constructors and loaded strictly."""
 
@@ -166,10 +179,12 @@ def check_source_geometry(geometry: str | None) -> None:
 
 
 def build_model(cfg: ScanpathConfig, stimuli, fixations, centre_bias, device: torch.device):
+    """-> (the model scored on ``fixations``, and for CanViT models a ``predict(stimuli, fixations)`` that runs
+    the same model on other scanpaths -- the temperature diagnostic needs the training split -- else None)."""
     if cfg.model == "uniform":
-        return pysaliency.UniformModel()
+        return pysaliency.UniformModel(), None
     if cfg.model == "centre_bias":
-        return centre_bias
+        return centre_bias, None
     from .canvit_models import CanViTModel, PolicyEpisode, precompute
     if cfg.ckpt is None:
         raise ValueError(f"--cfg.model {cfg.model} needs --cfg.ckpt (a run's .pt)")
@@ -182,9 +197,38 @@ def build_model(cfg: ScanpathConfig, stimuli, fixations, centre_bias, device: to
                          "the human fixations must be letterboxed into the scene the model was trained on")
     readout = "policy" if cfg.model == "canvit_policy" else "heatmap"
     ep = PolicyEpisode.load(task=task, ckpt=cfg.ckpt, device=device, need_policy=readout == "policy")
-    loader = make_scanpath_loader(stimuli, fixations, scene_size=cfg.scene_size, batch_size=cfg.batch_size,
-                                  num_workers=cfg.num_workers)
-    return precompute(CanViTModel(ep, readout), loader, grid=cfg.grid, scene_size=cfg.scene_size)
+
+    def predict(stimuli, fixations):
+        loader = make_scanpath_loader(stimuli, fixations, scene_size=cfg.scene_size, batch_size=cfg.batch_size,
+                                      num_workers=cfg.num_workers)
+        return precompute(CanViTModel(ep, readout), loader, grid=cfg.grid, scene_size=cfg.scene_size)
+
+    return predict(stimuli, fixations), predict
+
+
+def grid_diagnostics(model, stimuli, fixations, centre_bias, *, train=None) -> dict[str, Any]:
+    """For a grid model: the policy's entropy per fixation index (nats), and with ``train = (stimuli,
+    fixations, model on them)`` the fitted temperatures and the tempered likelihoods (DIAGNOSTIC)."""
+    H, t = policy_entropy(model, stimuli, fixations)
+    out: dict[str, Any] = {"entropy_fix": float(H.mean())} | {
+        f"entropy_t{i}": float(H[t == i].mean()) for i in np.unique(t) if (t == i).sum() >= 20}
+    if train is None:
+        return out
+    tau = fit_temperature(train[2], train[0], train[1])
+    tau_t = fit_temperature(train[2], train[0], train[1], per_index=True)
+    fx = without_start_fixations(fixations)
+    uniform_ll = pysaliency.UniformModel().log_likelihoods(stimuli, fx)
+    cb_ll = centre_bias.log_likelihoods(stimuli, fx)
+    for name, temp in (("global", tau), ("per_index", tau_t)):
+        ll = model.with_temperature(temp).log_likelihoods(stimuli, fx)
+
+        def bits(ref):
+            return float(average_values((ll - ref) / np.log(2), fx, average="image"))
+
+        out[f"tempered_{name}"] = {"temperature": temp, "ll_image": bits(uniform_ll), "ig_image": bits(cb_ll)}
+    H_tau, _ = policy_entropy(model.with_temperature(tau), stimuli, fixations)
+    out["tempered_global"]["entropy_fix"] = float(H_tau.mean())
+    return out
 
 
 def run(cfg: ScanpathConfig) -> dict[str, Any]:
@@ -199,8 +243,18 @@ def run(cfg: ScanpathConfig) -> dict[str, Any]:
     centre_bias = CrossvalidatedBaselineModel(stimuli, without_start_fixations(fixations), bandwidth=fit["bandwidth"],
                                               eps=fit["eps"],
                                               memory_cache_size=4)  # see scores(): fixations sorted by stimulus
-    model = build_model(cfg, stimuli, fixations, centre_bias, device)
+    model, predict = build_model(cfg, stimuli, fixations, centre_bias, device)
     metrics = scores(model, stimuli, fixations, centre_bias)
+    diagnostics: dict[str, Any] = {}
+    if isinstance(model, GridScanpathModel):
+        if cfg.save_predictions is not None:
+            model.save(cfg.save_predictions)
+        train = None
+        if cfg.fit_temperature_scanpaths > 0:
+            assert predict is not None
+            ft_sub = select(ft, condition=cfg.condition, limit=cfg.fit_temperature_scanpaths)
+            train = (st, ft_sub, predict(st, ft_sub))
+        diagnostics = grid_diagnostics(model, stimuli, fixations, centre_bias, train=train)
     return {
         "task": "scanpath",
         "model": cfg.model,
@@ -208,8 +262,10 @@ def run(cfg: ScanpathConfig) -> dict[str, Any]:
         | {"centre_bias": fit, "off_stimulus_fixations": "clipped at load",
            "pysaliency": getattr(pysaliency, "__version__", "?")},
         "metrics": metrics,
+        "diagnostics": diagnostics,
         "evaluated_at": datetime.now(UTC).isoformat(),
     }
 
 
-__all__ = ["ScanpathConfig", "check_source_geometry", "clip_to_stimuli", "run", "scores", "select"]
+__all__ = ["ScanpathConfig", "check_source_geometry", "clip_to_stimuli", "grid_diagnostics", "run", "scores",
+           "select"]

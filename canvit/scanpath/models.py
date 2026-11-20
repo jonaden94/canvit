@@ -54,18 +54,93 @@ def grid_log_density(logits: np.ndarray, *, hw: tuple[int, int], scene: int) -> 
 
 class GridScanpathModel(pysaliency.ScanpathModel):
     """Precomputed grid logits as a pysaliency scanpath model. ``logits[(scanpath_index, t)]`` [G*G]
-    is the prediction for fixation t after the human's fixations 0..t-1 (history length t)."""
+    is the prediction for fixation t after the human's fixations 0..t-1 (history length t).
 
-    def __init__(self, logits: dict[tuple[int, int], np.ndarray], *, scene_size: int, name: str):
+    ``temperature`` divides the logits: one global value, or per history length t (missing t: 1). It is a
+    DIAGNOSTIC only (owner, 2026-11-20: one global entropy alpha in training; tau shows how far the policy's
+    sharpness is from the human-optimal one) and never feeds back into training."""
+
+    def __init__(self, logits: dict[tuple[int, int], np.ndarray], *, scene_size: int, name: str,
+                 temperature: float | dict[int, float] = 1.0):
         super().__init__()
-        self.logits, self.scene, self.name = logits, scene_size, name
+        self.logits, self.scene, self.name, self.temperature = logits, scene_size, name, temperature
+
+    def tau(self, t: int) -> float:
+        return self.temperature if isinstance(self.temperature, float | int) else self.temperature.get(t, 1.0)
+
+    def with_temperature(self, temperature: float | dict[int, float]) -> GridScanpathModel:
+        return GridScanpathModel(self.logits, scene_size=self.scene, name=self.name, temperature=temperature)
 
     def conditional_log_density(self, stimulus, x_hist, y_hist, t_hist, attributes=None, out=None):
         key = (int(attributes["scanpath_index"]), len(x_hist))
         if key not in self.logits:
             raise KeyError(f"{self.name}: no prediction for scanpath {key[0]} after {key[1]} fixations "
                            "(was the episode run long enough?)")
-        return grid_log_density(self.logits[key], hw=as_stimulus(stimulus).size, scene=self.scene)
+        return grid_log_density(self.logits[key] / self.tau(key[1]), hw=as_stimulus(stimulus).size,
+                                scene=self.scene)
+
+    def save(self, path) -> None:
+        """The predictions as ``.npz`` (keys [N, 2] = (scanpath_index, t), float16 logits), e.g. for figures."""
+        keys = np.array(list(self.logits), dtype=np.int64).reshape(-1, 2)
+        np.savez_compressed(path, keys=keys, logits=np.stack([self.logits[tuple(k)] for k in keys]).astype(np.float16),
+                            scene_size=self.scene, name=self.name)
+
+    @classmethod
+    def load(cls, path) -> GridScanpathModel:
+        z = np.load(path)
+        return cls({(int(a), int(b)): v.astype(np.float32) for (a, b), v in zip(z["keys"], z["logits"])},
+                   scene_size=int(z["scene_size"]), name=str(z["name"]))
+
+
+def _scored_cells(model: GridScanpathModel, stimuli, fixations):
+    """For every fixation with a history: its logits [N, G*G], the cell it landed in [N], which cells show
+    the image [N, G*G], and its history length [N]. (pysaliency's LL = log p(cell) - log(pixels in cell);
+    the second term does not depend on the temperature, so fitting on cells is exact.)"""
+    fx = without_start_fixations(fixations)
+    logits, cells, on = [], [], []
+    for i in range(len(fx)):
+        h, w = stimuli.sizes[int(fx.n[i])]
+        lg = model.logits[(int(fx.scanpath_index[i]), int(fx.scanpath_history_length[i]))]
+        cell, count = _pixel_cells(int(h), int(w), model.scene, int(round(len(lg) ** 0.5)))
+        logits.append(lg)
+        cells.append(cell[fx.y_int[i], fx.x_int[i]])
+        on.append(count > 0)
+    return np.stack(logits).astype(np.float64), np.array(cells), np.stack(on), np.asarray(fx.scanpath_history_length)
+
+
+def _cell_log_probs(logits: np.ndarray, on: np.ndarray, tau: float) -> np.ndarray:
+    return log_softmax(np.where(on, logits / tau, -np.inf), axis=1)
+
+
+def fit_temperature(model: GridScanpathModel, stimuli, fixations, *, per_index: bool = False,
+                    min_fixations: int = 50) -> float | dict[int, float]:
+    """The temperature maximising the mean log-likelihood of the human fixations (fit on the TRAINING split).
+    ``per_index``: one per history length t with >= ``min_fixations`` fixations (a secondary diagnostic)."""
+    from scipy.optimize import minimize_scalar
+    logits, cells, on, t = _scored_cells(model, stimuli, fixations)
+    rows = np.arange(len(cells))
+
+    def fit(mask) -> float:
+        def nll(log_tau):
+            logp = _cell_log_probs(logits[mask], on[mask], float(np.exp(log_tau)))
+            return -logp[rows[: mask.sum()], cells[mask]].mean()
+        log_tau = minimize_scalar(nll, bounds=(-4.0, 4.0), method="bounded").x
+        if abs(abs(log_tau) - 4.0) < 1e-3:  # e.g. an uninformative map: flattening it is all the fit can do
+            log.warning("temperature fit at the edge of [e^-4, e^4]: tau=%.3g", np.exp(log_tau))
+        return float(np.exp(log_tau))
+
+    if not per_index:
+        return fit(np.ones(len(cells), dtype=bool))
+    return {int(i): fit(t == i) for i in np.unique(t) if (t == i).sum() >= min_fixations}
+
+
+def policy_entropy(model: GridScanpathModel, stimuli, fixations) -> tuple[np.ndarray, np.ndarray]:
+    """Entropy (nats) of the predicted next-fixation distribution over the image's cells, at the model's
+    temperature, per scored fixation; and the history length t of each."""
+    logits, _, on, t = _scored_cells(model, stimuli, fixations)
+    taus = np.array([model.tau(int(i)) for i in t])[:, None]
+    logp = log_softmax(np.where(on, logits / taus, -np.inf), axis=1)
+    return -(np.where(on, np.exp(logp) * logp, 0.0)).sum(1), t
 
 
 class DensitySaliencyMap(pysaliency.ScanpathSaliencyMapModel):
@@ -119,5 +194,5 @@ def fit_centre_bias(stimuli, fixations, *, n_images: int = 200, seed: int = 0,
     return best
 
 
-__all__ = ["DensitySaliencyMap", "GridScanpathModel", "fit_centre_bias", "grid_log_density",
-           "without_start_fixations"]
+__all__ = ["DensitySaliencyMap", "GridScanpathModel", "fit_centre_bias", "fit_temperature", "grid_log_density",
+           "policy_entropy", "without_start_fixations"]

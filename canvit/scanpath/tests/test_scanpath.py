@@ -188,3 +188,67 @@ def test_canvit_models_need_the_new_foveation_geometry_declared():
     cmd = tyro.cli(Command, args=["scanpath", "--cfg.model", "canvit_policy",  # pyright: ignore
                                   "--cfg.source-geometry", "fovi-27b1bde"])
     assert cmd.cfg.source_geometry == "fovi-27b1bde"
+
+
+# --- temperature, entropy, saved predictions (diagnostics for the CanViT results) --------------------
+
+def _random_grid_model(fix, *, seed=0, sharp_at_fixation=0.0):
+    """Random logits for every scored fixation, optionally raised at the cell the fixation landed in."""
+    rng = np.random.default_rng(seed)
+    cell, _ = _pixel_cells(H, W, 64, 32)
+    fx = fix[fix.scanpath_history_length > 0]
+    table = {}
+    for i in range(len(fx)):
+        lg = rng.standard_normal(1024)
+        lg[cell[fx.y_int[i], fx.x_int[i]]] += sharp_at_fixation
+        table[(int(fx.scanpath_index[i]), int(fx.scanpath_history_length[i]))] = lg
+    return GridScanpathModel(table, scene_size=64, name="random")
+
+
+def test_temperature_one_is_the_model_and_the_fit_beats_its_neighbours(fake_search):
+    from canvit.scanpath.models import fit_temperature
+    _, _, sv, fv = fake_search
+    fx = fv[fv.scanpath_history_length > 0]
+    m = _random_grid_model(fv, sharp_at_fixation=3.0)
+    assert np.allclose(m.with_temperature(1.0).log_likelihoods(sv, fx), m.log_likelihoods(sv, fx))
+    tau = fit_temperature(m, sv, fv)
+
+    def ll(t):
+        return m.with_temperature(t).log_likelihoods(sv, fx).mean()
+    assert ll(tau) >= ll(tau * 1.3) and ll(tau) >= ll(tau / 1.3)
+    per_t = fit_temperature(m, sv, fv, per_index=True, min_fixations=1)
+    assert set(per_t) == set(np.unique(fx.scanpath_history_length).tolist())
+
+
+def test_flat_logits_have_the_entropy_of_the_image_cells(fake_search):
+    from canvit.scanpath.models import policy_entropy
+    _, _, sv, fv = fake_search
+    m = _random_grid_model(fv)
+    m = GridScanpathModel({k: np.zeros(1024) for k in m.logits}, scene_size=64, name="flat")
+    H_, _ = policy_entropy(m, sv, fv)
+    _, count = _pixel_cells(H, W, 64, 32)
+    assert np.allclose(H_, np.log((count > 0).sum()))
+
+
+def test_saved_predictions_load_back(fake_search, tmp_path):
+    _, _, sv, fv = fake_search
+    fx = fv[fv.scanpath_history_length > 0]
+    m = _random_grid_model(fv)
+    m.save(tmp_path / "p.npz")
+    back = GridScanpathModel.load(tmp_path / "p.npz")
+    assert set(back.logits) == set(m.logits) and back.scene == 64
+    assert np.allclose(back.log_likelihoods(sv, fx), m.log_likelihoods(sv, fx), atol=5e-3)  # float16 storage
+
+
+def test_grid_diagnostics_report_entropy_and_tempered_likelihoods(fake_search):
+    from canvit.scanpath.evaluate import grid_diagnostics
+    st, ft, sv, fv = fake_search
+    cb = CrossvalidatedBaselineModel(sv, fv, bandwidth=0.1, eps=1e-3)
+    d = grid_diagnostics(_random_grid_model(fv), sv, fv, cb,
+                         train=(st, ft, _random_grid_model(ft, seed=1, sharp_at_fixation=3.0)))
+    # per-index entries need >= 20 fixations (entropy) / >= 50 (tau); this tiny split has fewer, so none appear
+    assert np.isfinite(d["entropy_fix"]) and not any(k.startswith("entropy_t") for k in d)
+    assert d["tempered_per_index"]["temperature"] == {}
+    for k in ("tempered_global", "tempered_per_index"):
+        assert {"temperature", "ll_image", "ig_image"} <= set(d[k])
+    assert d["tempered_global"]["temperature"] > 0 and np.isfinite(d["tempered_global"]["entropy_fix"])
