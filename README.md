@@ -208,7 +208,7 @@ repos/
 
 canvit is self-contained: the foveated geometry it used from `fovi` (fovi 27b1bde, planar
 visual field) was ported into [`canvit/core/foveation/`](canvit/core/foveation/) on
-2026-11-12, bit-identical (`claude_dev/fovi_port/`). `fovi` stays a sibling only for launchers
+2026-11-12, bit-identical. `fovi` stays a sibling only for launchers
 that pin a pre-port `TRAIN_COMMIT` plus a `FOVI_COMMIT`: those snapshots still `import fovi`.
 
 Four further clones are kept **read-only, as fallback references** — do not edit them, and
@@ -390,10 +390,10 @@ orthogonally to the task:
 | `joint` | task and policy together |
 
 Not every combination is meaningful (`distill` has no head, so `--preset probe`
-is refused). **`claude_dev/unification/capability_matrix.md` is generated from the live
+is refused). **[`docs/capability_matrix.md`](docs/capability_matrix.md) is generated from the live
 task objects** and lists exactly which task/preset combinations exist and what
 each resolves to — read it rather than guessing, and regenerate it with
-`claude_dev/unification/capability_matrix.py` after changing a `default_spec`.
+`scripts/capability_matrix.py` after changing a `default_spec`.
 
 `--cfg.*` are the task's own knobs (see the `Config` dataclass in the task's
 `config.py`); `--opts.*` are the framework's (run identity, cadence, checkpoint
@@ -576,9 +576,6 @@ A foveated model is only in-distribution at the view scale it was trained at, so
 (`--cfg.foveated-scale.fixed-scale`); off-scale glimpses make the metric *fall* as glimpses
 accumulate. The command warns when the generated scales look off-distribution.
 
-Details, and every defect found while unifying the two eval paths:
-[`claude_dev/unification/20-eval-merge.md`](claude_dev/unification/20-eval-merge.md).
-
 ## Tests
 
 ```bash
@@ -612,13 +609,8 @@ what they train, how to launch them, and how to judge the results:
   trained on a foveated backbone — where it beat random viewpoints on every
   seed. An exploratory first result, not a reference number.
 
-[`claude_dev/`](claude_dev/) is the other half of the documentation, kept for a different
-reader: it is the engineering record an AI agent reads to make a decision here — what was
-tried, what was measured, and which comparisons are invalid. `claude_dev/unification/`
-holds design notes and the generated capability matrix. Two entries there
-are the record of how this repo came to hold everything:
-[`20-eval-merge.md`](claude_dev/unification/20-eval-merge.md) (evaluation) and
-[`21-core-merge.md`](claude_dev/unification/21-core-merge.md) (the model).
+The design notes and engineering records written by and for Claude Code (what was tried,
+what was measured, which comparisons are invalid) are kept outside this repository.
 
 ### Other implementations
 
@@ -636,8 +628,7 @@ in the read-only `CanViT-PyTorch` clone that the pinned launchers archive from.
 
 **A pinned SLURM run using unexpected model code.** Not through shadowing — an old
 `CanViT-PyTorch` snapshot and a post-merge `canvit/core/` have different top-level names, so
-`PYTHONPATH` order cannot make one win over the other (`claude_dev/unification/21-core-merge.md`
-§10.2 retracts the §4 prediction that it could). The two real hazards are silent losses of
+`PYTHONPATH` order cannot make one win over the other. The two real hazards are silent losses of
 reproducibility, and the launcher logs both: no `TRAIN_COMMIT` at all, in which case the job
 runs the venv's editable install and later edits to the clone change it; and
 `PYTORCH_COMMIT` set on a post-merge pin, where it archives a `canvit_pytorch` that the

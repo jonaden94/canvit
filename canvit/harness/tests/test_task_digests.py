@@ -20,7 +20,7 @@ WHAT EACH DIGEST COVERS. Both halves of the training path:
     even if step 0's loss is untouched.
 
 FIDELITY. The spec of each config (bptt mode, branch composition, what is frozen) is the
-production one from ``claude_dev/unification/capability_matrix.md``. ``horizon`` and step count
+production one from ``docs/capability_matrix.md``. ``horizon`` and step count
 are cut down to keep this a CPU unit test; the digest's job is to detect change, not to
 reproduce a training curve.
 

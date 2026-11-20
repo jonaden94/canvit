@@ -10,7 +10,7 @@ Every sample is a dict:
 A new search dataset needs only an adapter that produces this; nothing downstream (head,
 loss, policy, eval) reads anything dataset-specific.
 
-COCO-Search18 facts this relies on (checked 2026-11-05, see claude_dev/search/00-design.md):
+COCO-Search18 facts this relies on (checked 2026-11-05, see canvit_claude/canvit/search/00-design.md):
 the TP fixation JSONs hold one record per (subject, trial), 10 subjects per
 (image, target) pair, with the same target bbox ``[x, y, w, h]`` (1680x1050 px) for every
 subject -- so the records are deduplicated on ``(name, task)``. The target-absent (TA)

@@ -4,14 +4,14 @@
 #   python -m canvit_train.harness.run ade20k --preset policy_only
 #
 # This is the run the whole session was building toward: the first production-scale
-# test of the harness's policy path. `claude_dev/unification/14-parity-coverage.md` calls
+# test of the harness's policy path. `canvit_claude/canvit/unification/14-parity-coverage.md` calls
 # the joint policy path "the substrate for all CanViT-RL work" whose first real run
 # doubles as its production gate — this is that run.
 #
 # Judged against ARM A (exp27-policy-oldloop-s0), not against the published band,
 # so the comparison carries no hardware or stack confound.
 #
-# CONFIG MAPPING — rl_train -> harness (claude_dev/unification/15 SS A). Everything below
+# CONFIG MAPPING — rl_train -> harness (canvit_claude/canvit/unification/15 SS A). Everything below
 # is a deliberate match; anything NOT listed is already identical by default
 # (model_repo, scene_size 512, batch_size 16, mode=frozen,
 # and the whole JointPolicyConfig: qreg, scales (0.5,0.25), centers_per_axis 16,

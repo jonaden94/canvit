@@ -1,6 +1,6 @@
 """Byte-exact parity: the generalized rollout engine reproduces distill's loss stream.
 
-Replicates ``claude_dev/unification/parity_probe.py`` (same tiny CPU model, same pinned
+Replicates ``canvit_claude/canvit/unification/parity_probe.py`` (same tiny CPU model, same pinned
 RNG, same 25 steps) but drives the loss through ``harness.rollout.run_rollout`` with
 a distill adapter instead of ``train/step.py::training_step``. If the sha256[:16] of
 the loss stream still equals the recorded ``9a0100a1a3de3acd``, the generalized

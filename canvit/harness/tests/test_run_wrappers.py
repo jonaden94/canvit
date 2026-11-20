@@ -5,7 +5,7 @@ RunTask protocol conformance), the trainable-param-group routing on tiny CPU mod
 (no HF download), the IN1k head=norm+head wrinkle, and the ``harness.cli`` command
 dataclasses (preset matrix, nested-config parsing, config-derived RunSettings). The
 model-loading + real-data training path is covered by the GPU integration script
-(``claude_dev/unification/harness_run_integration.py``).
+(``canvit_claude/canvit/unification/harness_run_integration.py``).
 """
 
 from pathlib import Path

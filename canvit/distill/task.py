@@ -242,7 +242,7 @@ class DistillRunTask:
         ("Compiling teacher and model"); the harness used to compile only the student, so
         every harness run drove an EAGER teacher for validation targets and for raw-shard
         on-the-fly training targets. Measured impact on the targets is negligible
-        (1-cos 1.2e-07, claude_dev/unification/teacher_compile_delta.py) — this is for speed and
+        (1-cos 1.2e-07, canvit_claude/canvit/unification/teacher_compile_delta.py) — this is for speed and
         for not leaving a gratuitous asymmetry behind.
         """
         teacher = self._load_teacher(device)

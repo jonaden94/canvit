@@ -9,7 +9,7 @@ Plus `cfg.reset_normalizer`, which must re-init even when the checkpoint carried
 
 The loader and the teacher are stubbed (a real one needs tar shards + a GPU); the
 dispatch, the reset rule and the on-the-fly bind are the real code. The raw path is
-exercised against real shards by `claude_dev/unification/harness_run_raw_shards.py`.
+exercised against real shards by `canvit_claude/canvit/unification/harness_run_raw_shards.py`.
 """
 
 from types import SimpleNamespace

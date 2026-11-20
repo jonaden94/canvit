@@ -1,10 +1,10 @@
 """The generated capability matrix must stay in sync with the code.
 
-`claude_dev/unification/capability_matrix.md` is the answer to "can task X do Y?". It is only
+`docs/capability_matrix.md` is the answer to "can task X do Y?". It is only
 trustworthy while it matches the live task objects, so adding a task, a preset, a
 `TaskCaps` field or a spec-selecting config knob must fail here until it is regenerated:
 
-    .venv-cu126/bin/python claude_dev/unification/capability_matrix.py
+    .venv-cu126/bin/python scripts/capability_matrix.py
 """
 
 import importlib.util
@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-_SCRIPT = Path(__file__).resolve().parents[3] / "claude_dev" / "unification" / "capability_matrix.py"
+_SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "capability_matrix.py"
 
 
 def _load():
@@ -28,5 +28,5 @@ def test_capability_matrix_is_current():
     assert mod.OUT.exists(), f"{mod.OUT} missing — run capability_matrix.py"
     assert mod.OUT.read_text() == mod.render(), (
         f"{mod.OUT.name} is stale. Regenerate:\n"
-        f"    .venv-cu126/bin/python claude_dev/unification/capability_matrix.py"
+        f"    .venv-cu126/bin/python scripts/capability_matrix.py"
     )

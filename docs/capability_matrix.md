@@ -1,7 +1,7 @@
 # Cross-task capability matrix
 
 **GENERATED — do not hand-edit.** Regenerate with
-`.venv-cu126/bin/python claude_dev/unification/capability_matrix.py`;
+`.venv-cu126/bin/python scripts/capability_matrix.py`;
 `test_capability_matrix.py` fails if this file drifts from the code.
 
 Answers "can task X do Y?" from the live task objects. A capability is reachable

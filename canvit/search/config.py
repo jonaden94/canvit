@@ -1,6 +1,6 @@
 """Visual-search task config (class-cued search, COCO-Search18 first).
 
-Design: ``claude_dev/search/00-design.md``. Haoze's defaults (autoregressive_detection,
+Design: ``canvit_claude/canvit/search/00-design.md``. Haoze's defaults (autoregressive_detection,
 branch haoze-wip) unless canvit has a natural equivalent; every formulation choice the
 owner named is an option here or in the policy config (``search_policy_config``).
 """

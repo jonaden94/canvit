@@ -37,7 +37,7 @@ authors' machine (doc 15 §A5.9/§A5.10).
 
 15 checkpoints, all re-scored at the LAST step through ONE eval in ONE process at eval batch
 32 (every arm logs `eval_batch_size=32`, so no batch-size confound).
-`claude_dev/unification/compare_arms.py` produces this table and the tests.
+`canvit_claude/canvit/unification/compare_arms.py` produces this table and the tests.
 
 | arm | n | mean(t1-t4) CE | mIoU t4 | jobs |
 |---|---|---|---|---|
@@ -79,14 +79,14 @@ An earlier version of this README blamed a "fp32 vs bf16 logits" divergence for 
 That was wrong twice over — the recomputation is bit-identical, and the trace that appeared to
 show a divergence was my own script omitting `rollout_and_loss`'s train-mode scorer forward
 (the one that updates `frontend.bn` before the eval-mode selection reads it). Retracted in
-doc 15 §A5.4. Reproduce: `claude_dev/unification/diff_training_trace.py`.
+doc 15 §A5.4. Reproduce: `canvit_claude/canvit/unification/diff_training_trace.py`.
 
 Still unexplained, and possibly nothing: arm C's t4 sd is 0.057 vs the harness's 0.133/0.136.
 At n=5 that ratio is weak evidence (F(4,4) is very wide). It is not a rollout code difference.
 
 Measurement is not the issue: the harness eval is bit-identical (0.0000 on t0..t4 + ce_mean)
 to the validated eval on **all three model sources** — published HF qband, `rl_train`, and
-harness (`claude_dev/unification/eval_equivalence.py`).
+harness (`canvit_claude/canvit/unification/eval_equivalence.py`).
 
 **FOUR defects had to be fixed, and every one of them was silent:**
 
@@ -132,7 +132,7 @@ Arm A is re-run anyway for two reasons:
 
 **Rule (learned in exp23/exp26): never gate a production A/B on one baseline run.** If A
 and B disagree, the next step is a second seed of A — not a verdict. See
-[[../../../claude_dev/unification/14-parity-coverage.md]].
+[[../../../../canvit_claude/canvit/unification/14-parity-coverage.md]].
 
 ## Verdict rule
 
@@ -153,7 +153,7 @@ and `reward_frac` trending positive. A policy that is learning nothing shows a f
 ## What had to be fixed before B was even meaningful
 
 All 2026-07-28/29, committed in `cea4dee`, detailed in
-[[../../../claude_dev/unification/15-rl-recipe-parity-and-open-items.md]] §A:
+[[../../../../canvit_claude/canvit/unification/15-rl-recipe-parity-and-open-items.md]] §A:
 
 1. **Validation deployed no policy.** `--preset policy_only` validated on RANDOM
    glimpses and selected `best.pt` on that mIoU. Fixed by the shared `eval_policy` knob
@@ -191,7 +191,7 @@ and `test_harness_policy_run_warns_when_not_band_comparable`.
 
 **Everything else audited clean** against the original repo (2026-07-29): same
 `model_repo` and probe rule, same `make_val_transforms` function (equivalence-tested for
-both modes in `claude_dev/unification/specialize_equivalence.py`), full val split with no
+both modes in `canvit_claude/canvit/unification/specialize_equivalence.py`), full val split with no
 limit/stride, eval CE at full 512², objective mean over t1–t4, and every recipe
 hyperparameter matching `TrainConfig` (lr 2e-4, wd 1e-2, betas .9/.95, clip 1.0,
 score_res 128, 640k forwards, batch 16, horizon 4, warmup 0.125, target_momentum 0.997,
@@ -218,7 +218,7 @@ for s in 0 1 2 3 4; do SEED=$s bash slurm/runs/exp27/policy-harness-s0.sh; done 
 `RUN_NAME` includes the seed, so seeds get distinct run dirs. That matters: an earlier
 re-run with a fixed `RUN_NAME` silently OVERWROTE the previous configuration's checkpoints.
 
-Curves for the Figure-4B comparison: `claude_dev/unification/plot_policy_curves.py
+Curves for the Figure-4B comparison: `canvit_claude/canvit/unification/plot_policy_curves.py
 --policy-ckpts <each seed's step-8000.policy.pt>`.
 
 Pins: `PRETRAIN=cea4dee`, `PYTORCH=017ce9b`, `FOVI=c399d3b` on both arms. `rl_train.py`

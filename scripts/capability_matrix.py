@@ -15,9 +15,9 @@ What it reports, per task (distill / ade20k / in1k):
                             ones that actually modulate training
   * head construction     — which ``from_pretrained_*`` entry ``build_model`` calls
 
-Run:  .venv-cu126/bin/python claude_dev/unification/capability_matrix.py [--check]
+Run:  .venv-cu126/bin/python scripts/capability_matrix.py [--check]
 
-``--check`` regenerates and diffs against the committed capability_matrix.md, exiting
+``--check`` regenerates and diffs against the committed docs/capability_matrix.md, exiting
 non-zero on drift (used by test_capability_matrix.py) instead of rewriting it.
 """
 
@@ -34,7 +34,7 @@ from pathlib import Path
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
-OUT = Path(__file__).with_name("capability_matrix.md")
+OUT = Path(__file__).resolve().parents[1] / "docs" / "capability_matrix.md"
 
 
 def _tasks():
@@ -138,7 +138,7 @@ def render() -> str:
         "# Cross-task capability matrix",
         "",
         "**GENERATED — do not hand-edit.** Regenerate with",
-        "`.venv-cu126/bin/python claude_dev/unification/capability_matrix.py`;",
+        "`.venv-cu126/bin/python scripts/capability_matrix.py`;",
         "`test_capability_matrix.py` fails if this file drifts from the code.",
         "",
         "Answers \"can task X do Y?\" from the live task objects. A capability is reachable",

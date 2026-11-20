@@ -10,7 +10,7 @@ These pin the guards that make both loud instead: the start-step derivation
 What is real here: the derivation, the invariant comparison, and the checkpoint
 round-trip (leg 1's ``resume_state()`` is what leg 2 reads). What is stubbed: the
 loader itself (a real one needs tar shards on disk) and the normalizer init. The
-same two legs against the real webdataset: ``claude_dev/unification/harness_run_wds_resume.py``.
+same two legs against the real webdataset: ``canvit_claude/canvit/unification/harness_run_wds_resume.py``.
 """
 
 from types import SimpleNamespace

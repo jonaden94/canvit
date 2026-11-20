@@ -4,7 +4,7 @@ Readout = per-glimpse canvas tokens ``[B, G, G, D]``; the target-conditioned hea
 applied OUTSIDE the backbone forward (so a frozen backbone still trains it). Foveated
 backbones only: the patcher consumes the full image and foveates it itself.
 
-Design: ``claude_dev/search/00-design.md``. Default regime: backbone frozen, task head and
+Design: ``canvit_claude/canvit/search/00-design.md``. Default regime: backbone frozen, task head and
 policy trained JOINTLY (``default_spec``).
 """
 

@@ -52,13 +52,12 @@ canvit/
   distill/ ade20k/ in1k/ search/   one folder per task: data, loss, metrics, figures
   checkpoint/  export to the HuggingFace format
 slurm/         cluster launchers, one folder per experiment (slurm/runs/<exp>/)
-claude_dev/    design notes and engineering records (mostly for Claude); search: claude_dev/search/
 docs/          docs for humans
 ```
 
 **Tests** live in a `tests/` folder inside each package (about 600). They check shapes and behaviour, compare against reference implementations, and include fingerprints of results that fail when a change moves the numbers. Run them with `.venv-cu126/bin/python -m pytest canvit` before using a commit for a real job.
 
-`CLAUDE.md` holds the working rules for Claude Code, which reads it automatically; you don't need to read it. Ask Claude to summarise what in it matters for what you are doing.
+The working rules and engineering notes for Claude Code are kept outside the repository (in the owner's `canvit_claude` folder); ask the owner if you need them.
 
 ## Search (where you start)
 

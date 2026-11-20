@@ -85,7 +85,7 @@ def _build_pipeline(
     workersplitter parameter) at the shard-URL level — one shard per worker.
     We must NOT add split_by_worker again via .compose(), as that would apply
     it a second time at the decoded-sample level, keeping only every Nth sample
-    per worker and reducing throughput by num_workers. See claude_dev/webdataset.md.
+    per worker and reducing throughput by num_workers.
 
     nodesplitter=None: we pre-slice shards per rank before constructing the
     dataset, so no node-level splitting inside WebDataset is needed (the default

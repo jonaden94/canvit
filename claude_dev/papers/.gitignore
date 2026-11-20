@@ -1,5 +1,0 @@
-# Papers and other material handed to Claude to read. The NOTES are tracked; the source
-# files are not -- PDFs bloat the repo and are usually not ours to redistribute.
-*
-!.gitignore
-!*.md
