@@ -214,11 +214,15 @@ def baselines_table(results: Path, out: Path) -> dict[str, str]:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--scandiff-runs", type=Path,
-                    default=Path("/mnt/lustre-grete/usr/u13879/normative_modelling/external/scandiff_driver/runs"))
+    ap.add_argument("--scandiff-runs", type=Path, default=None,
+                    help="the ScanDiff driver's sanity runs; default $SCANDIFF_RUNS_DIR")
     ap.add_argument("--results", type=Path, default=None,
                     help="evaluation records; default $SCANPATH_RESULTS_DIR, else $LOGS_DIR/scanpath_eval")
     a = ap.parse_args()
+    if a.scandiff_runs is None:
+        if not (runs := os.environ.get("SCANDIFF_RUNS_DIR")):
+            raise SystemExit("set --scandiff-runs or SCANDIFF_RUNS_DIR (source .envrc)")
+        a.scandiff_runs = Path(runs)
     if a.results is None:
         if root := os.environ.get("SCANPATH_RESULTS_DIR"):
             a.results = Path(root)
