@@ -7,7 +7,7 @@ import torch
 
 from canvit.harness.rollout.eval_viewpoints import deploy_rollout_viewpoints
 from canvit.harness.rollout.viewpoint import ViewpointType
-from canvit.scanpath.canvit_models import CanViTSearchModel, SearchEpisode
+from canvit.scanpath.canvit_models import CanViTModel, PolicyEpisode
 from canvit.search.tests.test_search_task import _cfg, _rl, _TinyTask
 
 B, S, CG = 2, 224, 32
@@ -25,7 +25,7 @@ def _episode(root, *, policy=True):
         for p in joint.scorer.parameters():  # non-trivial scores, so argmaxes differ between cells
             p.data.normal_(0, 0.5)
         joint.scorer.eval()
-    return SearchEpisode(task=task, model=model, joint=joint, device=torch.device("cpu"), amp=False)
+    return PolicyEpisode(task=task, model=model, joint=joint, device=torch.device("cpu"), amp=False)
 
 
 def _batch(fix):
@@ -101,7 +101,7 @@ def test_precompute_covers_every_scored_fixation_and_feeds_pysaliency(fake_cs18,
     _, _, sv, fv = fake_search
     ep = _episode(fake_cs18[0])
     loader = make_scanpath_loader(sv, fv, scene_size=S, batch_size=4, num_workers=0)
-    model = precompute(CanViTSearchModel(ep, "policy"), loader, grid=CG, scene_size=S)
+    model = precompute(CanViTModel(ep, "policy"), loader, grid=CG, scene_size=S)
     fx = fv[fv.scanpath_history_length > 0]
     keys = set(zip(fx.scanpath_index.tolist(), fx.scanpath_history_length.tolist()))
     assert set(model.logits) == keys
@@ -111,7 +111,62 @@ def test_precompute_covers_every_scored_fixation_and_feeds_pysaliency(fake_cs18,
 
 def test_heatmap_readout_needs_no_policy(fake_cs18):
     ep = _episode(fake_cs18[0], policy=False)
-    out = CanViTSearchModel(ep, "heatmap").forced_logits(_batch(torch.zeros(B, 3, 2)), 3, CG)
+    out = CanViTModel(ep, "heatmap").forced_logits(_batch(torch.zeros(B, 3, 2)), 3, CG)
     assert out.shape == (B, 3, CG * CG) and torch.isfinite(out).all()
     with pytest.raises(ValueError, match="grid"):
-        CanViTSearchModel(ep, "heatmap").forced_logits(_batch(torch.zeros(B, 3, 2)), 3, 16)
+        CanViTModel(ep, "heatmap").forced_logits(_batch(torch.zeros(B, 3, 2)), 3, 16)
+
+
+# --- a non-search task: the same episode for any task's policy (design §12) --------------------------
+
+def _in1k_episode():
+    """A tiny FOVEATED in1k classifier with its policy, built by the task's own constructors."""
+    from dataclasses import replace
+
+    from canvit.core import CanViTForImageClassification
+    from canvit.in1k.config import In1kConfig
+    from canvit.in1k.task import In1kRunTask
+    from canvit.search.tests.test_search_task import _FOVEATED
+    torch.manual_seed(0)
+    clf = CanViTForImageClassification(backbone_name="vits16", model_config=_FOVEATED, n_classes=10,
+                                       glimpse_grid_size=8).eval()
+    task = In1kRunTask(replace(In1kConfig(), canvas_grid=8), total_steps=1)
+    assert task.is_foveated(clf)
+    joint = task.build_policy(clf, device=torch.device("cpu"), canvas_grid=8,
+                              generator=torch.Generator().manual_seed(0))
+    torch.manual_seed(1)
+    for p in joint.scorer.parameters():
+        p.data.normal_(0, 0.5)
+    joint.scorer.eval()
+    return PolicyEpisode(task=task, model=clf, joint=joint, device=torch.device("cpu"), amp=False)
+
+
+def test_non_search_policy_reproduces_its_deploy_rollout_without_a_cue():
+    ep = _in1k_episode()
+    assert not ep.is_search
+    batch = _batch(torch.zeros(B, 3, 2)) | {"cue": torch.full((B,), -1)}  # free viewing: no cue
+    scores = []
+    hook = ep.joint.scorer.register_forward_hook(lambda m, i, o: scores.append(o.detach().reshape(B, -1)))
+
+    def advance(vp, state, t):  # in1k's own step (in1k/eval.py): the backbone on the whole image
+        if state is None:
+            state = ep.model.init_state(batch_size=B, canvas_grid_size=8)
+        return ep.model.canvit(image=batch["image"], state=state, viewpoint=vp).state
+
+    try:
+        taken = deploy_rollout_viewpoints(joint=ep.joint, advance=advance, t0_type=ViewpointType.FULL,
+                                          batch_size=B, device=torch.device("cpu"), n=3)
+    finally:
+        hook.remove()
+    batch["fix"] = torch.stack([vp.centers.flip(-1) for vp in taken], 1)
+    out = ep.run(batch, n=2)
+    assert set(out) == {"policy"}  # no task heatmap outside search
+    # the generic policy has a BatchNorm and select_bn_eval=True: the scorer runs twice per selection (identical
+    # in deploy's eval mode), so the hook saw 2 outputs per step
+    per_select = len(scores) // 2
+    assert ep.joint.policy_selector.select_bn_eval and per_select == 2
+    for t in range(2):
+        assert torch.equal(out["policy"][:, t], scores[t * per_select])
+    assert torch.allclose(ep.sample(batch, 3, temperature=0.0), batch["fix"], atol=1e-6)
+    with pytest.raises(ValueError, match="only the 'policy' readout"):
+        CanViTModel(ep, "heatmap")

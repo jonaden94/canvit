@@ -274,5 +274,11 @@ Plan (proposed 2026-11-20, owner: "sounds good"):
 3. (b) Training: one optional hook in the shared `PolicySelector` that adds the prior to the scores before
    choosing, behind a config flag that defaults off (so the parity and pinning digests stay unchanged), as
    the existing cue-conditioning hook does. Shared code: agree the hook with Jonathan first.
-4. Prerequisite: a task-agnostic episode (any task's policy + optional cue), see the review of FoAViS/autoreg
-   and canvit's per-task model/policy construction (in progress).
+4. Prerequisite, DONE 2026-11-20: a task-agnostic episode. `canvit_models.PolicyEpisode` runs any task's
+   foveated policy (search, distill/reconstruction, ade20k, in1k); the cue and the heatmap readout only for
+   search. The task comes from `sources.py` (`cfg.source:<task>` + the run's own `--cfg.source.cfg.*` /
+   `--cfg.source.rl.*`), built with the same constructor and policy defaults as the training CLI. Test: a tiny
+   foveated in1k policy, no cue, reproduces its deploy rollout bit for bit. Lessons from FoAViS/autoreg: one
+   fixation map per step kept apart from the task heads, one selection site, a preset-locations switch
+   (= our teacher forcing); its IoR was a heuristic-only mask; `render_policy_stats` (saccade length/angle
+   distributions) is worth porting for comparing CanViT's saccades with humans'.

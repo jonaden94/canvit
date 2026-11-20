@@ -152,3 +152,16 @@ def test_cli_parses_the_scanpath_subcommand():
     from canvit.harness.evaluate import Command, ScanpathEval
     cmd = tyro.cli(Command, args=["scanpath", "--cfg.model", "uniform", "--cfg.condition", "tp"])  # pyright: ignore
     assert isinstance(cmd, ScanpathEval) and cmd.cfg.model == "uniform" and cmd.cfg.condition == "tp"
+
+
+def test_cli_takes_the_policys_task_with_its_training_flags():
+    import tyro
+
+    from canvit.harness.evaluate import Command
+    from canvit.scanpath.sources import In1kSource, SearchSource
+    cmd = tyro.cli(Command, args=["scanpath", "--cfg.model", "canvit_policy", "cfg.source:in1k",  # pyright: ignore
+                                  "--cfg.source.cfg.canvas-grid", "8", "--cfg.source.rl.width", "32"])
+    assert isinstance(cmd.cfg.source, In1kSource)
+    assert cmd.cfg.source.cfg.canvas_grid == 8 and cmd.cfg.source.rl.width == 32
+    default = tyro.cli(Command, args=["scanpath"])  # pyright: ignore
+    assert isinstance(default.cfg.source, SearchSource) and default.cfg.source.rl.centers_per_axis == 32

@@ -27,11 +27,9 @@ import torch
 from pysaliency.baseline_utils import CrossvalidatedBaselineModel
 from pysaliency.utils import average_values
 
-from canvit.harness.config import JointPolicyConfig
-from canvit.search.config import SearchConfig, search_policy_config
-
 from .data import coco_search18, make_scanpath_loader
 from .models import DensitySaliencyMap, fit_centre_bias, without_start_fixations
+from .sources import PolicySource, SearchSource
 
 log = logging.getLogger(__name__)
 
@@ -46,8 +44,8 @@ def _env_path(name: str) -> Path:
 @dataclass
 class ScanpathConfig:
     model: Literal["uniform", "centre_bias", "canvit_policy", "canvit_heatmap"] = "centre_bias"
-    """``canvit_policy``: a search run's learned scorer; ``canvit_heatmap``: its task head's heatmap
-    (``canvit_models.py``). Both need ``ckpt``."""
+    """``canvit_policy``: a run's learned policy (any task, ``source``); ``canvit_heatmap``: a search run's
+    task head (``canvit_models.py``). Both need ``ckpt``."""
     data_location: Path = field(default_factory=lambda: _env_path("SCANPATH_DATA_DIR"))
     """pysaliency's dataset location (``$SCANPATH_DATA_DIR``); COCO-Search18 is cached under it."""
     release_dirs: tuple[Path, ...] = field(default_factory=lambda: tuple(
@@ -69,12 +67,10 @@ class ScanpathConfig:
     """Score only the first N scanpaths (smoke tests)."""
     device: str = "cuda"
     ckpt: Path | None = None
-    """A search run's harness ``.pt`` (its policy is read from the ``.policy.pt`` beside it)."""
-    search: SearchConfig = field(default_factory=SearchConfig)
-    """The search run's task flags (``--cfg.search.model-repo``, head size, ...): the model is
-    rebuilt with the training constructor and loaded strictly, so they must match the run's."""
-    rl: JointPolicyConfig = field(default_factory=search_policy_config)
-    """The search run's policy flags (``--cfg.rl.width``, ...); defaults = the search defaults."""
+    """A run's harness ``.pt`` (its policy is read from the ``.policy.pt`` beside it)."""
+    source: PolicySource = field(default_factory=SearchSource)
+    """The task the run trained, with its own flags (``cfg.source:<task> --cfg.source.cfg.* --cfg.source.rl.*``,
+    ``sources.py``): the model and policy are rebuilt with the training constructors and loaded strictly."""
 
 
 def load_coco_search18(cfg: ScanpathConfig):
@@ -154,18 +150,20 @@ def build_model(cfg: ScanpathConfig, stimuli, fixations, centre_bias, device: to
         return pysaliency.UniformModel()
     if cfg.model == "centre_bias":
         return centre_bias
-    from .canvit_models import CanViTSearchModel, SearchEpisode, precompute
+    from .canvit_models import CanViTModel, PolicyEpisode, precompute
     if cfg.ckpt is None:
-        raise ValueError(f"--cfg.model {cfg.model} needs --cfg.ckpt (a search run's .pt)")
-    if cfg.search.scene_size != cfg.scene_size:
-        raise ValueError(f"--cfg.search.scene-size {cfg.search.scene_size} != --cfg.scene-size {cfg.scene_size}: "
+        raise ValueError(f"--cfg.model {cfg.model} needs --cfg.ckpt (a run's .pt)")
+    task = cfg.source.task()
+    c = task.cfg
+    task_scene = getattr(c, "scene_size", None) or getattr(c, "scene_resolution", None)
+    if task_scene is not None and task_scene != cfg.scene_size:
+        raise ValueError(f"the {task.name} run's scene is {task_scene} px but --cfg.scene-size is {cfg.scene_size}: "
                          "the human fixations must be letterboxed into the scene the model was trained on")
     readout = "policy" if cfg.model == "canvit_policy" else "heatmap"
-    ep = SearchEpisode.load(search_cfg=cfg.search, rl=cfg.rl, ckpt=cfg.ckpt, device=device,
-                            need_policy=readout == "policy")
+    ep = PolicyEpisode.load(task=task, ckpt=cfg.ckpt, device=device, need_policy=readout == "policy")
     loader = make_scanpath_loader(stimuli, fixations, scene_size=cfg.scene_size, batch_size=cfg.batch_size,
                                   num_workers=cfg.num_workers)
-    return precompute(CanViTSearchModel(ep, readout), loader, grid=cfg.grid, scene_size=cfg.scene_size)
+    return precompute(CanViTModel(ep, readout), loader, grid=cfg.grid, scene_size=cfg.scene_size)
 
 
 def run(cfg: ScanpathConfig) -> dict[str, Any]:
