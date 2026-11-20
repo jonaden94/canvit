@@ -14,14 +14,6 @@ while a greedy ground-truth oracle on the same frozen model reaches 0.544, and i
 variant suggests most of that gap is real (`claude_dev/policy_oracle/`). So: do other ways of
 *learning* the policy close part of it?
 
-**Bottom line (2026-11-19, all runs done).** No. Six learning rules (PG, QReg, dense QReg, A2C, PPO,
-SAC-Discrete), four scorer-architecture changes (shallower U-Net, no input BN, local readout), less
-data (25-50 %) and augmentation all end at t4 ~0.450-0.454 vs ~0.54 for the oracle. Only dense QReg
-is slightly better, clearly at t1-t3 and within ~1-2 SE at t4 (dense16 0.4540, pg-lnfeat 0.4523).
-There is no overfitting and no data limit. So the remaining gap is what the policy cannot infer from
-the canvas (the oracle sees the labels), not the algorithm, capacity or data: ~0.454 is the practical
-ceiling for this frozen backbone + probe. Details: the results sections below.
-
 **Branch.** `policy-algos`, from **f3d6e6b** (Caglar's branch head = the code of every exp36_1 run),
 worktree `repos/canvit-policy-algos`. Not from main: main lacks Caglar's branch, and its fovi port
 (27b1bde geometry) differs from the fovi c399d3b geometry the exp22 backbone was trained on.
