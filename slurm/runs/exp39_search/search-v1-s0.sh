@@ -1,7 +1,7 @@
 #!/bin/bash
 # Visual search (COCO-Search18), FIRST TRAINING RUN. Class-cued search on a frozen
 # pretrained foveated CanViT; task head + policy trained jointly. Target-present and
-# target-absent trials (condition=both). Design and options: canvit_claude/canvit/search/01-summary.md.
+# target-absent trials (condition=both). Options: docs/search.md.
 #
 # Recipe = the search defaults, plus Haoze's augmentations (his use_advanced_augmentations:
 # true => flip, colour jitter + greyscale, rotation, affine, autocontrast; no random crop).

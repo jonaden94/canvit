@@ -194,6 +194,9 @@ Three training objectives, one unified framework and one entry point:
 | `ade20k` | ADE20K semantic-segmentation probe / finetune | ADE20K (`$ADE20K_ROOT`) |
 | `in1k` | ImageNet-1k linear probe / full finetune | ImageNet-1k WebDataset + validation image folder |
 
+A fourth task, `search`, trains class-cued visual search on COCO-Search18 on a frozen
+foveated backbone; see [`docs/search.md`](docs/search.md).
+
 On top of any of the three, the *viewpoint-selection policy* — the network that
 decides where the model looks next — can be trained by reinforcement learning,
 either alone against a frozen model or jointly with the task.
