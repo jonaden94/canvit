@@ -17,6 +17,13 @@ SLURM, both on a V100 (`jupyter` partition), in fp32 because V100 has no bfloat1
 - `slurm/runs/exp39_search/search-v1-s0.sh`: the first training run, the defaults plus Haoze's
   augmentations, 5 h. Needs `TRAIN_COMMIT=`.
 
+Evaluate a finished run from its checkpoint alone (the run's config, architecture and policy are
+read from `best.pt` and `best.policy.pt`; see the README, "Evaluating a checkpoint"):
+
+```bash
+python -m canvit.harness.evaluate search --opts.ckpt <run>/checkpoints/best.pt --opts.out <out>.json
+```
+
 ## What the task does
 
 - **Input:** a COCO-Search18 image, letterboxed to 512×512, plus a cue (one of the 18 class
@@ -183,5 +190,4 @@ for search.
 - `null_cell` (one softmax over cells + "absent").
 - A policy reward on target-absent trials.
 - A sampled-policy eval rule.
-- The standalone `SearchEval`.
 - DDP.

@@ -133,8 +133,13 @@ class In1kRunTask:
         return TrainSpec.probe(bptt=bptt, optim={"head": head_go})
 
     def build_model(self, device, prior_model_config=None):
-        # prior_model_config is unused: the backbone arch comes from the HF repo the head
-        # was built on, so a resume rebuilds the same model from cfg.model_repo already.
+        # prior_model_config (a resume or a standalone eval): build the checkpoint's OWN
+        # architecture; the caller loads all its weights (strict), so cfg.model_repo is not
+        # read. Older checkpoints (no "canvit" key) rebuild from cfg.model_repo as before.
+        if prior_model_config and "canvit" in prior_model_config:
+            from canvit.core.model.classification import CanViTForImageClassification
+            clf = CanViTForImageClassification.from_model_config(prior_model_config).to(device)
+            return clf, clf.head
         # mode-dependent head (fresh probe vs fused DINOv3 probe for finetune).
         from canvit.in1k.model import build_classifier
         clf = build_classifier(self.cfg, device)

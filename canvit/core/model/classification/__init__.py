@@ -252,14 +252,20 @@ class CanViTForImageClassification(
                 f"{path} does not record its architecture (model_config keys: "
                 f"{sorted(mc)}). It predates self-describing downstream checkpoints -- "
                 f"convert it with canvit_train.checkpoint.to_hf instead.")
-        model = cls(
+        model = cls.from_model_config(mc)
+        model.load_state_dict(raw["model_state"], strict=True)
+        return model
+
+    @classmethod
+    def from_model_config(cls, mc: dict) -> "CanViTForImageClassification":
+        """The architecture an ``in1k`` checkpoint's ``model_config`` records, with
+        UNTRAINED weights: the caller loads the checkpoint's ``model_state`` into it."""
+        return cls(
             backbone_name=cast(BackboneName, mc["backbone_name"]),
             model_config=mc["canvit"],
             n_classes=mc["n_classes"],
             glimpse_grid_size=mc.get("glimpse_grid_size"),
         )
-        model.load_state_dict(raw["model_state"], strict=True)
-        return model
 
     @classmethod
     def from_pretrained_with_new_head(

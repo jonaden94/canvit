@@ -565,9 +565,19 @@ layout (`CanViTForPretrainingHFHub`), an `in1k` one the classifier layout
 `evaluate` step with training-time validation, so the two cannot drift:
 
 ```bash
-python -m canvit.harness.evaluate <distill|ade20k|ade20k-dinov3|in1k> \
+python -m canvit.harness.evaluate <distill|ade20k|ade20k-dinov3|in1k|search> \
     --opts.ckpt <run>/checkpoints/best.pt --opts.out <out>.json --cfg.eval-policy <policy>
 ```
+
+**The checkpoint is enough.** Every checkpoint carries its run's full config (the training
+command line and every resolved field, `metadata["run_config"]`; also written to
+`<run>/run_config.json`) and its architecture (`model_config`). The evaluation therefore takes
+the run's own config as its defaults (anything typed on the command line wins; a default that
+changed since the run is reported), rebuilds the model from the checkpoint alone (no backbone
+file via `--cfg.model-repo`), and restores the learned policy from the `.policy.pt` next to the
+checkpoint. To hand a model to someone: `best.pt` + `best.policy.pt`, the code, and the dataset
+(point to their copy with e.g. `--cfg.data-root`). Checkpoints written before 2026-11-22 lack
+the saved config and need their flags typed.
 
 One config per invocation, one JSON artifact, and the resolved protocol recorded in every
 record. `--cfg.eval-policy` is **required** — there is no `auto` guess, because the adequate

@@ -68,3 +68,28 @@ def test_ddp_wrapped_model_is_unwrapped():
     mc = In1kRunTask(In1kConfig(model_repo="somewhere", canvas_grid=32)).model_config(wrapped)
     assert mc["backbone_name"] == "vitb16"
     assert mc["canvit"]["canvas_num_heads"] == 4
+
+
+def _built_from_model_config(task, mc):
+    """``build_model(prior_model_config=mc)``: the path a resume and ``harness.evaluate`` take.
+    ``model_repo='somewhere'`` does not exist, so reading it would fail the test."""
+    import torch
+    model, head = task.build_model(torch.device("cpu"), prior_model_config=mc)
+    assert head is model.head
+    return model
+
+
+def test_ade20k_builds_the_recorded_architecture_without_its_model_repo():
+    from dataclasses import asdict
+    task = Ade20kRunTask(Ade20kConfig(model_repo="somewhere", canvas_grid=32))
+    mc = task.model_config(_fake_model())
+    model = _built_from_model_config(task, {**mc, "canvit": asdict(_ARCH)})
+    assert task.model_config(model) == mc                  # the same architecture, round trip
+
+
+def test_in1k_builds_the_recorded_architecture_without_its_model_repo():
+    from dataclasses import asdict
+    task = In1kRunTask(In1kConfig(model_repo="somewhere", canvas_grid=32))
+    mc = task.model_config(_fake_model())
+    model = _built_from_model_config(task, {**mc, "canvit": asdict(_ARCH)})
+    assert task.model_config(model) == mc

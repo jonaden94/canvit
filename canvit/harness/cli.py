@@ -473,7 +473,43 @@ Command = (
 )
 
 
+def run_config_of(cmd: Any, argv: list[str]) -> dict[str, Any]:
+    """A run's full configuration, saved in every checkpoint it writes (``metadata["run_config"]``)
+    and as ``run_dir/run_config.json``: the exact command line (``argv``, which this code turns
+    back into the same command) and every field it resolved to (``resolved``, the readable record
+    a later replay is checked against)."""
+    import json
+    from dataclasses import asdict
+
+    return {"argv": list(argv), "resolved": json.loads(json.dumps(asdict(cmd), default=str))}
+
+
+def command_from_run_config(run_config: dict[str, Any]) -> tuple[Any, list[str]]:
+    """The training command a checkpoint was written by, rebuilt from its saved run config.
+
+    Returns it with the fields that now resolve differently than recorded (a default changed
+    since the run): the argv replays exactly what was typed, so only defaults can drift."""
+    argv = list(run_config["argv"])
+    cmd = tyro.cli(Command, args=argv)
+    then = _flatten_dict(run_config.get("resolved") or {})
+    now = _flatten_dict(run_config_of(cmd, argv)["resolved"])
+    drift = sorted(k for k in then.keys() | now.keys() if then.get(k) != now.get(k))
+    return cmd, drift
+
+
+def _flatten_dict(d: dict[str, Any], prefix: str = "") -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, v in d.items():
+        if isinstance(v, dict):
+            out.update(_flatten_dict(v, f"{prefix}{k}."))
+        else:
+            out[f"{prefix}{k}"] = v
+    return out
+
+
 def main(argv: list[str] | None = None) -> dict:
+    import sys
+
     import torch
 
     logging.basicConfig(level=logging.INFO,
@@ -482,12 +518,15 @@ def main(argv: list[str] | None = None) -> dict:
     # anything, and it changes both speed and numerics.
     torch.set_float32_matmul_precision("high")
 
+    argv = list(sys.argv[1:] if argv is None else argv)
     cmd: Any = tyro.cli(Command, args=argv)
     task, settings = cmd.build()
+    settings.run_config = run_config_of(cmd, argv)
     spec = resolve_spec(task, cmd.preset, *cmd.lr_wd(), getattr(cmd, "spec", None))
     log.info("task=%s preset=%s n_steps=%d eval_every=%d run_dir=%s",
              task.name, cmd.preset, settings.n_steps, settings.eval_every, settings.run_dir)
     return run(task=task, spec=spec, settings=settings)
 
 
-__all__ = ["Ade20kCmd", "DistillCmd", "HarnessOpts", "In1kCmd", "SearchCmd", "main", "resolve_spec"]
+__all__ = ["Ade20kCmd", "DistillCmd", "HarnessOpts", "In1kCmd", "SearchCmd", "command_from_run_config",
+           "main", "resolve_spec", "run_config_of"]

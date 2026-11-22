@@ -186,15 +186,24 @@ class SearchRunTask:
 
     def build_model(self, device, prior_model_config=None):
         from .model import CanViTForVisualSearch
-        if not self.cfg.model_repo:
+        c = self.cfg
+        if prior_model_config and "canvit" in prior_model_config:
+            # A resume or a standalone eval: the checkpoint's OWN architecture (backbone + head);
+            # the caller loads all its weights (strict), so cfg.model_repo is not read.
+            saved = prior_model_config.get("classes")
+            if saved is not None and list(saved) != list(self._classes()):
+                raise ValueError(f"the checkpoint was trained on the classes {saved}, the data gives "
+                                 f"{self._classes()}: the cue indices would not match.")
+            model = CanViTForVisualSearch.from_model_config(prior_model_config).to(device)
+        elif not c.model_repo:
             raise ValueError("--cfg.model-repo is required: a pretrained FOVEATED CanViT (HF id, local HF "
                              "dir or training .pt).")
-        c = self.cfg
-        model = CanViTForVisualSearch.from_pretrained_backbone(
-            c.model_repo, n_classes=len(self._classes()), cond_dim=c.cond_dim, kind=c.head,
-            width=c.head_width, block_layers=c.head_block_layers, dropout=c.dropout,
-            presence=c.condition == "both",
-        ).to(device)
+        else:
+            model = CanViTForVisualSearch.from_pretrained_backbone(
+                c.model_repo, n_classes=len(self._classes()), cond_dim=c.cond_dim, kind=c.head,
+                width=c.head_width, block_layers=c.head_block_layers, dropout=c.dropout,
+                presence=c.condition == "both",
+            ).to(device)
         if not consumes_full_image(model):
             raise ValueError(f"the search task supports FOVEATED backbones only; {c.model_repo} has patcher "
                              f"{getattr(model.canvit.cfg, 'patcher_name', '?')!r}.")

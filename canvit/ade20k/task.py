@@ -142,9 +142,13 @@ class Ade20kRunTask:
 
     # --- construction ------------------------------------------------------
     def build_model(self, device, prior_model_config=None):
-        # prior_model_config is unused: the backbone arch comes from the HF repo the probe
-        # was built on, so a resume rebuilds the same model from cfg.model_repo already.
-        if self.cfg.probe_repo:
+        # prior_model_config (a resume or a standalone eval): build the checkpoint's OWN
+        # architecture; the caller loads all its weights (strict), so neither cfg.model_repo
+        # nor cfg.probe_repo is read. Checkpoints older than self-describing model_configs
+        # (no "canvit" key) still rebuild from cfg.model_repo below.
+        if prior_model_config and "canvit" in prior_model_config:
+            seg = CanViTForSemanticSegmentation.from_model_config(prior_model_config).to(device)
+        elif self.cfg.probe_repo:
             # Finetune from a PUBLISHED probe (specialize's `init_probe_repo`). A
             # finetune from a random head at the finetune LR crawls — the in1k twin of
             # this was a real, costly bug (8f780ba).

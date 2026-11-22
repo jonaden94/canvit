@@ -70,5 +70,4 @@ The working rules and engineering notes for Claude Code are kept outside the rep
 - **Current state:** the learned policy localises the target as well as **greedy** fixation (always look at the current heatmap's peak, never twice at the same spot), but not better: `found` after the last glimpse is about 0.87 for both, against about 0.80 for random fixations. Its scanpaths, however, are more varied than greedy's. For the documented results (W&B runs, notes), ask Jonathan.
 
 **Missing so far:**
-- No standalone evaluation for search yet: `harness.evaluate` has no `search` subcommand, so search is evaluated only during training.
 - No comparison with **human scanpaths** (e.g. scanpath similarity, fixation-map metrics). COCO-Search18 has the human fixations; the other datasets don't.

@@ -239,7 +239,15 @@ class CanViTForSemanticSegmentation(
                 f"{path} does not record its architecture (model_config keys: "
                 f"{sorted(mc)}). It predates self-describing downstream checkpoints -- "
                 f"load it as model_repo={mc.get('model_repo')!r} + this file as the probe.")
-        model = cls(
+        model = cls.from_model_config(mc)
+        model.load_state_dict(raw["model_state"], strict=True)
+        return model
+
+    @classmethod
+    def from_model_config(cls, mc: dict) -> "CanViTForSemanticSegmentation":
+        """The architecture an ``ade20k`` checkpoint's ``model_config`` records, with
+        UNTRAINED weights: the caller loads the checkpoint's ``model_state`` into it."""
+        return cls(
             backbone_name=cast(BackboneName, mc["backbone_name"]),
             model_config=mc["canvit"],
             num_classes=mc["num_classes"],
@@ -247,8 +255,6 @@ class CanViTForSemanticSegmentation(
             use_ln=mc.get("use_ln", True),
             glimpse_grid_size=mc.get("glimpse_grid_size"),
         )
-        model.load_state_dict(raw["model_state"], strict=True)
-        return model
 
     @classmethod
     def from_pretrained_with_new_probe(

@@ -121,6 +121,10 @@ class RunSettings:
     wandb_entity: str | None = None
     wandb_dir: Path | None = None
     run_name: str | None = None
+    run_config: dict | None = None
+    """The run's full configuration (``cli.run_config_of``: the command line + every resolved
+    field), set by the CLI. Saved in every checkpoint (``metadata["run_config"]``) and as
+    ``run_dir/run_config.json``, so ``harness.evaluate --opts.ckpt`` can rebuild the run alone."""
 
 
 @runtime_checkable
@@ -435,7 +439,13 @@ def run(*, task: RunTask, spec: TrainSpec, settings: RunSettings) -> dict:
         "resume_state": task.resume_state(),
         "training_config_history": cfg_history,
         "provenance_history": prov_history,
+        # This job's full configuration (a programmatic run without one keeps the prior's).
+        "run_config": settings.run_config or prior_meta.get("run_config"),
     }
+    if settings.run_config is not None and run_dir is not None and rank == 0:
+        import json
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "run_config.json").write_text(json.dumps(settings.run_config, indent=1) + "\n")
 
     try:
         last = run_training_loop(

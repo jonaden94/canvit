@@ -41,6 +41,14 @@ class CanViTForVisualSearch(nn.Module):
         return self.canvit.init_state(batch_size=batch_size, canvas_grid_size=canvas_grid_size)
 
     @classmethod
+    def from_model_config(cls, mc: dict) -> CanViTForVisualSearch:
+        """The architecture a ``search`` checkpoint's ``model_config`` records (backbone + head),
+        with UNTRAINED weights: the caller loads the checkpoint's ``model_state`` into it."""
+        return cls(backbone_name=cast(BackboneName, mc["backbone_name"]), model_config=mc["canvit"],
+                   n_classes=mc["n_classes"], glimpse_grid_size=mc.get("glimpse_grid_size"),
+                   **mc["head_kw"])
+
+    @classmethod
     def from_pretrained_backbone(cls, pretrained_repo: str, *, n_classes: int, **head_kw) -> "CanViTForVisualSearch":
         """A pretrained CanViT (HF id, local HF dir or training ``.pt``) + a FRESH head."""
         log.info("Loading pretrained CanViT from %s (fresh %d-class search head)", pretrained_repo, n_classes)
