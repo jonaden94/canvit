@@ -82,6 +82,25 @@ def cancel_slurm_array() -> None:
         log.warning("scancel failed: %s", e)
 
 
+def _grad_split_metrics(params: list, policy_grads: list) -> dict[str, float]:
+    """Norms of the policy term's and the task term's gradient on the model params, and the
+    cosine between them, from THIS rank's gradient before the DDP average and the clip.
+    task = .grad - policy (the rollout's .grad holds their sum)."""
+    dot = pol_sq = task_sq = 0.0
+    for p, gp in zip(params, policy_grads):
+        if p.grad is None:
+            continue
+        g = p.grad.float()
+        gp = torch.zeros_like(g) if gp is None else gp.float()
+        gt = g - gp
+        dot += float((gt * gp).sum())
+        pol_sq += float((gp * gp).sum())
+        task_sq += float((gt * gt).sum())
+    denom = (pol_sq * task_sq) ** 0.5
+    return {"grad_split/policy_norm": pol_sq ** 0.5, "grad_split/task_norm": task_sq ** 0.5,
+            "grad_split/cos_task_policy": dot / denom if denom > 0 else 0.0}
+
+
 def grad_norms_by_module(
     module: Any, *, depth: int = 1, deep_prefixes: tuple[str, ...] = (),
 ) -> dict[str, float]:
@@ -276,12 +295,19 @@ def run_training_loop(
         do_viz = bool(viz_every) and run_dir is not None and step % viz_every == 0 \
             and hasattr(task, "render_viz")
         optimizer.zero_grad()
+        # Task-vs-policy gradient split (log steps only, only when the policy gradient
+        # reaches the model): the rollout additionally returns the policy term's own
+        # gradient; .grad stays the normal training gradient.
+        split = (log_grad_norms and on_log is not None and step % log_every == 0
+                 and joint is not None and spec.policy_grad_to_backbone and bool(trainable))
         result = run_rollout(
             model=model, images=images, task=bound, selector=selector, bptt=spec.bptt,
             branches=branches, canvas_grid_size=canvas_grid, amp_ctx=amp_ctx,
             task_weight=spec.task_weight, collect_viz=do_viz, viz_task=(task if do_viz else None),
-            joint=joint,
+            joint=joint, grad_split_params=(trainable if split else None),
         )
+        grad_split = (_grad_split_metrics(trainable, result.policy_grads)
+                      if result.policy_grads is not None else {})
         # DDP: average gradients across ranks BEFORE clipping (design §9 — nothing is
         # DDP-wrapped, so every trainable module is synced by hand here). Clipping first
         # and averaging after is a different operation and would drift from 1-GPU.
@@ -323,6 +349,7 @@ def run_training_loop(
         # Instantaneous (never smoothed), matching train/loop.py's metrics dict.
         if grad_norm is not None:
             last["grad_norm"] = float(grad_norm)
+        last.update(grad_split)
         if spec.bptt.continue_prob is not None:
             last["continue_prob"] = spec.bptt.continue_prob
         if log_timing and (t_data_total + t_gpu_total) > 0:

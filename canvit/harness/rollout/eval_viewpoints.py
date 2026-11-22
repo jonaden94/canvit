@@ -352,11 +352,17 @@ def deploy_rollout_viewpoints(
     device: torch.device,
     n: int,
     cond: Any = None,
+    prob_maps: list | None = None,
 ) -> list[Viewpoint]:
     """Run the closed-loop deploy rollout, returning the viewpoints it actually took.
 
     ``cond`` (visual search): a zero-argument callable returning the target embedding for
     a FiLM-conditioned scorer; None for every unconditioned policy.
+
+    ``prob_maps``: if a list is passed, the policy's action distribution
+    ``softmax(scores)`` [B, A] (float32, on device) is appended for every glimpse the
+    policy chose (t >= 1; t0 is the FULL anchor and has none). Read-only: selection is
+    unchanged.
 
     ``advance(viewpoint, state, t) -> RecurrentState`` is the task's own single-glimpse
     step (called with ``state=None`` at t0, so it owns its own state init); this function
@@ -388,6 +394,8 @@ def deploy_rollout_viewpoints(
                 vp_type = t0_type if t == 0 else ViewpointType.RANDOM
                 named = sel.select(vp_type=vp_type, ctx=ctx, t=t, batch_size=batch_size,
                                    device=device, state=state)
+                if prob_maps is not None and t > 0:
+                    prob_maps.append(torch.softmax(sel.last_aux["scores"].float(), dim=1))
                 vp = _to_vp(named)
                 taken.append(vp)
                 state = advance(vp, state, t)

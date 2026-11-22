@@ -126,6 +126,9 @@ class RolloutResult:
     n_glimpses: int = 0
     policy_metrics: dict | None = None          # detached per-step means (joint mode)
     viz: RolloutViz | None = None               # only when collect_viz=True
+    policy_grads: list[Tensor | None] | None = None
+    """Only with ``grad_split_params``: the POLICY term's share of those params' gradient,
+    scaled exactly as it entered ``.grad`` (None per param it does not reach)."""
 
 
 def _masked_mean(x: Tensor, mask: Tensor | None) -> Tensor:
@@ -176,6 +179,7 @@ def run_rollout(
     viz_task: Any = None,
     joint: "JointPolicy | None" = None,
     rng: Any = _random,
+    grad_split_params: list[Tensor] | None = None,
 ) -> RolloutResult:
     """Run every branch's rollout and return the total loss (backward already
     called inside, per the TBPTT cadence — no retain_graph). Mirrors the historical
@@ -188,6 +192,12 @@ def run_rollout(
     scales the per-glimpse task loss in the graph; the policy loss is already scaled by
     ``joint.rl_weight`` (== ``policy_weight``). The default 1.0 is byte-exact to the pre-
     weight path (the ``==1.0`` guard makes the parity config hit the identical expression).
+
+    ``grad_split_params`` (diagnostics, log steps only): before each chunk backward, an extra
+    ``torch.autograd.grad`` of the chunk's POLICY term alone w.r.t. these params; the sums
+    come back as ``RolloutResult.policy_grads``. The training backward itself is unchanged
+    (``autograd.grad`` does not touch ``.grad``), so ``.grad - policy_grads`` is the task
+    term's share. Costs one extra backward through the policy path on those steps.
     """
     n_branches = len(branches)
     assert n_branches >= 1
@@ -222,6 +232,19 @@ def run_rollout(
     eff_chunk = n_glimpses if bptt.mode in ("none", "full") else bptt.chunk_size
 
     pol_acc = {"loss": torch.zeros((), device=device), "reward": torch.zeros((), device=device), "n": 0}
+    split_grads: list[Tensor | None] | None = (
+        [None] * len(grad_split_params) if grad_split_params is not None else None)
+
+    def _split_policy_grad(chunk_pol: Tensor | None) -> None:
+        """Accumulate the policy term's gradient for ``grad_split_params`` (see docstring)."""
+        if split_grads is None or chunk_pol is None or not chunk_pol.requires_grad:
+            return
+        assert grad_split_params is not None
+        gs = torch.autograd.grad(chunk_pol / n_glimpses / n_branches, grad_split_params,
+                                 retain_graph=True, allow_unused=True)
+        for i, g in enumerate(gs):
+            if g is not None:
+                split_grads[i] = g if split_grads[i] is None else split_grads[i] + g
     results: list[BranchResult] = []
     # Viz is collected from branch 0 only (sample 0 inside the task's hook), matching
     # the historical training_step. Off by default => the parity path never touches it.
@@ -308,6 +331,7 @@ def run_rollout(
             prev_pi_loss = task.per_image_loss(gout.readout).detach()
 
         chunk_loss = _tw_loss(L, 0)
+        chunk_pol: Tensor | None = None  # the policy terms inside chunk_loss (grad split only)
         total_detached = L.combined.detach().float()
         n_steps = 1
         state = gout.state
@@ -370,6 +394,9 @@ def run_rollout(
                 # per-depth loss so the logged `policy_loss` series stays on the same scale
                 # as earlier harness runs and as rl_train's logged `train_loss`.
                 chunk_loss = chunk_loss + ploss * (n_glimpses / (n_glimpses - 1))
+                if split_grads is not None:
+                    term = ploss * (n_glimpses / (n_glimpses - 1))
+                    chunk_pol = term if chunk_pol is None else chunk_pol + term
                 pol_acc["loss"] = pol_acc["loss"] + ploss.detach()
                 pol_acc["reward"] = pol_acc["reward"] + _masked_mean(reward, rmask).detach()
                 pol_acc["n"] += 1
@@ -394,6 +421,8 @@ def run_rollout(
                     reward=reward, **mask_kw,
                 ) * n_glimpses
                 chunk_loss = chunk_loss + ploss
+                if split_grads is not None:
+                    chunk_pol = ploss if chunk_pol is None else chunk_pol + ploss
                 pol_acc["loss"] = pol_acc["loss"] + ploss.detach() / n_glimpses
                 pol_acc["reward"] = pol_acc["reward"] + _masked_mean(reward, rmask)
                 pol_acc["n"] += 1
@@ -405,7 +434,9 @@ def run_rollout(
             is_chunk_end = ((t + 1) % eff_chunk == 0)
             is_last = (t == n_glimpses - 1)
             if is_chunk_end:
+                _split_policy_grad(chunk_pol)
                 (chunk_loss / n_glimpses / n_branches).backward()  # no retain_graph
+                chunk_pol = None
                 if not is_last:
                     state = RecurrentState(canvas=gout.state.canvas.detach(),
                                            recurrent_cls=gout.state.recurrent_cls.detach())
@@ -419,6 +450,7 @@ def run_rollout(
         # needs its backward. For distill (chunk_size divides its stochastic length
         # by construction) this never fires, so the parity path is unaffected.
         if n_glimpses % eff_chunk != 0:
+            _split_policy_grad(chunk_pol)
             (chunk_loss / n_glimpses / n_branches).backward()
         if is_policy and joint is not None:
             joint.end_rollout()  # per_rollout entropy dual step; a no-op otherwise
@@ -458,7 +490,7 @@ def run_rollout(
         patcher.set_retinas(None)  # a later forward must choose its retinas explicitly
     return RolloutResult(
         total_loss=total_loss, branches=results, n_glimpses=n_glimpses,
-        policy_metrics=policy_metrics, viz=viz,
+        policy_metrics=policy_metrics, viz=viz, policy_grads=split_grads,
     )
 
 

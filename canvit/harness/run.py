@@ -390,12 +390,19 @@ def run(*, task: RunTask, spec: TrainSpec, settings: RunSettings) -> dict:
         # Validation is rank-0 only over the fixed subset (identical samples regardless of
         # world size — the same choice train/loop.py 692-696 makes); the others wait at the
         # barrier. Safe because evaluate() runs under no_grad with no collectives.
-        if is_dist and rank != 0:
+        # Exception: a task with `distributed_eval = True` (distill) is called on EVERY rank;
+        # it splits the fixed subset by rank and all-reduces inside, and only rank 0 logs.
+        distributed = is_dist and getattr(task, "distributed_eval", False)
+        if is_dist and rank != 0 and not distributed:
             ddp.barrier()
             return {}
         t_val = time.perf_counter()
+        extra = {"rank": rank, "world_size": world_size} if distributed else {}
         metrics = task.evaluate(model=model, head=head, val_loader=val_loader, device=device,
-                                step=step, tracker=tracker, run_dir=run_dir, joint=joint)
+                                step=step, tracker=tracker, run_dir=run_dir, joint=joint, **extra)
+        if is_dist and rank != 0:  # distributed eval: rank 0 holds the same metrics and logs them
+            ddp.barrier()
+            return {}
         val_seconds = time.perf_counter() - t_val
         log.info("step %d  eval (%.1fs): %s", step, val_seconds, metrics)
         if tracker is not None:

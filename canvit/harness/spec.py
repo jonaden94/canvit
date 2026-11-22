@@ -350,12 +350,12 @@ def check_spec(spec: TrainSpec, caps: TaskCaps, *, is_dist: bool = False) -> Spe
             "dataset instead of a disjoint shard. Run it on ONE GPU (NGPU=1, "
             "--ntasks-per-node=1)."
         )
-    if is_dist and spec.policy_grad_to_backbone:
-        e.append(
-            "policy_grad_to_backbone=True under DDP is unsupported: the policy->backbone "
-            "path runs through the unwrapped core model and bypasses DDP's AllReduce "
-            "(silent per-rank drift). Use policy_grad_to_backbone=False for multi-GPU."
-        )
+    # policy_grad_to_backbone=True IS supported under DDP (2026-11-22): nothing is wrapped in
+    # DistributedDataParallel; the loop AllReduces the .grad of every trainable model param by
+    # hand after the rollout (loop.py, ddp.allreduce_grads), whichever loss put it there, and
+    # the scorer through joint.allreduce_grads. The guard that refused it here was written with
+    # the harness (88957e6) and never tested; a 2-GPU run (canvit_claude/canvit/
+    # active_pretraining/ddp_policy_val_probe.py) ended with bit-identical params on both ranks.
 
     # bptt / optim internal validity
     e.extend(spec.bptt.errors())

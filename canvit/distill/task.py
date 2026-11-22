@@ -544,14 +544,23 @@ class DistillRunTask:
             },
         )
 
+    distributed_eval = True
+    """Every DDP rank calls :meth:`evaluate` (each validates its share of the val chunks,
+    sums all-reduced in ``validate``); without this flag only rank 0 validates."""
+
     @torch.no_grad()
     def evaluate(self, *, model, head, val_loader, device, step, tracker=None, run_dir=None,
-                 joint=None):
+                 joint=None, rank=0, world_size=1):
         """The full distill validation phase (train/loop.py 689-734): ``validate()`` over
         the fixed val subset, logging its per-timestep cos/recon series through the REAL
         tracker, plus the IN1k linear-probe readout, the curve plots and the PCA figure on
         their historical cadences. Needs the teacher (cached, offline) for val targets.
-        Best-effort: a readout, not parity-gated — returns {} if it can't run."""
+        Best-effort: a readout, not parity-gated — returns {} if it can't run.
+
+        Passes: the configured ``eval_policy`` (``auto`` = fixation_grid for foveated) under
+        the historical keys, and — when the run trains a policy (``joint`` given) — the
+        policy's argmax deploy under ``policy/<key>``. ``val_metric`` (and so best.pt)
+        follows the first pass. ``rank``/``world_size``: see ``distributed_eval``."""
         import tempfile
         from pathlib import Path
 
@@ -583,7 +592,7 @@ class DistillRunTask:
                 self._probe = load_probe(self.cfg.teacher_name, device)
             base_run_dir = run_dir or Path(tempfile.mkdtemp(prefix="distill_eval_"))
 
-            def run_validate(prefix: str, run_dir_: Path) -> dict[str, float]:
+            def run_validate(prefix: str, run_dir_: Path, eval_policy: str) -> dict[str, float]:
                 return validate(
                     exp=exp, step=step, model=model, compute_raw_targets=compute_raw_targets,
                     scene_normalizer=self.scene_norm, cls_normalizer=self.cls_norm,
@@ -604,36 +613,55 @@ class DistillRunTask:
                     # The shared validation-trajectory knob (harness/eval_viewpoints.py).
                     # "auto" (the default) reproduces this task's historical choice
                     # exactly: C2F for uniform, fixation_grid for foveated/square.
-                    eval_policy=self.cfg.eval_policy, foveated_scale=fs, joint=joint,
+                    eval_policy=eval_policy, foveated_scale=fs, joint=joint,
                     override_scale=self.cfg.eval_override_scale,
                     prefix=prefix, probe=self._probe,
                     log_curves=(val_count % max(1, self.cfg.curve_every_n_vals) == 0),
                     log_pca=(val_count % max(1, self.cfg.viz_every_n_vals) == 0),
                     teacher=teacher, log_spatial_stats=self.cfg.log_spatial_stats,
                     teacher_name=self.cfg.teacher_name,
+                    log_policy_maps=(eval_policy == "policy"
+                                     and val_count % max(1, self.cfg.viz_every_n_vals) == 0),
+                    rank=rank, world_size=world_size,
                 )
 
-            patcher = getattr(model, "patcher", None)
-            n_retinas = getattr(patcher, "n_retinas", 1)
-            with amp:
+            from canvit.harness.rollout.eval_viewpoints import resolve
+            passes = [(self.cfg.eval_policy, "")]
+            if joint is not None and resolve(self.cfg.eval_policy, task="distill",
+                                             is_foveated=self.is_foveated(model)) != "policy":
+                passes.append(("policy", "policy/"))
+
+            def run_pass(eval_policy: str, key_prefix: str) -> dict[str, float]:
+                patcher = getattr(model, "patcher", None)
+                n_retinas = getattr(patcher, "n_retinas", 1)
+                tag = key_prefix.rstrip("/")
+                pdir = base_run_dir / tag if tag else base_run_dir
+                vprefix = f"val/{tag}" if tag else "val"
                 if n_retinas == 1:
-                    series = run_validate("val", base_run_dir)
-                else:
-                    # Multi-retina patcher: validate every retina on the same images, return
-                    # each one's series under its name and the mean over retinas under the
-                    # usual keys (so `val_metric` and best.pt follow the mean). Each retina's
-                    # figures go to `<run_dir>/retinas/<retina>/`, its spatial stats under
-                    # the tracker prefix `val/<retina>`.
-                    per: dict[str, dict[str, float]] = {}
-                    try:
-                        for i, name in enumerate(patcher.retina_names):
-                            patcher.set_retinas(i)
-                            per[name] = run_validate(f"val/{name}", base_run_dir / "retinas" / name)
-                    finally:
-                        patcher.set_retinas(None)
-                    keys = set.intersection(*(set(v) for v in per.values()))
-                    series = {k: sum(float(v[k]) for v in per.values()) / n_retinas for k in sorted(keys)}
-                    series.update({f"{name}/{k}": float(v) for name, d in per.items() for k, v in d.items()})
+                    return run_validate(vprefix, pdir, eval_policy)
+                # Multi-retina patcher: validate every retina on the same images, return
+                # each one's series under its name and the mean over retinas under the
+                # usual keys (so `val_metric` and best.pt follow the mean). Each retina's
+                # figures go to `<run_dir>/retinas/<retina>/`, its spatial stats under
+                # the tracker prefix `val/<retina>`.
+                per: dict[str, dict[str, float]] = {}
+                try:
+                    for i, name in enumerate(patcher.retina_names):
+                        patcher.set_retinas(i)
+                        per[name] = run_validate(f"{vprefix}/{name}", pdir / "retinas" / name,
+                                                 eval_policy)
+                finally:
+                    patcher.set_retinas(None)
+                keys = set.intersection(*(set(v) for v in per.values()))
+                out = {k: sum(float(v[k]) for v in per.values()) / n_retinas for k in sorted(keys)}
+                out.update({f"{name}/{k}": float(v) for name, d in per.items() for k, v in d.items()})
+                return out
+
+            series: dict[str, float] = {}
+            with amp:
+                for eval_policy, key_prefix in passes:
+                    series.update({f"{key_prefix}{k}": v
+                                   for k, v in run_pass(eval_policy, key_prefix).items()})
             # `val_metric` is kept as an alias of scene_cos_raw_t{last} -- it is the key
             # exp22-exp36 logged and the one the loop's log line reads. The rest of the
             # series now comes back too, so a standalone evaluation sees more than one
