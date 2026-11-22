@@ -28,6 +28,7 @@ too — without this, the sampling grid stays on CPU and ``grid_sample`` errors
 out at the first forward.
 """
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal
 
@@ -46,6 +47,8 @@ from canvit.core.patcher.conditioning import (
 )
 from canvit.core.patcher.embed import build_embed_head, count_unique_pixels
 from canvit.core.viewpoint import Viewpoint
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -564,3 +567,19 @@ class FoveatedPatcher(Patcher):
         patches = self.conditioner.modulate_kpe_output(patches, scale=scales, retina=ids_dev)  # FiLM
         patches = self.embed_head(patches)
         return patches, self._patch_rowcol_all[ids_dev]
+
+
+def fix_backbone_retina(model: Any, retina: str | None, source: Any) -> None:
+    """A downstream task's ``--cfg.retina``: a multi-retina backbone (``model.canvit.patcher``)
+    is used through the named retina only, fixed for training AND eval (the rollout engine then
+    draws none); required for such a backbone, refused for a single-retina one."""
+    patcher = model.canvit.patcher
+    if getattr(patcher, "n_retinas", 1) > 1:
+        names = patcher.retina_names
+        if retina not in names:
+            raise ValueError(f"{source} is a multi-retina backbone: choose one retina with "
+                             f"--cfg.retina, one of {names} (got {retina!r}).")
+        patcher.fix_retina(names.index(retina))
+        log.info("multi-retina backbone: fixed to retina %d (%s)", names.index(retina), retina)
+    elif retina is not None:
+        raise ValueError(f"--cfg.retina {retina!r} needs a multi-retina backbone; {source} has one retina.")

@@ -1,6 +1,6 @@
 """A search checkpoint is enough to evaluate the model: ``harness.evaluate search --opts.ckpt``
 rebuilds the run's config (saved in the checkpoint), its architecture (``model_config``, no
-backbone file) and its learned policy (``.policy.pt``), and reproduces the training-time
+backbone file) and its learned policy (inside the same file), and reproduces the training-time
 validation exactly. Tiny foveated ViT-S on the synthetic COCO-Search18 from conftest, CPU."""
 
 import json
@@ -11,11 +11,11 @@ import pytest
 import torch
 
 from canvit.harness.cli import command_from_run_config, run_config_of
-from canvit.harness.evaluate import EvalOpts, SearchEval, evaluate, parse
+from canvit.harness.evaluate import SearchEval, evaluate, parse
 from canvit.harness.run import RunSettings, run
 from canvit.search.task import SearchRunTask
 
-from .test_search_task import _TinyTask, _cfg, _rl
+from .test_search_task import _cfg, _rl, _TinyTask
 
 
 class _RecordingTinyTask(_TinyTask):
@@ -39,7 +39,7 @@ def _argv(root: Path, run_dir: Path) -> list[str]:
 
 @pytest.fixture(scope="module")
 def trained(fake_cs18, tmp_path_factory):
-    """Train the tiny search model 2 steps (validation at step 2 writes best.pt + best.policy.pt)."""
+    """Train the tiny search model 2 steps (validation at step 2 writes best.pt)."""
     root, _ = fake_cs18
     run_dir = tmp_path_factory.mktemp("logs") / "g" / "tiny"
     argv = _argv(root, run_dir)
@@ -63,16 +63,16 @@ def test_the_run_config_is_saved_in_the_checkpoint_and_the_run_dir(trained):
 
 
 def test_checkpoint_alone_reproduces_the_training_validation(trained):
-    """No --cfg.model-repo anywhere: the architecture comes from the checkpoint, the policy from
-    best.policy.pt, the config from the checkpoint's run config. Same metrics, exactly."""
+    """ONE file, no --cfg.model-repo anywhere: the architecture, the learned policy and the run
+    config all come from best.pt. Same metrics, exactly."""
     _, run_dir, trained_metrics, _ = trained
     ckpt = run_dir / "checkpoints" / "best.pt"
-    assert ckpt.with_suffix(".policy.pt").is_file()
+    assert list(ckpt.parent.glob("*.policy.pt")) == []     # no separate policy file any more
     cmd, source = parse(["search", "--opts.ckpt", str(ckpt), "--opts.device", "cpu"])
     assert isinstance(cmd, SearchEval) and cmd.cfg.model_repo is None and source["drift"] == []
     task, name = cmd.build()
     record = evaluate(task, cmd.cfg, cmd.opts, task_name=name)
-    assert record["protocol"]["policy"] == str(ckpt.with_suffix(".policy.pt"))
+    assert record["protocol"]["learned_policy"] is True
     assert any(k.endswith("_policy") for k in record["metrics"])
     assert record["metrics"] == {k: float(v) for k, v in trained_metrics.items()}
 

@@ -574,8 +574,8 @@ command line and every resolved field, `metadata["run_config"]`; also written to
 `<run>/run_config.json`) and its architecture (`model_config`). The evaluation therefore takes
 the run's own config as its defaults (anything typed on the command line wins; a default that
 changed since the run is reported), rebuilds the model from the checkpoint alone (no backbone
-file via `--cfg.model-repo`), and restores the learned policy from the `.policy.pt` next to the
-checkpoint. To hand a model to someone: `best.pt` + `best.policy.pt`, the code, and the dataset
+file via `--cfg.model-repo`), and restores the learned policy, which every task saves inside the
+same checkpoint. To hand a model to someone: `best.pt`, the code, and the dataset
 (point to their copy with e.g. `--cfg.data-root`). Checkpoints written before 2026-11-22 lack
 the saved config and need their flags typed.
 

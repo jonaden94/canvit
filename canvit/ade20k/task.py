@@ -24,6 +24,7 @@ from torch import Tensor
 from canvit.ade20k.data import IGNORE_LABEL
 from canvit.ade20k.metrics import ce_loss
 from canvit.core import CanViTForSemanticSegmentation, RecurrentState, sample_at_viewpoint
+from canvit.core.patcher.foveated import fix_backbone_retina
 from canvit.core.policy.features import FEATURE_GROUPS
 from canvit.harness.rollout import GlimpseOut, TaskLoss
 from canvit.harness.rollout.episode import consumes_full_image, derive_glimpse_px
@@ -177,6 +178,7 @@ class Ade20kRunTask:
                 pretrained_repo=self.cfg.model_repo, num_classes=self._num_classes(),
                 dropout=self.cfg.dropout, use_ln=True,
             ).to(device)
+        fix_backbone_retina(seg, self.cfg.retina, self.cfg.model_repo)
         # The OOD footgun that silently ruined run 15025338 (ade20k/train.py:97): a
         # foveated backbone derives its fixation window as `fix_size = scale * H`, so a
         # probe rollout at a scale the backbone never saw makes EVERY glimpse

@@ -136,13 +136,15 @@ class In1kRunTask:
         # prior_model_config (a resume or a standalone eval): build the checkpoint's OWN
         # architecture; the caller loads all its weights (strict), so cfg.model_repo is not
         # read. Older checkpoints (no "canvit" key) rebuild from cfg.model_repo as before.
+        from canvit.core.patcher.foveated import fix_backbone_retina
         if prior_model_config and "canvit" in prior_model_config:
             from canvit.core.model.classification import CanViTForImageClassification
             clf = CanViTForImageClassification.from_model_config(prior_model_config).to(device)
-            return clf, clf.head
-        # mode-dependent head (fresh probe vs fused DINOv3 probe for finetune).
-        from canvit.in1k.model import build_classifier
-        clf = build_classifier(self.cfg, device)
+        else:
+            # mode-dependent head (fresh probe vs fused DINOv3 probe for finetune).
+            from canvit.in1k.model import build_classifier
+            clf = build_classifier(self.cfg, device)
+        fix_backbone_retina(clf, self.cfg.retina, self.cfg.model_repo)
         return clf, clf.head
 
     def canvas_grid(self, model):

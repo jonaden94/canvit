@@ -8,8 +8,8 @@
 (``metadata["run_config"]``: the training command line + every resolved field) and its
 architecture (``model_config``). So the run's own config is the default here (see :func:`parse`;
 anything typed on the command line wins), the model is rebuilt from the checkpoint alone (no
-``--cfg.model-repo`` backbone file), and a ``.policy.pt`` sidecar next to it restores the
-learned policy. Older checkpoints need their flags typed, as before.
+``--cfg.model-repo`` backbone file), and the learned policy saved in it (any task) is restored.
+Older checkpoints need their flags typed, as before.
 
 A training run measures ONE protocol — whatever ``eval_policy`` resolved to for that run.
 This re-measures a finished checkpoint under any protocol, without retraining, which is how
@@ -169,27 +169,27 @@ def evaluate(task: Any, cfg: Any, opts: EvalOpts, *, task_name: str) -> dict[str
     model.load_state_dict(payload["model_state"], strict=True)
     model.eval()
 
-    # The learned policy, when the run trained one: its `.policy.pt` sidecar, restored into
-    # the policy the task builds from its config -- what training-time validation deployed.
-    sidecar = opts.ckpt.with_suffix(".policy.pt")
+    # The learned policy, when the run trained one (any task): restored into the policy the task
+    # builds from its config -- what training-time validation deployed.
+    from canvit.harness.infra.checkpoint import policy_state_of
+
+    policy_state = policy_state_of(payload, path=opts.ckpt, device=device)
     joint = None
-    if sidecar.is_file():
+    if policy_state is not None:
         gen = torch.Generator(device=device).manual_seed(0)
         joint = task.build_policy(model, device=device, canvas_grid=task.canvas_grid(model),
                                   generator=gen)
-        joint.load_state_dict(torch.load(sidecar, map_location=device, weights_only=False))
-        log.info("restored the policy from %s", sidecar)
+        joint.load_state_dict(policy_state)
+        log.info("restored the learned policy from the checkpoint")
     else:
-        log.warning("no policy next to the checkpoint (%s): a learned-policy protocol has nothing to "
-                    "deploy (search drops its 'policy' rule). Copy the .policy.pt along with a "
-                    "checkpoint whose run trained a policy.", sidecar)
+        log.info("the checkpoint holds no learned policy (its run trained none)")
 
     val_loader = task.build_val_loader()
     assert val_loader is not None, f"{task_name} has no val loader for this config"
     is_foveated = task.is_foveated(model)
     protocol = _resolved_protocol(cfg, task_name, is_foveated)
     protocol["adopted_from_checkpoint"] = adopted
-    protocol["policy"] = str(sidecar) if joint is not None else None
+    protocol["learned_policy"] = joint is not None
     log.info("evaluating %s under %s", opts.ckpt, protocol)
 
     step = int(payload.get("step", 0))
@@ -217,7 +217,7 @@ class Ade20kEval:
 
     cfg: Ade20kConfig = field(default_factory=Ade20kConfig)
     rl: JointPolicyConfig = field(default_factory=JointPolicyConfig)
-    """The policy config; only used when the checkpoint has a ``.policy.pt`` sidecar."""
+    """The policy config; only used when the checkpoint holds a learned policy."""
     opts: EvalOpts = field(default_factory=lambda: EvalOpts(ckpt=Path()))
 
     def build(self):
@@ -231,7 +231,7 @@ class In1kEval:
 
     cfg: In1kConfig = field(default_factory=In1kConfig)
     rl: JointPolicyConfig = field(default_factory=JointPolicyConfig)
-    """The policy config; only used when the checkpoint has a ``.policy.pt`` sidecar."""
+    """The policy config; only used when the checkpoint holds a learned policy."""
     opts: EvalOpts = field(default_factory=lambda: EvalOpts(ckpt=Path()))
 
     def build(self):
@@ -242,7 +242,7 @@ class In1kEval:
 @dataclass
 class SearchEval:
     """Class-cued visual search (COCO-Search18): found / hit / presence per glimpse under each
-    of ``cfg.eval_policies`` (random, greedy, and the learned policy from ``.policy.pt``)."""
+    of ``cfg.eval_policies`` (random, greedy, and the learned policy saved in the checkpoint)."""
 
     cfg: SearchConfig = field(default_factory=SearchConfig)
     rl: JointPolicyConfig = field(default_factory=search_policy_config)

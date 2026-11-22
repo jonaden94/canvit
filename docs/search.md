@@ -18,7 +18,7 @@ SLURM, both on a V100 (`jupyter` partition), in fp32 because V100 has no bfloat1
   augmentations, 5 h. Needs `TRAIN_COMMIT=`.
 
 Evaluate a finished run from its checkpoint alone (the run's config, architecture and policy are
-read from `best.pt` and `best.policy.pt`; see the README, "Evaluating a checkpoint"):
+read from `best.pt`; see the README, "Evaluating a checkpoint"):
 
 ```bash
 python -m canvit.harness.evaluate search --opts.ckpt <run>/checkpoints/best.pt --opts.out <out>.json
@@ -129,7 +129,7 @@ Task config, `--cfg.<name>` (dashes, e.g. `--cfg.presence-loss ce`):
 | option | default | choices / meaning |
 |---|---|---|
 | `model_repo` | required | the foveated backbone |
-| `retina` | None | a multi-retina backbone is used through this one retina (fixed for training and eval), by name, e.g. `cmf0.75_res65_cps6`; required for such a backbone, refused otherwise |
+| `retina` | None | a multi-retina backbone is used through this one retina (fixed for training and eval), by name, e.g. `cmf0.75_res65_cps6`; required for such a backbone, refused otherwise. The same option exists for `ade20k` and `in1k` |
 | `condition` | `both` | `tp` = target-present only (no presence head) |
 | `split` | 1 | 2 = the dataset's split2 (needs `condition tp`) |
 | `scene_size` | 512 | scene side in px |
