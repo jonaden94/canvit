@@ -67,7 +67,7 @@ def _targets(images, _sz, *, fail: bool = False):
 
 
 def _run(eval_policy: str, *, rank: int = 0, world_size: int = 1, fail: bool = False,
-         run_dir=None, log_policy_maps: bool = False) -> dict[str, float]:
+         run_dir=None, log_policy_maps: bool = False, log_pca: bool = False) -> dict[str, float]:
     from canvit.distill.validate import validate
 
     # One CPU thread in EVERY process: CPU matmul rounding depends on the thread count, and
@@ -83,14 +83,18 @@ def _run(eval_policy: str, *, rank: int = 0, world_size: int = 1, fail: bool = F
             scene_normalizer=pnorm, cls_normalizer=cnorm, val_batches=_batches(), device=_DEV,
             canvas_grid_size=_G, scene_size_px=_G * 16, glimpse_size_px=128,
             run_dir=run_dir, n_eval_viewpoints=_T, eval_policy=eval_policy, joint=joint,
-            log_policy_maps=log_policy_maps, rank=rank, world_size=world_size,
+            log_policy_maps=log_policy_maps, log_pca=log_pca, rank=rank, world_size=world_size,
+            # validate asserts a teacher when log_pca; it is only used for the IN1k teacher
+            # accuracy (needs a probe, none here), so a placeholder satisfies it.
+            teacher=(object() if log_pca else None),  # type: ignore[arg-type]
         )
     finally:
         torch.set_num_threads(n_threads)
 
 
 def test_policy_pass_reports_entropy_and_saves_maps(tmp_path):
-    out = _run("policy", run_dir=tmp_path, log_policy_maps=True)
+    # log_pca too: the step-0 viz draws the policy trajectory's boxes (smoke 17481820 failed there)
+    out = _run("policy", run_dir=tmp_path, log_policy_maps=True, log_pca=True)
     n_actions = _build()[1].policy_selector.vp_flat.shape[0]  # uniform patcher: scales x 16^2
     ents = [out[f"policy_entropy_t{t}"] for t in range(1, _T)]
     assert len(ents) == _T - 1 and "policy_entropy_t0" not in out

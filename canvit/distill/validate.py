@@ -157,7 +157,7 @@ def _deploy_viewpoints(*, model, images, joint, n, canvas_grid_size, prob_maps=N
     (ade20k/in1k collect their readout DURING selection and pay nothing extra.)
     """
     from canvit.harness.rollout.eval_viewpoints import deploy_rollout_viewpoints
-    from canvit.harness.rollout.viewpoint import ViewpointType
+    from canvit.harness.rollout.viewpoint import Viewpoint, ViewpointType
 
     B = images.shape[0]
 
@@ -166,8 +166,12 @@ def _deploy_viewpoints(*, model, images, joint, n, canvas_grid_size, prob_maps=N
             state = model.init_state(batch_size=B, canvas_grid_size=canvas_grid_size)
         return model(image=images, state=state, viewpoint=vp).state
 
-    return deploy_rollout_viewpoints(joint=joint, advance=advance, t0_type=ViewpointType.FULL,
-                                     batch_size=B, device=images.device, n=n, prob_maps=prob_maps)
+    vps = deploy_rollout_viewpoints(joint=joint, advance=advance, t0_type=ViewpointType.FULL,
+                                    batch_size=B, device=images.device, n=n, prob_maps=prob_maps)
+    # The selectors return core Viewpoints; the viz (PCA panel boxes) needs the named
+    # harness Viewpoint, like open_loop_viewpoints returns.
+    return [Viewpoint(centers=v.centers, scales=v.scales, name="full" if t == 0 else f"policy_t{t}")
+            for t, v in enumerate(vps)]
 
 
 def _plot_policy_maps(*, image: np.ndarray, maps: list[np.ndarray], viewpoints: list):
