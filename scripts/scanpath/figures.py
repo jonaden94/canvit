@@ -882,6 +882,115 @@ def priors_index_figure(recs: list[dict], results: Path, out: Path, t_max: int =
     return True
 
 
+# --------------------------------------------------------------------------------------- temperature sweep
+TAU_EVALS = [("coco_search18", "tp_validation", "COCO-Search18 TP"), ("coco_search18", "ta_validation",
+             "COCO-Search18 TA"), ("coco_freeview", "validation", "COCO-FreeView"), ("mit1003", "all", "MIT1003")]
+TAUS = np.geomspace(0.25, 128.0, 37)
+
+
+def temperature_sweep(rec: dict, chunk: int = 20000) -> dict | None:
+    """IG over the centre bias (bits/fix, per image as pysaliency) and mean map entropy (nats, over the image's
+    cells) of a CanViT record's saved validation predictions at every tau in TAUS, plus tau = 1 and the fitted tau.
+    IG(tau) = the record's IG + the exact per-fixation shift of log p(cell) from tau = 1 (as evaluate.py's tempered
+    diagnostic). Cached in <record dir>/temperature/<stem>.json (recomputed when the .npz is newer)."""
+    from scipy.special import log_softmax
+
+    from canvit.scanpath.models import _scored_cells, without_start_fixations
+    from canvit.scanpath.priors import image_average
+    cache = rec["path"].parent / "temperature" / f"{rec['path'].stem}.json"
+    npz = rec["path"].with_suffix(".npz")
+    if cache.exists() and (not npz.exists() or cache.stat().st_mtime > npz.stat().st_mtime):
+        return json.loads(cache.read_text())
+    pred = predictions(rec)
+    if pred is None:
+        return None
+    st, fx, model = pred
+    fit = rec.get("diagnostics", {}).get("tempered_global", {})
+    taus = np.unique(np.concatenate([TAUS, [1.0], [fit["temperature"]] if fit else []]))
+    sx = without_start_fixations(fx)
+    shift, H = np.zeros((len(taus), len(sx))), np.zeros((len(taus), len(sx)))
+    for i in range(0, len(sx), chunk):
+        logits, cells, logcount, _ = _scored_cells(model, st, sx[i:i + chunk])
+        rows = np.arange(len(cells))
+        base = log_softmax(logits + logcount, axis=1)[rows, cells]
+        for j, tau in enumerate(taus):
+            lp = log_softmax(logits / tau + logcount, axis=1)
+            shift[j, i:i + len(cells)] = (lp[rows, cells] - base) / np.log(2)
+            H[j, i:i + len(cells)] = -(np.exp(lp) * np.where(np.isfinite(lp), lp, 0.0)).sum(1)
+    ig0 = rec["metrics"]["ig_image"]
+    res = {"record": str(rec["path"]), "taus": taus.tolist(), "fitted_tau": fit.get("temperature"),
+           "fitted_ig_record": fit.get("ig_image"), "ig_image": [ig0 + image_average(s, sx.n) for s in shift],
+           "entropy_fix": H.mean(1).tolist(), "n_fixations": len(sx)}
+    cache.parent.mkdir(exist_ok=True)
+    cache.write_text(json.dumps(res, indent=1))
+    return res
+
+
+def temperature_figure(recs: list[dict], out: Path) -> dict[str, str]:
+    """How much the temperature matters for the policy (validation): top, IG over the centre bias vs tau (log
+    axis); bottom, the mean entropy of the policy's map vs tau with the humans' entropy (KDE of K_SUBJECTS
+    subjects' fixation t, median over stimuli, mean over t = 1..TRAINED_FIXATIONS). tau = 1 (as trained) and the
+    tau fitted on training scanpaths are marked. Macros tauIG<One|Fit><tag>, tauFit<tag>."""
+    rows = []
+    for ds, split, title in TAU_EVALS:
+        rec = next(iter(canvit_records(recs, ds, split)), None)
+        sw = temperature_sweep(rec) if rec is not None else None
+        if sw is not None:
+            rows.append((ds, split, title, rec, sw))
+    if not rows:
+        print("temperature_figure: no CanViT predictions yet")
+        return {}
+    color, marker, label = STYLE["canvit"]
+    fig, axes = plt.subplots(2, len(rows), figsize=(TEXTWIDTH_IN, 3.2), sharex=True, sharey="row", squeeze=False,
+                             layout="constrained")
+    macros = {}
+    for j, (ds, split, title, rec, sw) in enumerate(rows):
+        taus, ig, H = np.array(sw["taus"]), np.array(sw["ig_image"]), np.array(sw["entropy_fix"])
+        one, fit = int(np.argmin(abs(taus - 1.0))), sw["fitted_tau"]
+        k = int(np.argmin(abs(taus - fit))) if fit else None
+        ax, axh = axes[:, j]
+        ax.axhline(0, color=STYLE["centre_bias"][0], lw=0.5)
+        ax.plot(taus, ig, color=color, lw=0.8)
+        axh.plot(taus, H, color=color, lw=0.8)
+        st, fx = dataset(ds, rec["protocol"].get("part", eval_part(ds)))
+        mask = np.ones(len(fx.scanpaths), dtype=bool)
+        if ds == "coco_search18":
+            mask = present_mask(fx) if split.startswith("tp") else ~present_mask(fx)
+        hum = human_entropy(st, fx, mask, t_max=TRAINED_FIXATIONS)
+        if hum:
+            h_ref = float(np.mean([v[0] for v in hum.values()]))
+            axh.axhline(h_ref, color=STYLE["human"][0], ls="--", lw=0.8)
+            axh.annotate(f"humans {h_ref:.1f}", (taus[-1], h_ref), xytext=(0, -2), textcoords="offset points",
+                         ha="right", va="top", fontsize=FS - 1)
+        for a, y in ((ax, ig), (axh, H)):
+            a.plot(taus[one], y[one], marker="o", mfc="white", mec=color, ms=4, ls="none")
+            if k is not None:
+                a.plot(taus[k], y[k], marker=marker, color=color, ms=4, ls="none")
+        tag = {"tp_validation": "TP", "ta_validation": "TA"}.get(split, {"coco_freeview": "FV", "mit1003": "MIT"}
+                                                                  .get(ds, ""))
+        macros[f"tauIGOne{tag}"] = _num(ig[one])
+        if k is not None:
+            macros[f"tauIGFit{tag}"], macros[f"tauFit{tag}"] = _num(ig[k]), f"{fit:.1f}"
+            if sw["fitted_ig_record"] is not None and abs(ig[k] - sw["fitted_ig_record"]) > 0.01:
+                print(f"temperature_figure: {title}: sweep IG at fitted tau {ig[k]:.3f} != record "
+                      f"{sw['fitted_ig_record']:.3f}")
+        ax.set(title=title + (f"\nfitted $\\tau$ = {fit:.1f}" if fit else ""), xscale="log")
+        axh.set(xlabel=r"temperature $\tau$")
+        despine(ax), despine(axh)
+    axes[0, 0].set(ylabel="IG over centre bias\n(bits/fix)", ylim=(-12, 1.5))  # tau < ~0.5 runs off the bottom
+    axes[1, 0].set_ylabel("map entropy (nats)")
+    handles = [plt.Line2D([], [], color=color, lw=0.8),
+               plt.Line2D([], [], marker="o", mfc="white", mec=color, ms=4, ls="none"),
+               plt.Line2D([], [], marker=marker, color=color, ms=4, ls="none"),
+               plt.Line2D([], [], color=STYLE["human"][0], ls="--", lw=0.8)]
+    fig.legend(handles, [label + "; free viewing: cue mixture", r"$\tau$ = 1 (as trained)",
+                         r"$\tau$ fitted on training scanpaths",
+                         f"humans (KDE of {K_SUBJECTS} subjects, t = 1-{TRAINED_FIXATIONS})"],
+               loc="outside upper center", ncol=2)
+    save(fig, out / "temperature.pdf")
+    return macros
+
+
 # The evaluated (dataset, split) pairs in the order of the cross-dataset figure and table.
 EVALS = [("coco_search18", "tp_validation", "COCO-Search18 TP"), ("coco_search18", "ta_validation", "COCO-Search18 TA"),
          ("coco_freeview", "validation", "COCO-FreeView"), ("mit1003", "all", "MIT1003"), ("cat2000", "all", "CAT2000"),
@@ -1157,6 +1266,7 @@ def main() -> None:
     res_macros |= policy_vs_human(recs, tabs)
     res_macros |= priors_figure(recs, a.results, figs, tabs)
     priors_index_figure(recs, a.results, figs)
+    res_macros |= temperature_figure(recs, figs)
 
     sacc = {}
     for slug, cond, title in PANELS:
