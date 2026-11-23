@@ -54,10 +54,13 @@ class CanViTConfig:
     #   policy_token_mode "readonly": the tokens attend to all local tokens and read the
     #     canvas, nothing attends to them and they do not write (pretrained path unchanged);
     #   "full": ordinary local tokens (everything attends to them, they write).
+    #   "isolated": like "readonly", but with OWN weights per block / read / write and reading
+    #     the reconstruction path only through detached tensors (+ receiving the canvas writes),
+    #     so the policy loss reaches no reconstruction parameter (core/model/base/policy_stream.py).
     #   policy_token_reinit: start every glimpse from the learned init (like the registers)
     #     instead of carrying them over (like recurrent_cls).
     n_policy_tokens: int = 0
-    policy_token_mode: Literal["readonly", "full"] = "readonly"
+    policy_token_mode: Literal["readonly", "full", "isolated"] = "readonly"
     policy_token_reinit: bool = False
     policy_heads: int = 8
     policy_grid: int = 32

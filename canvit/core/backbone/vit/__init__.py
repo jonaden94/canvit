@@ -154,6 +154,17 @@ class ViTBlock(nn.Module):
         h = self.norm2(x)
         return x + (self._alpha0 + a2) * self.mlp((1.0 + g2) * h + b2)
 
+    def forward_with_kv(self, x: Tensor, rope: RoPE) -> tuple[Tensor, Tensor, Tensor]:
+        """Standard (unmodulated) block on ``x`` exactly as ``forward`` (the same ops), also
+        returning the attention's k, v [B, H, N, D_h] (RoPE applied to k) for an isolated
+        policy stream that reads them detached."""
+        assert not self.modulated, "isolated policy tokens are not implemented for modulated blocks"
+        B, N, D = x.shape
+        q, k, v = self.attn._qkv(self.norm1(x), rope)
+        a = F.scaled_dot_product_attention(q, k, v, scale=self.attn.scale)
+        x = x + self.ls1(self.attn.proj(a.transpose(1, 2).reshape(B, N, D)))
+        return x + self.ls2(self.mlp(self.norm2(x))), k, v
+
     def forward_with_readers(self, x: Tensor, rope: RoPE, readers: Tensor) -> tuple[Tensor, Tensor]:
         """Standard (unmodulated) block on ``x`` exactly as ``forward``, plus read-only tokens
         that use the same weights but attend one way (see SelfAttention.forward_with_readers)."""

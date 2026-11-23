@@ -124,9 +124,9 @@ def build_policy(
     if n_tok:
         if not isinstance(obj, PG):
             raise ValueError(f"policy tokens are trained by PG only, got objective={rl.objective!r}")
-        # No detaching possible: the tokens are processed by the backbone. run() refuses a
-        # spec with policy_grad_to_backbone=False for a token model (rl.feats_detached is
-        # ignored here; the spec is the one switch).
+        # readonly/full: no detaching possible, the tokens are processed by the backbone;
+        # isolated: detached by construction. run() checks the spec against the mode
+        # (rl.feats_detached is ignored here; the spec is the one switch).
         grid = canvit.cfg.policy_grid
         tok_random = RandomSelector(
             is_foveated=is_foveated, foveated_scale=foveated_scale, min_viewpoint_scale=min_viewpoint_scale)
@@ -134,7 +134,8 @@ def build_policy(
             model=canvit, vp_flat=fixation_candidates(grid).reshape(-1, 3).to(device),
             fallback=tok_random, mode="sample", generator=generator)
         jp = JointPolicy(
-            policy_selector=tok_sel, random_selector=tok_random, scorer=canvit.policy_readout,  # type: ignore[arg-type]
+            policy_selector=tok_sel, random_selector=tok_random,
+            scorer=canvit.policy_parameters_module(),  # type: ignore[arg-type]
             objective=obj, rl_weight=rl.rl_weight, keep_random_branch=rl.keep_random_branch,
             target_momentum=rl.target_momentum, device=device, prime_target=1.0, prime_warmup=0,
             reward=reward,

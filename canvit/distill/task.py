@@ -361,6 +361,7 @@ class DistillRunTask:
             canvit=model, rl=self.cfg.rl, feature_groups=POLICY_FEATURE_GROUPS, device=device,
             canvas_grid=canvas_grid, min_viewpoint_scale=self.cfg.min_viewpoint_scale,
             foveated_scale=self.cfg.foveated_scale, generator=generator, encode_model=None,
+            scorer_input_norm=self.cfg.policy_scorer_input_norm,
         )
 
     def policy_feature_groups(self):

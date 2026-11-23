@@ -20,6 +20,7 @@ from canvit.core.backbone.vit import ViTBackbone
 from canvit.core.coords import grid_coords
 from canvit.core.model.base.config import CanViTConfig
 from canvit.core.model.base.policy_readout import PolicyTokenReadout
+from canvit.core.model.base.policy_stream import PolicyStream
 from canvit.core.modulation import Modulation, TokenModulation
 from canvit.core.patcher import Patcher, create_patcher
 from canvit.core.rope import RoPE, compute_rope, make_rope_periods, rope_apply_with_prefix
@@ -126,6 +127,17 @@ def compute_rw_positions(
         read_after = []
 
     return tuple(read_after), tuple(write_after)
+
+
+class _PolicyParamView(nn.Module):
+    """Groups the isolated policy's parameters (token init, stream, readout), which the model
+    registers itself, into one module for the policy optimizer group / clip / checkpoint state."""
+
+    def __init__(self, token_init: nn.Parameter | None, stream: nn.Module, readout: nn.Module) -> None:
+        super().__init__()
+        self.token_init = token_init
+        self.stream = stream
+        self.readout = readout
 
 
 class CanvasSelfAttnBlock(nn.Module):
@@ -268,6 +280,7 @@ class CanViT(nn.Module):
         # recurrent_cls; the readout turns them + the canvas into a fixation distribution.
         self.policy_token_init: nn.Parameter | None = None
         self.policy_readout: PolicyTokenReadout | None = None
+        self.policy_stream: PolicyStream | None = None
         if cfg.n_policy_tokens > 0:
             self.policy_token_init = nn.Parameter(
                 torch.randn(1, cfg.n_policy_tokens, local_dim) * local_scale)
@@ -277,6 +290,13 @@ class CanViT(nn.Module):
             log.info("Policy tokens: %d (%s, reinit=%s), %d heads each, %dx%d action grid",
                      cfg.n_policy_tokens, cfg.policy_token_mode, cfg.policy_token_reinit,
                      cfg.policy_heads, cfg.policy_grid, cfg.policy_grid)
+            if cfg.policy_token_mode == "isolated":
+                self.policy_stream = PolicyStream(
+                    n_blocks=n_blocks, local_dim=local_dim, num_heads=backbone.num_heads,
+                    ffn_ratio=backbone.ffn_ratio, layerscale_init=backbone.layerscale_init,
+                    canvas_dim=canvas_dim, canvas_num_heads=cfg.canvas_num_heads,
+                    n_reads=len(read_after), n_writes=len(write_after))
+                self.policy_stream.copy_from_trunk(self)
 
         self.vpe: VPEEncoder | None = None
         if cfg.enable_vpe:
@@ -346,7 +366,24 @@ class CanViT(nn.Module):
         the order of ``fixation_candidates(G)``."""
         assert self.policy_readout is not None and state.policy_tokens is not None, (
             "policy_log_probs needs a model with n_policy_tokens > 0 and a state from it")
-        return self.policy_readout(state.policy_tokens, self.get_spatial(state.canvas))
+        spatial = self.get_spatial(state.canvas)
+        if self.policy_stream is not None:  # isolated: the policy loss must not reach the canvas
+            spatial = spatial.detach()
+        return self.policy_readout(state.policy_tokens, spatial)
+
+    def policy_parameters_module(self) -> nn.Module:
+        """The module whose parameters are the POLICY's (optimizer group, separate clip, policy
+        checkpoint state): the readout for "readonly"/"full" (the tokens' init stays with the
+        model, as their gradient is mixed with the task's anyway); for "isolated" a view over the
+        token init, the stream and the readout -- none of them gets a task gradient."""
+        assert self.policy_readout is not None, "no policy tokens"
+        if self.policy_stream is None:
+            return self.policy_readout
+        view = self.__dict__.get("_policy_view")
+        if view is None:
+            view = _PolicyParamView(self.policy_token_init, self.policy_stream, self.policy_readout)
+            self.__dict__["_policy_view"] = view  # NOT a registered submodule (no duplicate keys)
+        return view
 
     def _get_spatial_positions(self, canvas: Tensor, canvas_grid_size: int | None = None) -> Tensor:
         if canvas_grid_size is None:
@@ -398,6 +435,7 @@ class CanViT(nn.Module):
                          if (self.cfg.policy_token_reinit or carried is None) else carried)
         full_policy = policy_in is not None and self.cfg.policy_token_mode == "full"
         readers = policy_in if (policy_in is not None and not full_policy) else None
+        stream = self.policy_stream if readers is not None else None
         n_pol_local = policy_in.shape[1] if full_policy else 0  # type: ignore[union-attr]
 
         tokens = LocalTokens(vpe=vpe_tok, recurrent_cls=recurrent_cls, registers=registers,
@@ -440,6 +478,9 @@ class CanViT(nn.Module):
             block_mod = mod.block[block_idx] if mod is not None else None
             if readers is None:
                 local = self.backbone.blocks[block_idx](local, local_rope_backbone, block_mod)
+            elif stream is not None:  # isolated: own weights, reads the block's k, v detached
+                local, k_blk, v_blk = self.backbone.blocks[block_idx].forward_with_kv(local, local_rope_backbone)
+                readers = stream.blocks[block_idx].forward_isolated(readers, k_blk, v_blk)
             else:  # the local stream's computation is unchanged; readers attend to it one way
                 local, readers = self.backbone.blocks[block_idx].forward_with_readers(
                     local, local_rope_backbone, readers)
@@ -450,7 +491,11 @@ class CanViT(nn.Module):
                     query=local, kv=canvas, query_rope=local_rope_xattn, kv_rope=spatial_rope, mod=read_mod
                 )
                 local = local + read_out
-                if readers is not None:
+                if stream is not None:
+                    assert empty_xattn_rope is not None
+                    readers = stream.read(read_idx, readers, canvas, query_rope=empty_xattn_rope,
+                                          kv_rope=spatial_rope)
+                elif readers is not None:
                     readers = readers + self.canvas_read[read_idx](
                         query=readers, kv=canvas, query_rope=empty_xattn_rope, kv_rope=spatial_rope)
                 read_idx += 1
@@ -461,6 +506,10 @@ class CanViT(nn.Module):
                     query=canvas, kv=local, query_rope=spatial_rope, kv_rope=local_rope_xattn, mod=write_mod
                 )
                 canvas = write_out if self.cfg.canvas_update_mode == "convex" else canvas + write_out
+                if stream is not None:  # the tokens receive the write too (detached local tokens)
+                    assert empty_xattn_rope is not None
+                    readers = stream.write(write_idx, readers, local, query_rope=empty_xattn_rope,
+                                           kv_rope=local_rope_xattn)
                 write_idx += 1
 
         # Consolidate the memory between glimpses: self-attention over the canvas

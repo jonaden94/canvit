@@ -52,6 +52,10 @@ class Config:
     rl: JointPolicyConfig = field(default_factory=JointPolicyConfig)
     """Joint task+policy training (P4b). OFF by default => byte-identical to
     pre-P4b pretraining. See :class:`JointPolicyConfig`."""
+    policy_scorer_input_norm: Literal["batch", "none"] = "batch"
+    """Input normalisation of the separate policy scorer (U-Net on the canvas; not used by policy
+    tokens): "batch" = its per-channel BatchNorm (the historical default), "none" = without it,
+    as the search task does (no BatchNorm needed there)."""
     chunk_size: int = 2  # BPTT chunk size (glimpses per chunk, gradient flows within)
     continue_prob: float = 0.5  # prob of adding another chunk to trajectory
     enable_scene_patches_loss: bool = True  # Scene (canvas) patch reconstruction loss

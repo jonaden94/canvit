@@ -293,8 +293,14 @@ def run(*, task: RunTask, spec: TrainSpec, settings: RunSettings) -> dict:
         # policy gradient reached the backbone, silently (found 2026-11-22; no launcher had
         # set either). The spec wins; a policy-token model cannot detach at all.
         sel = joint.policy_selector
-        if getattr(getattr(getattr(model, "module", model), "cfg", None), "n_policy_tokens", 0):
-            if not spec.policy_grad_to_backbone:
+        core_cfg = getattr(getattr(model, "module", model), "cfg", None)
+        if getattr(core_cfg, "n_policy_tokens", 0):
+            isolated = getattr(core_cfg, "policy_token_mode", None) == "isolated"
+            if isolated and spec.policy_grad_to_backbone:
+                raise ValueError(
+                    "isolated policy tokens read the reconstruction path only detached, so no policy "
+                    "gradient reaches it: use --spec.policy-grad-to-backbone False")
+            if not isolated and not spec.policy_grad_to_backbone:
                 raise ValueError(
                     "policy tokens are processed by the backbone, so the policy gradient reaches "
                     "it by construction: use --spec.policy-grad-to-backbone True")
@@ -330,10 +336,17 @@ def run(*, task: RunTask, spec: TrainSpec, settings: RunSettings) -> dict:
         seed_payload = load_checkpoint(settings.seed_ckpt, device)
         # weights only: no optimizer/scheduler => the run starts a fresh schedule.
         # A model with policy tokens seeded from one without: only those params start fresh.
-        new_params = (("policy_token_init", "policy_readout.")
-                      if getattr(getattr(getattr(model, "module", model), "cfg", None), "n_policy_tokens", 0) else ())
+        core = getattr(model, "module", model)
+        new_params = (("policy_token_init", "policy_readout.", "policy_stream.")
+                      if getattr(getattr(core, "cfg", None), "n_policy_tokens", 0) else ())
         restore_into(seed_payload, model=model, joint=joint, path=settings.seed_ckpt, device=device,
                      new_param_prefixes=new_params)
+        stream = getattr(core, "policy_stream", None)
+        if stream is not None and not any(k.startswith("policy_stream.") for k in seed_payload["model_state"]):
+            # An isolated stream seeded from a model without one starts as a copy of the
+            # (now pretrained) trunk: at step 0 it computes what read-only tokens would.
+            stream.copy_from_trunk(core)
+            log.info("SEED: isolated policy stream initialised from the seeded trunk")
         start_step = 0
     else:
         log.info("FRESH mode: no checkpoint, starting from scratch")

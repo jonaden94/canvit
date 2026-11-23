@@ -192,3 +192,114 @@ def test_deploy_takes_the_argmax_cell():
         with torch.no_grad():
             idx = m.policy_log_probs(states[t - 1]).argmax(-1)
         assert torch.equal(vps[t].centers, table[idx, :2])
+
+
+# --- isolated policy stream (policy_token_mode="isolated") ------------------------------------
+
+def _policy_ids(m) -> set[int]:
+    return {id(p) for p in m.policy_parameters_module().parameters()}
+
+
+def test_isolated_tokens_leave_the_pretrained_computation_bit_identical():
+    base, tok = _model(), _model(n_policy_tokens=_K, policy_token_mode="isolated")
+    tok.load_state_dict(base.state_dict(), strict=False)
+    images = torch.randn(_B, 3, _IMG, _IMG, generator=torch.Generator().manual_seed(1))
+    for ob, ot in zip(_roll(base, images), _roll(tok, images)):
+        assert torch.equal(ob.state.canvas, ot.state.canvas)
+        assert torch.equal(ob.state.recurrent_cls, ot.state.recurrent_cls)
+        assert torch.equal(ob.local_patches, ot.local_patches)
+        assert ot.state.policy_tokens.shape == (_B, _K, base.local_dim)
+
+
+def test_isolated_stream_copied_from_the_trunk_starts_as_the_readonly_computation():
+    """copy_from_trunk + zero-initialised write receivers: at init the isolated tokens compute
+    exactly what read-only tokens (which share the trunk's weights) compute."""
+    ro = _model(n_policy_tokens=_K, policy_token_mode="readonly")
+    iso = _model(n_policy_tokens=_K, policy_token_mode="isolated")
+    iso.load_state_dict(ro.state_dict(), strict=False)  # trunk, token init and readout of `ro`
+    iso.policy_stream.copy_from_trunk(iso)
+    images = torch.randn(_B, 3, _IMG, _IMG, generator=torch.Generator().manual_seed(2))
+    for o_ro, o_iso in zip(_roll(ro, images), _roll(iso, images)):
+        assert torch.equal(o_ro.state.policy_tokens, o_iso.state.policy_tokens)
+        with torch.no_grad():
+            assert torch.equal(ro.policy_log_probs(o_ro.state), iso.policy_log_probs(o_iso.state))
+
+
+def test_isolated_policy_loss_reaches_no_reconstruction_parameter():
+    """The point of the mode: the policy loss's gradient is EXACTLY zero (None) on every
+    parameter outside the policy's own, and the task loss's gradient is None on the policy's."""
+    m = _model(n_policy_tokens=_K, policy_token_mode="isolated")
+    with torch.no_grad():  # zero-initialised write receivers pass no gradient at all: open them
+        for w in m.policy_stream.writes:
+            w.out_proj.weight.normal_(std=0.02)
+    pol = _policy_ids(m)
+    assert {id(m.policy_token_init)} | {id(p) for p in m.policy_stream.parameters()} \
+        | {id(p) for p in m.policy_readout.parameters()} == pol
+    images = torch.randn(_B, 3, _IMG, _IMG)
+    state = m.init_state(batch_size=_B, canvas_grid_size=_G)
+    for vp in _vps():
+        out = m(image=images, state=state, viewpoint=vp)
+        state = out.state
+    (-m.policy_log_probs(state)[:, :5].sum()).backward(retain_graph=True)
+    for name, p in m.named_parameters():
+        if id(p) in pol:
+            continue
+        assert p.grad is None or not p.grad.any(), f"policy gradient reached {name}"
+    got = [n for n, p in m.named_parameters() if id(p) in pol and p.grad is not None and p.grad.any()]
+    assert any(n.startswith("policy_stream.blocks.0.") for n in got) and "policy_token_init" in got
+    assert any(n.startswith("policy_stream.reads.") for n in got), got
+    assert any(n.startswith("policy_stream.writes.") and "k_proj" in n for n in got), got
+    m.zero_grad(set_to_none=True)
+    # and the other way round: the reconstruction loss never reaches the policy's parameters
+    (state.canvas.square().mean() + out.local_patches.square().mean()).backward()
+    for name, p in m.named_parameters():
+        if id(p) in pol:
+            assert p.grad is None or not p.grad.any(), f"task gradient reached {name}"
+
+
+def test_isolated_policy_trains_as_its_own_group():
+    m = _model(n_policy_tokens=_K, policy_token_mode="isolated")
+    joint = _joint(m)
+    assert {id(p) for p in joint.scorer.parameters()} == _policy_ids(m)
+    task = BoundDistillTask(DistillTask(
+        scene_target=torch.randn(_B, _G * _G, _D), cls_target=torch.randn(_B, _D),
+        enable_scene_patches_loss=True, enable_scene_cls_loss=True))
+    r = run_rollout(
+        model=m, images=torch.randn(_B, 3, _IMG, _IMG), task=task,
+        selector=RandomSelector(is_foveated=False, foveated_scale=FoveatedScaleConfig(), min_viewpoint_scale=0.05),
+        bptt=BpttSpec(mode="chunked", chunk_size=2, horizon=4), branches=[ViewpointType.FULL],
+        canvas_grid_size=_G, amp_ctx=torch.enable_grad(), joint=joint)
+    assert r.policy_metrics is not None and torch.isfinite(r.policy_metrics["policy_loss"])
+    for name, p in [("init", m.policy_token_init), ("stream", m.policy_stream.blocks[0].attn.qkv.weight),
+                    ("readout", m.policy_readout.q_proj.weight), ("backbone", m.backbone.blocks[0].attn.qkv.weight)]:
+        assert p.grad is not None and p.grad.abs().sum() > 0, name
+    # the policy's checkpoint state round-trips through the view
+    sd = joint.state_dict()
+    joint.load_state_dict(sd)
+
+
+def test_isolated_seed_from_a_token_free_checkpoint():
+    base = _model()
+    with torch.no_grad():  # make the trunk differ from the isolated model's own init
+        for p in base.parameters():
+            p.add_(0.01)
+    iso = _model(n_policy_tokens=_K, policy_token_mode="isolated")
+    restore_into({"model_state": base.state_dict(), "step": 0}, model=iso,
+                 new_param_prefixes=("policy_token_init", "policy_readout.", "policy_stream."))
+    iso.policy_stream.copy_from_trunk(iso)
+    for b_src, b_dst in zip(iso.backbone.blocks, iso.policy_stream.blocks):
+        for (n, a), (_, c) in zip(b_src.state_dict().items(), b_dst.state_dict().items()):
+            assert torch.equal(a, c), n
+
+
+def test_distill_scorer_input_norm_option():
+    from canvit.distill.config import Config
+    from canvit.distill.task import DistillRunTask
+
+    m = _model()
+    for norm, has_bn in (("batch", True), ("none", False)):
+        cfg = Config(webdataset_dir="/nonexistent", policy_scorer_input_norm=norm)
+        cfg.rl = JointPolicyConfig(objective="pg", feats_detached=False, select_bn_eval=False)
+        joint = DistillRunTask(cfg).build_policy(m, device=_DEV, canvas_grid=_G,
+                                                 generator=torch.Generator().manual_seed(0))
+        assert isinstance(joint.scorer.frontend.bn, torch.nn.BatchNorm2d) == has_bn, norm
