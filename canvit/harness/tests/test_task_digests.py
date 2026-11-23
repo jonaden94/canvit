@@ -107,6 +107,37 @@ _EXPECTED = {
     "policy_vpg_foveated": "625ccbd492174ac8",
 }
 
+# The values above are AVX2 numerics (recorded on AMD EPYC 7513, the A100 nodes). An AVX-512 CPU runs other
+# ATen/MKL/oneDNN kernels and computes different bits; neither pinning those libraries nor a tolerance makes
+# the two agree (AdamW turns rounding noise in near-zero gradients into lr-sized steps, and the policy configs
+# sample different fixations), see canvit_claude/canvit/digest_pinning/README.md. So AVX-512 gets its own
+# values: computed 2026-11-23 on UNCHANGED main b029fd3, which reproduces every value above on AMD, and
+# identical on three Intel models (Xeon Gold 6148 ggpu01, 6248 ggpu02, 6242 agq010 -- the V100 / RTX5000
+# jupyter nodes). They are as trustworthy as the AVX2 values because they come from that same verified commit.
+_EXPECTED_AVX512 = {
+    "ade20k_probe": "3986b2adad0bb041",
+    "ade20k_finetune": "d4b88346845af83f",
+    "in1k_probe": "397f72a267a81d24",
+    "in1k_finetune": "0d180a9eeb27bdb0",
+    "distill_foveated": "b07ed9c9221f54d4",
+    "ade20k_probe_foveated": "336e75b8aa28bd49",
+    "policy_qreg_uniform": "4d639efbb7ad9798",
+    "policy_qreg_foveated": "15e7138507255915",
+    "policy_qreg_foveated_scorer": "f99dbab2a09a4763",
+    "policy_pg_foveated": "0798ffdc18ce68b5",
+    "policy_vpg_foveated": "4e2b8b4150ce11cb",
+}
+_EXPECTED_BY_CPU = {"AVX2": _EXPECTED, "AVX512": _EXPECTED_AVX512}
+
+
+def _expected(key: str) -> str:
+    """The recorded digest for this CPU's kernel class; skip (never pass) on a class with no record."""
+    cap = torch.backends.cpu.get_cpu_capability()
+    if cap not in _EXPECTED_BY_CPU:
+        pytest.skip(f"no digests recorded for CPU capability {cap!r} (have {sorted(_EXPECTED_BY_CPU)}); "
+                    "record them from an unchanged commit that passes on a recorded class")
+    return _EXPECTED_BY_CPU[cap][key]
+
 
 def _selector(*, foveated: bool = False) -> RandomSelector:
     """The no-arg call is the uniform selector the four original digests recorded under —
@@ -428,19 +459,19 @@ DIGESTS = {
 
 
 def test_ade20k_probe_digest():
-    assert ade20k_probe_digest() == _EXPECTED["ade20k_probe"]
+    assert ade20k_probe_digest() == _expected("ade20k_probe")
 
 
 def test_ade20k_finetune_digest():
-    assert ade20k_finetune_digest() == _EXPECTED["ade20k_finetune"]
+    assert ade20k_finetune_digest() == _expected("ade20k_finetune")
 
 
 def test_in1k_probe_digest():
-    assert in1k_probe_digest() == _EXPECTED["in1k_probe"]
+    assert in1k_probe_digest() == _expected("in1k_probe")
 
 
 def test_in1k_finetune_digest():
-    assert in1k_finetune_digest() == _EXPECTED["in1k_finetune"]
+    assert in1k_finetune_digest() == _expected("in1k_finetune")
 
 
 # To run just the path you touched, select by NAME: `-k foveated` (36 tests across the
@@ -449,31 +480,31 @@ def test_in1k_finetune_digest():
 # name. Run the whole suite before pinning a commit for a real job: every expensive bug in
 # this repo's history was a cross-cutting surprise that "only touched" something else.
 def test_distill_foveated_digest():
-    assert distill_foveated_digest() == _EXPECTED["distill_foveated"]
+    assert distill_foveated_digest() == _expected("distill_foveated")
 
 
 def test_ade20k_probe_foveated_digest():
-    assert ade20k_probe_foveated_digest() == _EXPECTED["ade20k_probe_foveated"]
+    assert ade20k_probe_foveated_digest() == _expected("ade20k_probe_foveated")
 
 
 def test_policy_qreg_uniform_digest():
-    assert policy_qreg_uniform_digest() == _EXPECTED["policy_qreg_uniform"]
+    assert policy_qreg_uniform_digest() == _expected("policy_qreg_uniform")
 
 
 def test_policy_qreg_foveated_digest():
-    assert policy_qreg_foveated_digest() == _EXPECTED["policy_qreg_foveated"]
+    assert policy_qreg_foveated_digest() == _expected("policy_qreg_foveated")
 
 
 def test_policy_qreg_foveated_scorer_digest():
-    assert policy_qreg_foveated_scorer_digest() == _EXPECTED["policy_qreg_foveated_scorer"]
+    assert policy_qreg_foveated_scorer_digest() == _expected("policy_qreg_foveated_scorer")
 
 
 def test_policy_pg_foveated_digest():
-    assert policy_pg_foveated_digest() == _EXPECTED["policy_pg_foveated"]
+    assert policy_pg_foveated_digest() == _expected("policy_pg_foveated")
 
 
 def test_policy_vpg_foveated_digest():
-    assert policy_vpg_foveated_digest() == _EXPECTED["policy_vpg_foveated"]
+    assert policy_vpg_foveated_digest() == _expected("policy_vpg_foveated")
 
 
 if __name__ == "__main__":  # record / re-check the digests
