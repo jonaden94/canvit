@@ -38,6 +38,8 @@ from canvit.scanpath.models import GridScanpathModel, grid_log_density, policy_e
 
 # ---------------------------------------------------------------------------------------------------- style
 # From FoAViS notebooks/paper_common.py (OKABE_ITO, BASELINE_COLOR, set_paper_style, despine, mark_fixation).
+# one preliminary search checkpoint (seed 0, step 15000 of 20000); every CanViT label names it
+CKPT = "exp39 s0"
 OKABE_ITO = {"black": "#000000", "orange": "#E69F00", "skyblue": "#56B4E9", "green": "#009E73",
              "yellow": "#F0E442", "blue": "#0072B2", "vermillion": "#D55E00", "purple": "#CC79A7"}
 BASELINE_COLOR = "0.35"  # every baseline / reference line
@@ -46,8 +48,8 @@ FS = 8
 # One meaning per colour in every figure: (colour, marker, label). Humans are the data, drawn in black.
 STYLE = {
     "human": (OKABE_ITO["black"], "o", "humans"),
-    "canvit": (OKABE_ITO["blue"], "s", "CanViT search policy"),
-    "canvit_heatmap": (OKABE_ITO["skyblue"], "o", "CanViT search heatmap"),  # the task head as a distribution
+    "canvit": (OKABE_ITO["blue"], "s", f"CanViT search policy ({CKPT})"),
+    "canvit_heatmap": (OKABE_ITO["skyblue"], "o", f"CanViT search heatmap ({CKPT})"),  # the task head as a distribution
     "deepgaze3": (OKABE_ITO["orange"], "^", "DeepGaze III"),
     "centre_bias": (BASELINE_COLOR, "D", "centre bias"),
     "uniform": (BASELINE_COLOR, "v", "uniform"),
@@ -360,7 +362,7 @@ def saccade_table(summ: dict[str, dict], out: Path, ppd: dict[str, float] | None
     lines = [r"\begin{tabular}{llrrrrrrr}", r"\toprule",
              r"dataset & from & saccades & median length & median length (deg) & horizontal & vertical & "
              r"1st: median length & 1st: left \\"]
-    for who, rows in (("humans", summ), ("CanViT samples", model or {})):
+    for who, rows in (("humans", summ), (f"CanViT samples ({CKPT})", model or {})):
         if rows:
             lines.append(r"\midrule")
         for key, s in rows.items():
@@ -616,7 +618,7 @@ def qualitative_figure(recs: list[dict], out: Path, steps=(1, 2, 3, 4), n_rows: 
             for k in np.flatnonzero(z["n"] == n):
                 ax.plot(z["xs"][k], z["ys"][k], color=STYLE["canvit"][0], lw=0.6, marker=".", ms=2)
             if i == rows[0]:
-                ax.set_title("humans (white)\nCanViT samples (blue)")
+                ax.set_title(f"humans (white)\nCanViT {CKPT} (blue)")
         for ax in a:
             ax.set(xticks=[], yticks=[])
             for sp_ in ax.spines.values():
@@ -781,7 +783,7 @@ def priors_figure(recs: list[dict], results: Path, out: Path, tabs: Path) -> dic
             ax.annotate(f"{ig:+.2f}", (ig, row), xytext=(5, 0), textcoords="offset points", va="center",
                         fontsize=FS - 1)
         cv0 = pri[("policy", cond)]["record_ig_image"]
-        ax.set(title=rf"{CONDITIONS[cond]} (CanViT at $\tau$ = 1: {cv0:+.2f})",
+        ax.set(title=rf"{CONDITIONS[cond]} (CanViT {CKPT} at $\tau$ = 1: {cv0:+.2f})",
                xlabel="IG over centre bias (bits/fix, validation, absolute)")
         despine(ax)
     labels = [_tex_label(next(cell[(s_, k, c)]["label"] for c in conds if (s_, k, c) in cell)) for s_, k, _ in rows]
@@ -906,7 +908,10 @@ def results_table(recs: list[dict], out: Path) -> dict[str, str]:
             m = r["metrics"]
             vals = " & ".join(f"{m[k]:.3f}".replace("-", "$-$") for k in ("ig_image", "ll_image", "auc_image",
                                                                             "nss_image"))
-            name = "CanViT policy, cue mixture" if r["model"].endswith("cuemix") else STYLE[kind][2]  # 18 cues
+            # tables keep short names; the caption names the checkpoint
+            name = STYLE[kind][2].replace(f" ({CKPT})", "")
+            if r["model"].endswith("cuemix"):  # 18 cues
+                name = "CanViT policy, cue mixture"
             rows.append(f" & {name} & {int(m['n_fixations'])} & {vals} \\\\")
             tag = {"tp_validation": "TP", "ta_validation": "TA"}.get(split) if ds == "coco_search18" else \
                 {"coco_freeview": "FV"}.get(ds)
