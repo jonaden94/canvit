@@ -38,7 +38,7 @@ from canvit.scanpath.models import GridScanpathModel, grid_log_density, policy_e
 
 # ---------------------------------------------------------------------------------------------------- style
 # From FoAViS notebooks/paper_common.py (OKABE_ITO, BASELINE_COLOR, set_paper_style, despine, mark_fixation).
-# one preliminary search checkpoint (seed 0, step 15000 of 20000); every CanViT label names it
+# one preliminary checkpoint: exp39 s0, best validation step 15000 of a finished 20000-step run; every CanViT label names it
 CKPT = "exp39 s0"
 OKABE_ITO = {"black": "#000000", "orange": "#E69F00", "skyblue": "#56B4E9", "green": "#009E73",
              "yellow": "#F0E442", "blue": "#0072B2", "vermillion": "#D55E00", "purple": "#CC79A7"}
