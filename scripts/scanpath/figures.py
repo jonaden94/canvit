@@ -704,6 +704,56 @@ def policy_vs_human(recs: list[dict], out: Path, steps=(1, 2, 3, 4), near: float
     return macros
 
 
+# Post-hoc human-bias priors (canvit.scanpath.priors): variant -> (row label, macro tag)
+PRIOR_ROWS = [("canvit_tau", "CanViT, fitted tau", "Tau"),
+              ("canvit_tau+amplitude", "+ saccade amplitude", "Amp"),
+              ("canvit_tau+return", "+ return (IOR / facilitation)", "Ret"),
+              ("canvit_tau+direction", "+ direction", "Dir"),
+              ("canvit_tau+centre", "+ centre bias", "Cb"),
+              ("canvit_tau+all", "+ all four priors", "All"),
+              ("priors_only", "priors only (no image)", "Only"),
+              ("centre_only", "centre-bias prior only (check)", "CbOnly")]
+
+
+def priors_figure(results: Path, out: Path) -> dict[str, str]:
+    """IG over the centre bias (bits/fix, validation) of CanViT with each post-hoc prior, fitted on training
+    scanpaths, COCO-Search18 TP | TA; grey rows are without CanViT. Returns macros prIG<variant><TP|TA>."""
+    recs = {}
+    for p in sorted(results.glob("*/priors/coco_search18_*_validation.json")):
+        r = json.loads(p.read_text())
+        if r.get("model") == "canvit_search_policy":
+            recs[r["split"][:2]] = r
+    if not recs:
+        print("priors_figure: no priors results yet")
+        return {}
+    macros = {}
+    conds = [c for c in CONDITIONS if c in recs]
+    fig, axes = plt.subplots(1, len(conds), figsize=(TEXTWIDTH_IN, 0.22 * len(PRIOR_ROWS) + 0.7), sharey=True,
+                             squeeze=False, layout="constrained")
+    for ax, cond in zip(axes[0], conds):
+        v = recs[cond]["variants"]
+        ax.axvline(0, color=BASELINE_COLOR, lw=0.5)
+        cv0 = recs[cond]["record_ig_image"]  # CanViT at tau = 1, open square on the first row
+        ax.plot(cv0, 0, marker="s", ms=4, mfc="white", mec=STYLE["canvit"][0], ls="none")
+        ax.annotate(f"tau = 1: {cv0:+.2f}", (cv0, 0), xytext=(0, -9), textcoords="offset points", ha="center",
+                    fontsize=FS - 1)
+        for row, (key, _, tag) in enumerate(PRIOR_ROWS):
+            if key not in v:
+                continue
+            ig = v[key]["ig_image"]
+            macros[f"prIG{tag}{cond.upper()}"] = f"{ig:.2f}".replace("-", r"\ensuremath{-}")
+            color, marker = STYLE["canvit"][:2] if v[key]["with_canvit"] else (BASELINE_COLOR, "D")
+            ax.plot(ig, row, marker=marker, ms=4, color=color, ls="none")
+            ax.annotate(f"{ig:+.2f}", (ig, row), xytext=(6, 0), textcoords="offset points", va="center",
+                        fontsize=FS - 1)
+        ax.set(title=CONDITIONS[cond], xlabel="IG over centre bias (bits/fix, validation)")
+        despine(ax)
+    axes[0, 0].set(yticks=range(len(PRIOR_ROWS)), yticklabels=[r[1] for r in PRIOR_ROWS],
+                   ylim=(len(PRIOR_ROWS) - 0.5, -0.8))
+    save(fig, out / "priors.pdf")
+    return macros
+
+
 # The evaluated (dataset, split) pairs in the order of the cross-dataset figure and table.
 EVALS = [("coco_search18", "tp_validation", "COCO-Search18 TP"), ("coco_search18", "ta_validation", "COCO-Search18 TA"),
          ("coco_freeview", "validation", "COCO-FreeView"), ("mit1003", "all", "MIT1003"), ("cat2000", "all", "CAT2000"),
@@ -934,6 +984,7 @@ def main() -> None:
     cross_dataset_figure(recs, figs, read_references(a.references))
     res_macros = results_table(recs, tabs)
     res_macros |= policy_vs_human(recs, tabs)
+    res_macros |= priors_figure(a.results, figs)
 
     sacc = {}
     for slug, cond, title in PANELS:
