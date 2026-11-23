@@ -72,7 +72,7 @@ def test_foveated_rollout_trains_probe() -> None:
 def test_square_patcher_also_routes_the_full_image() -> None:
     """SQUARE, not just foveated. "Square counts as foveated" was a real bug (it made the
     square patcher take the uniform pre-crop path); the only same-seed check on it lived in
-    `claude_dev/unification/parity_configs.py`, which was an old-loop-vs-harness A/B and retired
+    `canvit_claude/canvit/unification/parity_configs.py`, which was an old-loop-vs-harness A/B and retired
     with `train/step.py`. Pinned here so the routing predicate keeps its second case."""
     from canvit.core import SquarePatcherConfig
 

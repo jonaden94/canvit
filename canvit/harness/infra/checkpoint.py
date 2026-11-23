@@ -4,8 +4,10 @@ Persists everything needed to resume + (optionally, later) publish: the full mod
 state (backbone + head — both are submodules of the task wrapper, so one
 ``state_dict()`` captures them), the optimizer/scheduler, the step, the resolved
 ``TrainSpec``, the model config, and free-form metadata (incl. ``pretrain_view_scale``
-for the foveated footgun). The policy (scorer + reward standardizers + PG dual) rides
-in a ``.policy.pt`` sidecar, schema-independent of the main file.
+for the foveated footgun, and the run's full config). The policy (scorer + reward
+standardizers + PG dual), for every task that trains one, is in the same file
+(``policy_state``); checkpoints before 2026-11-22 kept it in a ``.policy.pt`` sidecar, which
+is still read.
 
 **Never touches the network.** Training writes local files only — exactly as
 this repo and the retired specialize repo do. HF publishing stays a separate, manual
@@ -39,8 +41,9 @@ def save_checkpoint(
     extra: dict | None = None,
     update_latest: bool = True,
 ) -> Path:
-    """Write a full local checkpoint (and a ``.policy.pt`` sidecar if ``joint`` given).
-    Returns the path written. DDP-safe to call on rank 0 only (unwraps ``.module``)."""
+    """Write a full local checkpoint: ONE file, with the policy (``joint``, any task) inside as
+    ``policy_state``. Returns the path written. DDP-safe to call on rank 0 only (unwraps
+    ``.module``)."""
     core = getattr(model, "module", model)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -53,10 +56,9 @@ def save_checkpoint(
         "model_config": model_config or {},
         "metadata": metadata or {},
         "extra": extra or {},
+        "policy_state": joint.state_dict() if joint is not None else None,
     }
     torch.save(payload, path)
-    if joint is not None:
-        torch.save(joint.state_dict(), path.with_suffix(".policy.pt"))
     if update_latest:
         update_latest_symlink(path.parent / "latest.pt", path)
     return path
@@ -72,19 +74,31 @@ def restore_into(
     joint: Any | None = None, path: Path | None = None, device: torch.device | str = "cpu",
 ) -> int:
     """Apply a loaded payload to live modules; return the saved step. Optimizer/scheduler
-    are restored only when provided (resume mode); a joint sidecar is restored when
-    present next to ``path``."""
+    are restored only when provided (resume mode); the policy when ``joint`` is given and
+    the checkpoint has one (see :func:`policy_state_of`)."""
     core = getattr(model, "module", model)
     core.load_state_dict(payload["model_state"])
     if optimizer is not None and payload.get("optimizer_state") is not None:
         optimizer.load_state_dict(payload["optimizer_state"])
     if scheduler is not None and payload.get("scheduler_state") is not None:
         scheduler.load_state_dict(payload["scheduler_state"])
-    if joint is not None and path is not None:
-        sidecar = path.with_suffix(".policy.pt")
-        if sidecar.exists():
-            joint.load_state_dict(torch.load(sidecar, map_location=device, weights_only=False))
+    if joint is not None:
+        state = policy_state_of(payload, path=path, device=device)
+        if state is not None:
+            joint.load_state_dict(state)
     return int(payload.get("step", 0))
+
+
+def policy_state_of(payload: dict, *, path: Path | None, device: torch.device | str = "cpu") -> dict | None:
+    """The policy saved with a checkpoint, None if its run trained none: the payload's
+    ``policy_state``, or -- for checkpoints written before 2026-11-22 -- the ``.policy.pt``
+    sidecar file next to ``path``."""
+    if payload.get("policy_state") is not None:
+        return payload["policy_state"]
+    sidecar = path.with_suffix(".policy.pt") if path is not None else None
+    if sidecar is not None and sidecar.exists():
+        return torch.load(sidecar, map_location=device, weights_only=False)
+    return None
 
 
 def update_latest_symlink(link: Path, target: Path) -> None:
@@ -114,4 +128,5 @@ def find_latest(ckpt_dir: Path) -> Path | None:
     return steps[-1] if steps else None
 
 
-__all__ = ["find_latest", "load_checkpoint", "restore_into", "save_checkpoint", "update_latest_symlink"]
+__all__ = ["find_latest", "load_checkpoint", "policy_state_of", "restore_into", "save_checkpoint",
+           "update_latest_symlink"]

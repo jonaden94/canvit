@@ -5,7 +5,7 @@ RunTask protocol conformance), the trainable-param-group routing on tiny CPU mod
 (no HF download), the IN1k head=norm+head wrinkle, and the ``harness.cli`` command
 dataclasses (preset matrix, nested-config parsing, config-derived RunSettings). The
 model-loading + real-data training path is covered by the GPU integration script
-(``claude_dev/unification/harness_run_integration.py``).
+(``canvit_claude/canvit/unification/harness_run_integration.py``).
 """
 
 from pathlib import Path
@@ -403,11 +403,14 @@ def test_ade20k_build_model_warns_on_foveated_view_scale(monkeypatch, caplog):
     full-image (foveated/square) models, so a plain uniform run — including every GPU
     smoke so far — never executes it; a bare `log.warning` there once meant a NameError
     on exactly the foveated path."""
+    from types import SimpleNamespace
+
     import canvit.ade20k.task as adetask
     from canvit.harness.config import FoveatedScaleConfig
 
     class _StubSeg:
         head = "HEAD"
+        canvit = SimpleNamespace(patcher=SimpleNamespace())  # single retina: --cfg.retina is a no-op
 
         def to(self, device):
             return self

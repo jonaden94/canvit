@@ -156,3 +156,22 @@ def test_config_checks():
     with pytest.raises(AssertionError, match="single retina"):
         single.set_retinas(0)
 
+
+
+def test_fix_retina_equals_that_retina_and_cannot_be_changed():
+    multi = _multi(RETINA_SETS["cmf_a"])
+    with torch.no_grad():                                          # FiLM off its no-op init
+        multi.conditioner.mlp[-1].weight.normal_(0, 0.1)
+    image, vp = _batch(3)
+    multi.set_retinas(1)
+    with torch.no_grad():
+        ref = multi(image, vp)
+    multi.set_retinas(None)
+    multi.fix_retina(1)
+    assert multi.fixed_retina == 1 and multi.active_retina(2) == 1
+    with torch.no_grad():
+        got = multi(image, vp)
+    assert all(torch.equal(a, b) for a, b in zip(ref, got))
+    for change in (0, None, torch.tensor([1, 1, 1])):
+        with pytest.raises(AssertionError, match="is fixed"):
+            multi.set_retinas(change)

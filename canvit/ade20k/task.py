@@ -24,6 +24,7 @@ from torch import Tensor
 from canvit.ade20k.data import IGNORE_LABEL
 from canvit.ade20k.metrics import ce_loss
 from canvit.core import CanViTForSemanticSegmentation, RecurrentState, sample_at_viewpoint
+from canvit.core.patcher.foveated import fix_backbone_retina
 from canvit.core.policy.features import FEATURE_GROUPS
 from canvit.harness.rollout import GlimpseOut, TaskLoss
 from canvit.harness.rollout.episode import consumes_full_image, derive_glimpse_px
@@ -142,9 +143,13 @@ class Ade20kRunTask:
 
     # --- construction ------------------------------------------------------
     def build_model(self, device, prior_model_config=None):
-        # prior_model_config is unused: the backbone arch comes from the HF repo the probe
-        # was built on, so a resume rebuilds the same model from cfg.model_repo already.
-        if self.cfg.probe_repo:
+        # prior_model_config (a resume or a standalone eval): build the checkpoint's OWN
+        # architecture; the caller loads all its weights (strict), so neither cfg.model_repo
+        # nor cfg.probe_repo is read. Checkpoints older than self-describing model_configs
+        # (no "canvit" key) still rebuild from cfg.model_repo below.
+        if prior_model_config and "canvit" in prior_model_config:
+            seg = CanViTForSemanticSegmentation.from_model_config(prior_model_config).to(device)
+        elif self.cfg.probe_repo:
             # Finetune from a PUBLISHED probe (specialize's `init_probe_repo`). A
             # finetune from a random head at the finetune LR crawls — the in1k twin of
             # this was a real, costly bug (8f780ba).
@@ -173,6 +178,7 @@ class Ade20kRunTask:
                 pretrained_repo=self.cfg.model_repo, num_classes=self._num_classes(),
                 dropout=self.cfg.dropout, use_ln=True,
             ).to(device)
+        fix_backbone_retina(seg, self.cfg.retina, self.cfg.model_repo)
         # The OOD footgun that silently ruined run 15025338 (ade20k/train.py:97): a
         # foveated backbone derives its fixation window as `fix_size = scale * H`, so a
         # probe rollout at a scale the backbone never saw makes EVERY glimpse

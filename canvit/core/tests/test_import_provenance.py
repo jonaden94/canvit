@@ -2,7 +2,7 @@
 
 The 2026-09-03 core merge moved ``canvit_pytorch`` into ``canvit/core/`` but left the old
 ``CanViT-PyTorch`` clone on disk on purpose — 116 launchers ``git archive`` a core commit out
-of it (``claude_dev/unification/21-core-merge.md`` §4). Both venvs still carry a stale
+of it (``canvit_claude/canvit/unification/21-core-merge.md`` §4). Both venvs still carry a stale
 ``_editable_impl_canvit_pytorch.pth`` pointing at that clone, so the old top-level
 ``canvit_pytorch`` package remains importable.
 
@@ -43,8 +43,7 @@ def test_core_and_canvit_are_the_same_tree() -> None:
     )
 
 
-# Every tree in the repo that holds LIVE code. Deliberately excludes claude_dev/unification/,
-# whose one-shot gate drivers are dated records of what ran against the old layout, and
+# Every tree in the repo that holds LIVE code. Deliberately excludes
 # slurm/runs + slurm/archive, whose launchers pin pre-merge commits on purpose.
 _LIVE_TREES = ("canvit", "bench", "demos", "scripts")
 

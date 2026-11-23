@@ -6,7 +6,7 @@
 # Backbone: the exp22 foveated teacher-init ViT-B that the exp36 foveated policy runs used
 # (pretrained at view scale 2.0, which is SearchConfig's default foveated_scale).
 # Everything else is the search defaults: frozen backbone, task head + policy trained
-# jointly, condition=both. Design: claude_dev/search/00-design.md.
+# jointly, condition=both. Design: canvit_claude/canvit/search/00-design.md.
 #
 # What to check in the log: train total_loss falls; every validation prints loss_t*/found_t*/hit_t*
 # and the presence metrics for all three fixation rules; PNGs appear under

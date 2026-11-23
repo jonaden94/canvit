@@ -16,7 +16,7 @@ the cost of cropping the long side. Whichever is used has to be reported with th
 
 Note: ADE20K train-mIoU (`train_miou_mean`, `best_val_miou_t{t}`) is **deliberately not
 logged** by the harness (owner decision, 2026-07-31 — see
-`claude_dev/unification/17-harness-consolidation.md`). Train loss and per-timestep val mIoU are
+`canvit_claude/canvit/unification/17-harness-consolidation.md`). Train loss and per-timestep val mIoU are
 unaffected. Old pre-2026-07-31 ade20k wandb runs have `train_miou_mean` panels these will not.
 
 ## How to judge these results — mIoU is NOT directly comparable to exp24

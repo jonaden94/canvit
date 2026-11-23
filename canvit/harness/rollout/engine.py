@@ -200,10 +200,12 @@ def run_rollout(
 
     # Multi-retina patcher: each sample's retina, drawn uniformly and held for all its
     # glimpses (every branch of this step sees the same images with the same retinas).
-    # torch's global CPU RNG, seeded per rank. A single-retina patcher draws nothing.
+    # torch's global CPU RNG, seeded per rank. A single-retina patcher draws nothing, and
+    # neither does one whose retina a downstream task fixed (`fix_retina`).
     patcher = _patcher_of(core_model)
     n_retinas = getattr(patcher, "n_retinas", 1)
-    if n_retinas > 1:
+    draw_retinas = n_retinas > 1 and getattr(patcher, "fixed_retina", None) is None
+    if draw_retinas:
         patcher.set_retinas(torch.randint(n_retinas, (B,)))
 
     n_glimpses = sample_n_glimpses(bptt, rng=rng)
@@ -452,7 +454,7 @@ def run_rollout(
         # scale (~-0.7 for the ade20k probe, not ~+0.03).
         policy_metrics.update(joint.last_step)
 
-    if n_retinas > 1:
+    if draw_retinas:
         patcher.set_retinas(None)  # a later forward must choose its retinas explicitly
     return RolloutResult(
         total_loss=total_loss, branches=results, n_glimpses=n_glimpses,

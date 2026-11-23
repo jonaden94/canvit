@@ -28,6 +28,7 @@ too — without this, the sampling grid stays on CPU and ``grid_sample`` errors
 out at the first forward.
 """
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal
 
@@ -46,6 +47,8 @@ from canvit.core.patcher.conditioning import (
 )
 from canvit.core.patcher.embed import build_embed_head, count_unique_pixels
 from canvit.core.viewpoint import Viewpoint
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -286,6 +289,7 @@ class FoveatedPatcher(Patcher):
             self.retina_names = [f"cmf{a:g}_res{r}_cps{c}" for a, r, c, _ in retinas]
             assert len(set(self.retina_names)) == len(retinas), f"duplicate retinas: {self.retina_names}"
             self._active_retinas: int | Tensor | None = None
+            self.fixed_retina: int | None = None  # set by fix_retina; the engine then draws none
 
         # Optional ring pruning: drop patches whose eccentricity ring adds fewer
         # than `min_ring_new_pixels` new pixels at the `pattern_reference_size`
@@ -358,6 +362,8 @@ class FoveatedPatcher(Patcher):
         tensor gives one retina per sample, ``None`` clears the choice (a forward then
         fails). A rollout must keep one choice for all its glimpses."""
         assert self._multi, "set_retinas: this patcher has a single retina"
+        assert self.fixed_retina is None, (
+            f"set_retinas: retina {self.fixed_retina} is fixed (fix_retina); a fixed patcher keeps it")
         if isinstance(retinas, Tensor):
             retinas = retinas.detach().to("cpu", torch.long)
             assert retinas.ndim == 1 and 0 <= int(retinas.min()) and int(retinas.max()) < self.n_retinas
@@ -365,6 +371,13 @@ class FoveatedPatcher(Patcher):
             assert 0 <= int(retinas) < self.n_retinas, f"retina {retinas} of {self.n_retinas}"
             retinas = int(retinas)
         self._active_retinas = retinas
+
+    def fix_retina(self, retina: int) -> None:
+        """Multi-retina patcher used through ONE of its retinas from now on (a downstream task
+        on a multi-retina backbone): every later forward uses ``retina`` for every sample, the
+        rollout engine draws no retinas, and ``set_retinas`` refuses to change it."""
+        self.set_retinas(int(retina))
+        self.fixed_retina = int(retina)
 
     def active_retina(self, sample: int) -> int:
         """The retina the current choice gives sample ``sample`` (0 for a single retina)."""
@@ -554,3 +567,19 @@ class FoveatedPatcher(Patcher):
         patches = self.conditioner.modulate_kpe_output(patches, scale=scales, retina=ids_dev)  # FiLM
         patches = self.embed_head(patches)
         return patches, self._patch_rowcol_all[ids_dev]
+
+
+def fix_backbone_retina(model: Any, retina: str | None, source: Any) -> None:
+    """A downstream task's ``--cfg.retina``: a multi-retina backbone (``model.canvit.patcher``)
+    is used through the named retina only, fixed for training AND eval (the rollout engine then
+    draws none); required for such a backbone, refused for a single-retina one."""
+    patcher = model.canvit.patcher
+    if getattr(patcher, "n_retinas", 1) > 1:
+        names = patcher.retina_names
+        if retina not in names:
+            raise ValueError(f"{source} is a multi-retina backbone: choose one retina with "
+                             f"--cfg.retina, one of {names} (got {retina!r}).")
+        patcher.fix_retina(names.index(retina))
+        log.info("multi-retina backbone: fixed to retina %d (%s)", names.index(retina), retina)
+    elif retina is not None:
+        raise ValueError(f"--cfg.retina {retina!r} needs a multi-retina backbone; {source} has one retina.")

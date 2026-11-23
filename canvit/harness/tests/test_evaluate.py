@@ -282,3 +282,19 @@ def test_mode_fixed_without_a_value_adopts_nothing():
                    "patcher_name": "foveated", "mode": "fixed", "fixed_scale": None}}}
     adopt_checkpoint_provenance(cfg, payload, source="x.pt")
     assert cfg.foveated_scale.fixed_scale == 1.0
+
+
+def test_the_cli_hands_the_run_its_full_config(monkeypatch):
+    """`harness.run` records what it was started with: the exact argv and every resolved field."""
+    import canvit.harness.cli as cli
+
+    seen = {}
+    monkeypatch.setattr(cli, "run", lambda *, task, spec, settings: seen.setdefault("s", settings))
+    argv = ["search", "--cfg.run-group", "g", "--cfg.model-repo", "x.pt", "--cfg.retina", "r0",
+            "--rl.width", "16"]
+    cli.main(argv)
+    rc = seen["s"].run_config
+    assert rc["argv"] == argv
+    assert rc["resolved"]["cfg"]["retina"] == "r0" and rc["resolved"]["rl"]["width"] == 16
+    cmd, drift = cli.command_from_run_config(rc)
+    assert drift == [] and cmd.cfg.model_repo == "x.pt"

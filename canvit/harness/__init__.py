@@ -1,6 +1,6 @@
 """Task-neutral training harness: the orchestrator AND everything shared between tasks.
 
-Design: ``claude_dev/unification/07-unified-harness-design.md``. The three tasks
+Design: ``canvit_claude/canvit/unification/07-unified-harness-design.md``. The three tasks
 (``distill`` / ``ade20k`` / ``in1k``) are equal peers that plug in via the task seam;
 nothing in this package knows about DINOv3, segmentation, or classification.
 
@@ -32,7 +32,7 @@ equivalents) work exactly as they did when each was a single flat module.
 The rule: **shared lives here, task-specific lives in that task's folder.** Until
 2026-07-31 the shared primitives sat in a folder called ``train/`` alongside distill's
 own code, because distill was once the whole repo — see
-``claude_dev/unification/18-package-restructure.md``.
+``canvit_claude/canvit/unification/18-package-restructure.md``.
 """
 
 from canvit.harness.spec import (

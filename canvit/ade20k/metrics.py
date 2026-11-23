@@ -50,7 +50,7 @@ def preds_from_logits(logits: Tensor, H: int, W: int) -> Tensor:
     This is the protocol every published ADE20K number is measured under. It was
     verified against CanViT-eval's independent implementation before that repo was
     archived: the two agreed on all ten timesteps to +0.00e+00 on exp34's probe
-    (``claude_dev/unification/20-eval-merge.md`` §5, and the archive marker in CanViT-eval).
+    (``canvit_claude/canvit/unification/20-eval-merge.md`` §5, and the archive marker in CanViT-eval).
     """
     if logits.shape[-2:] != (H, W):
         logits = F.interpolate(logits.float(), size=(H, W), mode="bilinear", align_corners=False)

@@ -44,6 +44,10 @@ class In1kConfig:
     or full finetune, over a glimpse rollout."""
 
     model_repo: str = resolve_canvit_repo("canvitb16-add-vpe-pretrain-g128px-s512px-in21k-dv3b16-2026-02-02")
+    retina: str | None = None
+    """A MULTI-RETINA backbone is used through this one retina, by name as the backbone's patcher
+    lists it (e.g. ``cmf0.75_res65_cps6``), for training and eval. Required for such a backbone,
+    refused for a single-retina one (``core.patcher.foveated.fix_backbone_retina``)."""
     train_dir: Path = field(default_factory=_default_in1k_train_dir)
     val_dir: Path = field(default_factory=_default_in1k_val_dir)
     scene_size: int = 512

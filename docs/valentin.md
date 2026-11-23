@@ -52,13 +52,12 @@ canvit/
   distill/ ade20k/ in1k/ search/   one folder per task: data, loss, metrics, figures
   checkpoint/  export to the HuggingFace format
 slurm/         cluster launchers, one folder per experiment (slurm/runs/<exp>/)
-claude_dev/    design notes and engineering records (mostly for Claude); search: claude_dev/search/
 docs/          docs for humans
 ```
 
 **Tests** live in a `tests/` folder inside each package (about 600). They check shapes and behaviour, compare against reference implementations, and include fingerprints of results that fail when a change moves the numbers. Run them with `.venv-cu126/bin/python -m pytest canvit` before using a commit for a real job.
 
-`CLAUDE.md` holds the working rules for Claude Code, which reads it automatically; you don't need to read it. Ask Claude to summarise what in it matters for what you are doing.
+The working rules and engineering notes for Claude Code are kept outside the repository (in the owner's `canvit_claude` folder); ask the owner if you need them.
 
 ## Search (where you start)
 
@@ -71,10 +70,9 @@ docs/          docs for humans
 - **Current state:** the learned policy localises the target as well as **greedy** fixation (always look at the current heatmap's peak, never twice at the same spot), but not better: `found` after the last glimpse is about 0.87 for both, against about 0.80 for random fixations. Its scanpaths, however, are more varied than greedy's. For the documented results (W&B runs, notes), ask Jonathan.
 
 **Missing so far:**
-- No standalone evaluation for search yet: `harness.evaluate` has no `search` subcommand, so search is evaluated only during training.
 - No comparison with **human scanpaths** (e.g. scanpath similarity, fixation-map metrics). COCO-Search18 has the human fixations; the other datasets don't.
 
 > *AI edit (Claude Opus 5.5, 2026-11-18):* in progress on branch `scanpath-eval`:
 > `python -m canvit.harness.evaluate scanpath` scores a model on human scanpaths (teacher-forced likelihood,
 > pysaliency conventions; COCO-Search18 benchmark metrics to follow). Code `canvit/scanpath/`, design and
-> status `claude_dev/scanpath/00-design.md`.
+> status in the design notes outside the repo (`canvit_claude/scanpath/`).

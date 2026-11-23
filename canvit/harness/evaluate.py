@@ -1,10 +1,15 @@
 """Standalone evaluation of a finished checkpoint — the counterpart of ``harness.run``.
 
-    python -m canvit.harness.evaluate ade20k \
-        --opts.ckpt logs/<group>/<run>/checkpoints/best.pt \
-        --cfg.model-repo <the backbone the probe was trained on> \
-        --cfg.eval-policy fixation_grid --cfg.foveated-scale.fixed-scale 2.0 \
-        --opts.out results/exp34-fixgrid.json
+    python -m canvit.harness.evaluate search --opts.ckpt logs/<group>/<run>/checkpoints/best.pt
+    python -m canvit.harness.evaluate ade20k --opts.ckpt .../best.pt \
+        --cfg.eval-policy fixation_grid --opts.out results/exp34-fixgrid.json
+
+**The checkpoint is enough.** Since 2026-11-22 every checkpoint carries its run's full config
+(``metadata["run_config"]``: the training command line + every resolved field) and its
+architecture (``model_config``). So the run's own config is the default here (see :func:`parse`;
+anything typed on the command line wins), the model is rebuilt from the checkpoint alone (no
+``--cfg.model-repo`` backbone file), and the learned policy saved in it (any task) is restored.
+Older checkpoints need their flags typed, as before.
 
 A training run measures ONE protocol — whatever ``eval_policy`` resolved to for that run.
 This re-measures a finished checkpoint under any protocol, without retraining, which is how
@@ -45,8 +50,10 @@ import tyro
 from canvit.ade20k.config import Ade20kConfig
 from canvit.ade20k.dinov3_baseline import DinoV3BaselineOpts
 from canvit.distill.config import Config as DistillConfig
+from canvit.harness.config import JointPolicyConfig
 from canvit.in1k.config import In1kConfig
 from canvit.scanpath.evaluate import ScanpathConfig
+from canvit.search.config import SearchConfig, search_policy_config
 
 log = logging.getLogger(__name__)
 
@@ -75,9 +82,11 @@ def _resolved_protocol(cfg: Any, task_name: str, is_foveated: bool) -> dict[str,
     from canvit.harness.rollout.eval_viewpoints import resolve
 
     fs = getattr(cfg, "foveated_scale", None)
+    ep = getattr(cfg, "eval_policy", None)  # search has none: it measures all its eval_policies
     return {
-        "eval_policy": resolve(cfg.eval_policy, task=task_name, is_foveated=is_foveated),
-        "eval_policy_requested": cfg.eval_policy,
+        "eval_policy": None if ep is None else resolve(ep, task=task_name, is_foveated=is_foveated),
+        "eval_policy_requested": ep,
+        "eval_policies": getattr(cfg, "eval_policies", None),
         "override_scale": getattr(cfg, "eval_override_scale", None),
         "is_foveated": is_foveated,
         "foveated_scale": None if fs is None else {
@@ -143,7 +152,7 @@ def evaluate(task: Any, cfg: Any, opts: EvalOpts, *, task_name: str) -> dict[str
 
     which is where a comparison table belongs — a notebook — rather than inside a CLI.
     """
-    assert cfg.eval_policy != "auto", (
+    assert getattr(cfg, "eval_policy", None) != "auto", (
         "--cfg.eval-policy is required for a standalone evaluation; 'auto' is the "
         "TRAINING-time table (HISTORICAL_DEFAULTS), which exists to keep exp22-exp36 curves "
         "comparable and has no bearing on a fresh measurement. Pick the protocol you mean: "
@@ -155,22 +164,38 @@ def evaluate(task: Any, cfg: Any, opts: EvalOpts, *, task_name: str) -> dict[str
 
     payload = torch.load(opts.ckpt, weights_only=False, map_location=device)
     adopted = adopt_checkpoint_provenance(cfg, payload, source=opts.ckpt)
-    # distill rebuilds its architecture FROM the checkpoint (build_model's resume path);
-    # ade20k/in1k rebuild from cfg.model_repo and ignore this.
+    # Every task rebuilds the checkpoint's OWN architecture from its model_config (no
+    # backbone file needed); checkpoints too old to record one fall back to cfg.model_repo.
     model, head = task.build_model(device, prior_model_config=payload.get("model_config"))
     model.load_state_dict(payload["model_state"], strict=True)
     model.eval()
+
+    # The learned policy, when the run trained one (any task): restored into the policy the task
+    # builds from its config -- what training-time validation deployed.
+    from canvit.harness.infra.checkpoint import policy_state_of
+
+    policy_state = policy_state_of(payload, path=opts.ckpt, device=device)
+    joint = None
+    if policy_state is not None:
+        gen = torch.Generator(device=device).manual_seed(0)
+        joint = task.build_policy(model, device=device, canvas_grid=task.canvas_grid(model),
+                                  generator=gen)
+        joint.load_state_dict(policy_state)
+        log.info("restored the learned policy from the checkpoint")
+    else:
+        log.info("the checkpoint holds no learned policy (its run trained none)")
 
     val_loader = task.build_val_loader()
     assert val_loader is not None, f"{task_name} has no val loader for this config"
     is_foveated = task.is_foveated(model)
     protocol = _resolved_protocol(cfg, task_name, is_foveated)
     protocol["adopted_from_checkpoint"] = adopted
+    protocol["learned_policy"] = joint is not None
     log.info("evaluating %s under %s", opts.ckpt, protocol)
 
     step = int(payload.get("step", 0))
     metrics = task.evaluate(model=model, head=head, val_loader=val_loader, device=device,
-                            step=step)
+                            step=step, joint=joint)
 
     return {
         "task": task_name,
@@ -192,11 +217,13 @@ class Ade20kEval:
     """ADE20K semantic segmentation: mIoU per timestep over the val set."""
 
     cfg: Ade20kConfig = field(default_factory=Ade20kConfig)
+    rl: JointPolicyConfig = field(default_factory=JointPolicyConfig)
+    """The policy config; only used when the checkpoint holds a learned policy."""
     opts: EvalOpts = field(default_factory=lambda: EvalOpts(ckpt=Path()))
 
     def build(self):
         from canvit.ade20k.task import Ade20kRunTask
-        return Ade20kRunTask(self.cfg), "ade20k"
+        return Ade20kRunTask(self.cfg, rl=self.rl), "ade20k"
 
 
 @dataclass
@@ -204,11 +231,27 @@ class In1kEval:
     """ImageNet-1k classification: top-1/5 at the final timestep."""
 
     cfg: In1kConfig = field(default_factory=In1kConfig)
+    rl: JointPolicyConfig = field(default_factory=JointPolicyConfig)
+    """The policy config; only used when the checkpoint holds a learned policy."""
     opts: EvalOpts = field(default_factory=lambda: EvalOpts(ckpt=Path()))
 
     def build(self):
         from canvit.in1k.task import In1kRunTask
-        return In1kRunTask(self.cfg), "in1k"
+        return In1kRunTask(self.cfg, rl=self.rl), "in1k"
+
+
+@dataclass
+class SearchEval:
+    """Class-cued visual search (COCO-Search18): found / hit / presence per glimpse under each
+    of ``cfg.eval_policies`` (random, greedy, and the learned policy saved in the checkpoint)."""
+
+    cfg: SearchConfig = field(default_factory=SearchConfig)
+    rl: JointPolicyConfig = field(default_factory=search_policy_config)
+    opts: EvalOpts = field(default_factory=lambda: EvalOpts(ckpt=Path()))
+
+    def build(self):
+        from canvit.search.task import SearchRunTask
+        return SearchRunTask(self.cfg, rl=self.rl), "search"
 
 
 @dataclass
@@ -248,7 +291,7 @@ class Ade20kDinoV3Eval:
 @dataclass
 class ScanpathEval:
     """Human scanpaths: teacher-forced likelihood of each human fixation given the earlier ones
-    (claude_dev/scanpath/00-design.md). Its own ``run()``, like ``ade20k-dinov3``: the baseline
+    (design notes outside the repo: canvit_claude/scanpath/). Its own ``run()``, like ``ade20k-dinov3``: the baseline
     models have no checkpoint to restore, so ``evaluate()``'s strict reload does not apply."""
 
     cfg: ScanpathConfig = field(default_factory=ScanpathConfig)
@@ -263,17 +306,62 @@ Command = Annotated[Ade20kEval, tyro.conf.subcommand("ade20k")] | \
     Annotated[Ade20kDinoV3Eval, tyro.conf.subcommand("ade20k-dinov3")] | \
     Annotated[In1kEval, tyro.conf.subcommand("in1k")] | \
     Annotated[DistillEval, tyro.conf.subcommand("distill")] | \
+    Annotated[SearchEval, tyro.conf.subcommand("search")] | \
     Annotated[ScanpathEval, tyro.conf.subcommand("scanpath")]
 
+_CHECKPOINT_EVALS: dict[str, type] = {"ade20k": Ade20kEval, "in1k": In1kEval,
+                                      "distill": DistillEval, "search": SearchEval}
 
-def main() -> None:
+
+def parse(argv: list[str]) -> tuple[Any, dict[str, Any] | None]:
+    """The eval command for ``argv``, with the CHECKPOINT'S OWN run config as the defaults.
+
+    A checkpoint written since the run config was saved (``metadata["run_config"]``) carries
+    the command line that trained it; that command is rebuilt here and its task / policy
+    configs become this evaluation's defaults, so ``<task> --opts.ckpt <best.pt>`` alone
+    reproduces the run's own setup. Anything typed here still wins. Older checkpoints parse
+    as before (every flag on the command line). Returns the command and a note on the config's
+    source for the record (None when the checkpoint had none)."""
+    sub = argv[0] if argv and not argv[0].startswith("-") else None
+    ckpt = next((Path(argv[i + 1]) for i, a in enumerate(argv[:-1]) if a == "--opts.ckpt"),
+                next((Path(a.split("=", 1)[1]) for a in argv if a.startswith("--opts.ckpt=")), None))
+    run_config = None
+    if sub in _CHECKPOINT_EVALS and ckpt is not None and ckpt.is_file():
+        meta = torch.load(ckpt, map_location="cpu", weights_only=False, mmap=True).get("metadata") or {}
+        run_config = meta.get("run_config")
+    if run_config is None:
+        return tyro.cli(Command, args=argv), None  # pyright: ignore[reportArgumentType]
+
+    from canvit.harness.cli import command_from_run_config
+
+    trained_as = run_config["argv"][0]
+    if trained_as != sub:
+        raise ValueError(f"{ckpt} was trained by `harness.run {trained_as}`; evaluate it with "
+                         f"`harness.evaluate {trained_as}`, not `{sub}`.")
+    train_cmd, drift = command_from_run_config(run_config)
+    if drift:
+        log.warning("the checkpoint's run config resolves differently with this code (defaults "
+                    "changed since the run) in: %s. Pass the old values on the command line to "
+                    "reproduce the run exactly.", ", ".join(drift))
+    eval_cls = _CHECKPOINT_EVALS[sub]
+    default = eval_cls(cfg=train_cmd.cfg, opts=EvalOpts(ckpt=ckpt),
+                       **({"rl": train_cmd.rl} if "rl" in eval_cls.__dataclass_fields__ else {}))
+    log.info("defaults from the checkpoint's run config: harness.run %s", " ".join(run_config["argv"]))
+    cmd = tyro.cli(eval_cls, args=argv[1:], default=default)
+    return cmd, {"argv": run_config["argv"], "drift": drift}
+
+
+def main(argv: list[str] | None = None) -> None:
+    import sys
+
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    cmd = tyro.cli(Command)  # pyright: ignore[reportArgumentType]
+    cmd, config_source = parse(list(sys.argv[1:] if argv is None else argv))
     if isinstance(cmd, (Ade20kDinoV3Eval, ScanpathEval)):
         record, out = cmd.run(), cmd.out
     else:
         task, task_name = cmd.build()
         record, out = evaluate(task, cmd.cfg, cmd.opts, task_name=task_name), cmd.opts.out
+        record["run_config_from_checkpoint"] = config_source
     text = json.dumps(record, indent=2, default=str)
     print(text)
     if out is not None:

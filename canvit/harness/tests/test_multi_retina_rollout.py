@@ -111,3 +111,12 @@ def test_patcher_found_on_model_and_wrapper():
     assert _patcher_of(m) is m.patcher
     assert _patcher_of(Wrapper(m)) is m.patcher
     assert _patcher_of(nn.Linear(2, 2)) is None
+
+
+def test_fixed_retina_is_neither_redrawn_nor_cleared():
+    model, task = _Model(n_retinas=9), _Task()
+    model.patcher.fixed_retina = 4
+    model.patcher.active = 4
+    _rollout(model, task)
+    assert model.patcher.calls == []                             # no draw, no clear
+    assert task.seen == [4] * (2 * 3)

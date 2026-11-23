@@ -1,6 +1,6 @@
 """Byte-exact parity: the generalized rollout engine reproduces distill's loss stream.
 
-Replicates ``claude_dev/unification/parity_probe.py`` (same tiny CPU model, same pinned
+Replicates ``canvit_claude/canvit/unification/parity_probe.py`` (same tiny CPU model, same pinned
 RNG, same 25 steps) but drives the loss through ``harness.rollout.run_rollout`` with
 a distill adapter instead of ``train/step.py::training_step``. If the sha256[:16] of
 the loss stream still equals the recorded ``9a0100a1a3de3acd``, the generalized
@@ -13,6 +13,7 @@ import hashlib
 import random
 from contextlib import nullcontext
 
+import pytest
 import torch
 
 from canvit import CanViTForPretraining, CanViTForPretrainingConfig
@@ -23,6 +24,9 @@ from canvit.harness.rollout import GlimpseOut, run_rollout
 from canvit.harness.rollout.selector import RandomSelector
 from canvit.harness.rollout.viewpoint import ViewpointType
 from canvit.harness.spec import BpttSpec
+
+# The digests were recorded with one CPU thread (see conftest.one_cpu_thread).
+pytestmark = pytest.mark.usefixtures("one_cpu_thread")
 
 _B, _G, _D = 2, 8, 384
 _N_STEPS = 25
