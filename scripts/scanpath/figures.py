@@ -1364,7 +1364,7 @@ FOCUS = [("coco_search18", "tp_validation"), ("coco_search18", "ta_validation"),
          ("coco_search18", "tp_test"), ("coco_search18", "ta_test")]
 # the results tables also show the official COCO-Search18 test split (a second evaluation, helper_1; TP test
 # scanpaths end at the first target fixation, as redistributed by Gazeformer/ScanDiff); cross_dataset does not
-RESULT_EVALS = EVALS[:3] + [("coco_search18", "tp_test", "COCO-Search18 TP (test)"),
+RESULT_EVALS = EVALS[:3] + [("coco_search18", "tp_test", r"COCO-Search18 TP (test)$^\ast$"),  # *: ends at target
                             ("coco_search18", "ta_test", "COCO-Search18 TA (test)")] + EVALS[3:]
 METRICS = [("ig_image", "IG over centre bias\n(bits/fix)"), ("ll_image", "LL over uniform\n(bits/fix)"),
            ("auc_image", "AUC"), ("nss_image", "NSS")]
