@@ -338,7 +338,7 @@ def saccade_table(summ: dict[str, dict], out: Path, ppd: dict[str, float] | None
 
 
 # ------------------------------------------------------------------------------------------------- records
-HELD_OUT = {"figrim": "CanViT numbers under check: square images vs the trained letterbox (helper_1, 2026-11-23)"}
+HELD_OUT: dict[str, str] = {}  # dataset -> reason; FIGRIM released 2026-11-23 (helper_1: framed record = headline)
 
 
 def load_records(results: Path) -> list[dict]:
@@ -354,6 +354,8 @@ def load_records(results: Path) -> list[dict]:
             continue
         if not isinstance(r, dict) or r.get("task") != "scanpath" or "metrics" not in r:
             continue  # also a shard of a sharded run (no metrics until merged)
+        if p.stem.endswith("_scene"):  # the unframed comparison run (helper_1); the framed record is the headline
+            continue
         if "retina" in p.relative_to(results).parts:  # the retina sweep (helper_1): out-of-distribution retinas,
             continue                                   # read only by its own figure
         top = p.parent == results
@@ -1347,7 +1349,7 @@ def temperature_figure(recs: list[dict], out: Path) -> dict[str, str]:
 # The evaluated (dataset, split) pairs in the order of the cross-dataset figure and table.
 EVALS = [("coco_search18", "tp_validation", "COCO-Search18 TP"), ("coco_search18", "ta_validation", "COCO-Search18 TA"),
          ("coco_freeview", "validation", "COCO-FreeView"), ("mit1003", "all", "MIT1003"), ("cat2000", "all", "CAT2000"),
-         ("daemons", "validation", "DAEMONS"), ("figrim", "all", "FIGRIM")]
+         ("daemons", "validation", "DAEMONS"), ("figrim", "all", "FIGRIM (memorisation)")]
 METRICS = [("ig_image", "IG over centre bias\n(bits/fix)"), ("ll_image", "LL over uniform\n(bits/fix)"),
            ("auc_image", "AUC"), ("nss_image", "NSS")]
 
