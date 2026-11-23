@@ -26,6 +26,7 @@ A sample (one human scanpath):
     boxes:    float [1, 4]     target box, scene xyxy (NaN: no target / target absent)
     content:  float [4]        the stimulus inside the scene, xyxy [-1, 1]
     hw:       long  [2]        the stimulus size in pixels (h, w)
+    frame:    long  [2]        the display frame (H, W) it was letterboxed into; (0, 0) = none ("scene")
     scanpath: long  []         index into ``fixations.scanpaths`` (pysaliency's ``scanpath_index``)
 """
 
@@ -197,17 +198,35 @@ def clip_to_stimuli(stimuli, fixations):
 
 # --- scene geometry ------------------------------------------------------------------------------
 
-def letterbox_geometry(h: int, w: int, scene: int) -> tuple[int, int, int, int]:
+def parse_display_frame(spec: str | None) -> tuple[int, int] | None:
+    """``"scene"`` -> None (the stimulus fills the scene as far as its aspect allows); ``"<W>x<H>"`` -> (H, W): the
+    stimulus is letterboxed into the box a W x H display occupies in the scene (:func:`letterbox_geometry`)."""
+    if spec is None:
+        raise ValueError("display_frame is unresolved (None): evaluate.run derives it from the checkpoint")
+    if spec == "scene":
+        return None
+    w, h = (int(v) for v in spec.lower().split("x"))
+    return h, w
+
+
+def letterbox_geometry(h: int, w: int, scene: int, frame: tuple[int, int] | None = None) -> tuple[int, int, int, int]:
     """(content_h, content_w, top, left) of an (h, w) image letterboxed into the scene -- the numbers
-    ``SearchDataset.__getitem__`` uses."""
-    ch, cw = letterbox_hw(h, w, scene)
+    ``SearchDataset.__getitem__`` uses. ``frame`` (H, W): first into the box of an H x W display centred in the
+    scene. An image at least as wide as the frame takes exactly the plain letterbox (the frame changes nothing
+    for it); a narrower one gets the box's height instead of the scene's (it stays inside the rows a model
+    trained on such displays has seen content in)."""
+    if frame is None or w * frame[0] >= h * frame[1]:
+        ch, cw = letterbox_hw(h, w, scene)
+    else:
+        bh = letterbox_hw(frame[0], frame[1], scene)[0]
+        ch, cw = bh, max(1, round(w * bh / h))
     return ch, cw, (scene - ch) // 2, (scene - cw) // 2
 
 
-def pixel_to_scene(xy: Tensor, *, hw: tuple[int, int], scene: int) -> Tensor:
+def pixel_to_scene(xy: Tensor, *, hw: tuple[int, int], scene: int, frame: tuple[int, int] | None = None) -> Tensor:
     """``xy`` [..., 2] stimulus pixels (x, y), continuous -> scene [-1, 1]. Not clamped."""
     h, w = hw
-    ch, cw, top, left = letterbox_geometry(h, w, scene)
+    ch, cw, top, left = letterbox_geometry(h, w, scene, frame)
     x = (xy[..., 0] * (cw / w) + left) / scene * 2 - 1
     y = (xy[..., 1] * (ch / h) + top) / scene * 2 - 1
     return torch.stack([x, y], dim=-1)
@@ -235,8 +254,9 @@ def _task_names(stimuli) -> list[str] | None:
 class ScanpathDataset(Dataset):
     """pysaliency (stimuli, scanpath fixations) -> one sample per scanpath. Deterministic."""
 
-    def __init__(self, stimuli, fixations, *, scene_size: int):
+    def __init__(self, stimuli, fixations, *, scene_size: int, frame: tuple[int, int] | None = None):
         self.stimuli = stimuli
+        self.frame = frame
         self.scanpaths = fixations.scanpaths
         self.scene = scene_size
         names = _task_names(stimuli)
@@ -253,7 +273,7 @@ class ScanpathDataset(Dataset):
             img = np.repeat(img[..., None], 3, axis=-1)
         img = torch.from_numpy(np.ascontiguousarray(img[..., :3])).permute(2, 0, 1)
         h, w = img.shape[-2:]
-        ch, cw, top, left = letterbox_geometry(h, w, self.scene)
+        ch, cw, top, left = letterbox_geometry(h, w, self.scene, self.frame)
         img = v2.Resize((ch, cw), antialias=True)(img)
         img = TF.pad(img, [left, top, self.scene - cw - left, self.scene - ch - top], fill=0)
         image = TF.normalize(TF.to_dtype(img, torch.float32, scale=True),
@@ -264,11 +284,15 @@ class ScanpathDataset(Dataset):
         boxes = torch.full((1, 4), math.nan)
         if self.bbox is not None and np.isfinite(self.bbox[i]).all():
             x, y, bw, bh = (float(v) for v in self.bbox[i])
-            boxes = pixel_to_scene(torch.tensor([[x, y], [x + bw, y + bh]]), hw=hw, scene=self.scene).reshape(1, 4)
-        content = pixel_to_scene(torch.tensor([[0.0, 0.0], [float(w), float(h)]]), hw=hw, scene=self.scene)
+            boxes = pixel_to_scene(torch.tensor([[x, y], [x + bw, y + bh]]), hw=hw, scene=self.scene,
+                                   frame=self.frame).reshape(1, 4)
+        content = pixel_to_scene(torch.tensor([[0.0, 0.0], [float(w), float(h)]]), hw=hw, scene=self.scene,
+                                 frame=self.frame)
         return {"image": image.as_subclass(Tensor),
                 "cue": torch.tensor(-1 if self.cues is None else self.cues[n], dtype=torch.long),
-                "fix": pixel_to_scene(xy, hw=hw, scene=self.scene), "n_fix": torch.tensor(L, dtype=torch.long),
+                "fix": pixel_to_scene(xy, hw=hw, scene=self.scene, frame=self.frame),
+                "n_fix": torch.tensor(L, dtype=torch.long),
+                "frame": torch.tensor(self.frame or (0, 0), dtype=torch.long),
                 "boxes": boxes, "content": content.reshape(4), "hw": torch.tensor(hw, dtype=torch.long),
                 "scanpath": torch.tensor(i, dtype=torch.long)}
 
@@ -279,17 +303,17 @@ def collate_scanpath(batch: list[dict]) -> dict:
     fix = torch.full((len(batch), L, 2), math.nan)
     for i, s in enumerate(batch):
         fix[i, : s["fix"].shape[0]] = s["fix"]
-    keys = ("image", "cue", "n_fix", "boxes", "content", "hw", "scanpath")
+    keys = ("image", "cue", "n_fix", "boxes", "content", "hw", "frame", "scanpath")
     out = {k: torch.stack([s[k] for s in batch]) for k in keys}
     return out | {"fix": fix}
 
 
 def make_scanpath_loader(stimuli, fixations, *, scene_size: int, batch_size: int, num_workers: int,
-                         indices=None) -> DataLoader:
+                         indices=None, frame: tuple[int, int] | None = None) -> DataLoader:
     """The scanpaths (only ``indices``, if given) with at least one fixation after the start (the others have
     nothing to score), sorted by length (a batch runs as many glimpses as its longest scanpath; sorting cuts the
     padding); samples keep their index into ``fixations.scanpaths``."""
-    ds = ScanpathDataset(stimuli, fixations, scene_size=scene_size)
+    ds = ScanpathDataset(stimuli, fixations, scene_size=scene_size, frame=frame)
     length = np.asarray(fixations.scanpaths.length)
     order = np.argsort(length, kind="stable")
     if indices is not None:
@@ -301,4 +325,4 @@ def make_scanpath_loader(stimuli, fixations, *, scene_size: int, batch_size: int
 
 __all__ = ["DATASETS", "ScanpathDataset", "clamp_to_content", "clip_to_stimuli", "coco_search18", "collate_scanpath",
            "eval_part", "fit_part", "letterbox_geometry", "load_dataset", "local_mirror", "make_scanpath_loader",
-           "pixel_to_scene"]
+           "parse_display_frame", "pixel_to_scene"]

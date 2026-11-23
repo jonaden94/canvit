@@ -35,10 +35,12 @@ log = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=16)
-def _pixel_cells(h: int, w: int, scene: int, grid: int) -> tuple[np.ndarray, np.ndarray]:
-    """[h, w] flat cell index of every pixel centre, and [G*G] pixel count per cell."""
+def _pixel_cells(h: int, w: int, scene: int, grid: int, frame: tuple[int, int] | None = None
+                 ) -> tuple[np.ndarray, np.ndarray]:
+    """[h, w] flat cell index of every pixel centre, and [G*G] pixel count per cell (``frame``:
+    data.letterbox_geometry)."""
     yy, xx = np.meshgrid(np.arange(h) + 0.5, np.arange(w) + 0.5, indexing="ij")
-    xy = pixel_to_scene(torch.from_numpy(np.stack([xx, yy], -1)), hw=(h, w), scene=scene).numpy()
+    xy = pixel_to_scene(torch.from_numpy(np.stack([xx, yy], -1)), hw=(h, w), scene=scene, frame=frame).numpy()
     ij = np.clip(np.floor((xy + 1) / 2 * grid), 0, grid - 1).astype(np.int64)
     cell = ij[..., 1] * grid + ij[..., 0]
     return cell, np.bincount(cell.ravel(), minlength=grid * grid)
@@ -49,12 +51,13 @@ def _log_count(count: np.ndarray) -> np.ndarray:
         return np.log(count)  # -inf for cells without a stimulus pixel
 
 
-def grid_log_density(logits: np.ndarray, *, hw: tuple[int, int], scene: int) -> np.ndarray:
+def grid_log_density(logits: np.ndarray, *, hw: tuple[int, int], scene: int,
+                     frame: tuple[int, int] | None = None) -> np.ndarray:
     """[G*G] scene-grid logits -> [h, w] log density over the stimulus pixels (sums to 1): every pixel gets
     its cell's logit, normalised over the pixels (= cell probabilities ``softmax(logits + log pixels)``,
     spread evenly over each cell's pixels)."""
     grid = int(round(len(logits) ** 0.5))
-    cell, count = _pixel_cells(hw[0], hw[1], scene, grid)
+    cell, count = _pixel_cells(hw[0], hw[1], scene, grid, frame)
     logp = log_softmax(logits.astype(np.float64) + _log_count(count))
     with np.errstate(invalid="ignore"):  # -inf - -inf in cells no pixel reads
         return (logp - _log_count(count))[cell]
@@ -66,18 +69,23 @@ class GridScanpathModel(pysaliency.ScanpathModel):
 
     ``temperature`` divides the logits: one global value, or per history length t (missing t: 1). It is a
     DIAGNOSTIC only (owner, 2026-11-20: one global entropy alpha in training; tau shows how far the policy's
-    sharpness is from the human-optimal one) and never feeds back into training."""
+    sharpness is from the human-optimal one) and never feeds back into training.
+
+    ``frame`` (H, W) or None: the display frame the stimuli were letterboxed into (``data.letterbox_geometry``);
+    the predictions only mean something in the geometry they were made in, so it is saved with them."""
 
     def __init__(self, logits: dict[tuple[int, int], np.ndarray], *, scene_size: int, name: str,
-                 temperature: float | dict[int, float] = 1.0):
+                 temperature: float | dict[int, float] = 1.0, frame: tuple[int, int] | None = None):
         super().__init__()
         self.logits, self.scene, self.name, self.temperature = logits, scene_size, name, temperature
+        self.frame = None if frame is None else (int(frame[0]), int(frame[1]))
 
     def tau(self, t: int) -> float:
         return self.temperature if isinstance(self.temperature, float | int) else self.temperature.get(t, 1.0)
 
     def with_temperature(self, temperature: float | dict[int, float]) -> GridScanpathModel:
-        return GridScanpathModel(self.logits, scene_size=self.scene, name=self.name, temperature=temperature)
+        return GridScanpathModel(self.logits, scene_size=self.scene, name=self.name, temperature=temperature,
+                                 frame=self.frame)
 
     def conditional_log_density(self, stimulus, x_hist, y_hist, t_hist, attributes=None, out=None):
         key = (int(attributes["scanpath_index"]), len(x_hist))
@@ -85,7 +93,7 @@ class GridScanpathModel(pysaliency.ScanpathModel):
             raise KeyError(f"{self.name}: no prediction for scanpath {key[0]} after {key[1]} fixations "
                            "(was the episode run long enough?)")
         return grid_log_density(self.logits[key] / self.tau(key[1]), hw=as_stimulus(stimulus).size,
-                                scene=self.scene)
+                                scene=self.scene, frame=self.frame)
 
     def save(self, path, *, meta: dict | None = None) -> None:
         """The predictions as ``.npz`` (keys [N, 2] = (scanpath_index, t), float32 logits; ``meta``: JSON, e.g. the
@@ -93,7 +101,8 @@ class GridScanpathModel(pysaliency.ScanpathModel):
         import json
         keys = np.array(list(self.logits), dtype=np.int64).reshape(-1, 2)
         np.savez_compressed(path, keys=keys, logits=np.stack([self.logits[tuple(k)] for k in keys]).astype(np.float32),
-                            scene_size=self.scene, name=self.name, meta=json.dumps(meta or {}, default=str))
+                            scene_size=self.scene, name=self.name, meta=json.dumps(meta or {}, default=str),
+                            frame=np.array(self.frame or (0, 0), dtype=np.int64))
 
     @classmethod
     def load(cls, *paths) -> GridScanpathModel:
@@ -104,7 +113,8 @@ class GridScanpathModel(pysaliency.ScanpathModel):
         first = None
         for path in paths:
             z = np.load(path)
-            head = (int(z["scene_size"]), str(z["name"]))
+            fr = tuple(int(v) for v in z["frame"]) if "frame" in z else (0, 0)  # files before 2026-11-23: none
+            head = (int(z["scene_size"]), str(z["name"]), None if fr == (0, 0) else fr)
             if first is not None and head != first[0]:
                 raise ValueError(f"{path}: predictions of {head}, not {first[0]}")
             part = {(int(a), int(b)): v.astype(np.float32) for (a, b), v in zip(z["keys"], z["logits"])}
@@ -113,7 +123,7 @@ class GridScanpathModel(pysaliency.ScanpathModel):
             logits |= part
             first = first or (head, json.loads(str(z["meta"])) if "meta" in z else {})
         assert first is not None, "no prediction file given"
-        model = cls(logits, scene_size=first[0][0], name=first[0][1])
+        model = cls(logits, scene_size=first[0][0], name=first[0][1], frame=first[0][2])
         model.meta = first[1]
         return model
 
@@ -127,7 +137,7 @@ def _scored_cells(model: GridScanpathModel, stimuli, fixations):
     for i in range(len(fx)):
         h, w = stimuli.sizes[int(fx.n[i])]
         lg = model.logits[(int(fx.scanpath_index[i]), int(fx.scanpath_history_length[i]))]
-        cell, count = _pixel_cells(int(h), int(w), model.scene, int(round(len(lg) ** 0.5)))
+        cell, count = _pixel_cells(int(h), int(w), model.scene, int(round(len(lg) ** 0.5)), model.frame)
         logits.append(lg)
         cells.append(cell[fx.y_int[i], fx.x_int[i]])
         logcount.append(_log_count(count))

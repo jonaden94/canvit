@@ -208,7 +208,6 @@ class PolicyEpisode:
         rollout for one cue. Needs the policy and ``batch["hw"]``."""
         import math
 
-        from .models import _pixel_cells
         if self.joint is None:
             raise ValueError("sampling scanpaths needs the learned policy")
         K = 0
@@ -222,7 +221,7 @@ class PolicyEpisode:
             if temperature == 0 and not K:
                 idx = scores.argmax(-1)
             else:
-                count = np.stack([_pixel_cells(int(h), int(w), S, g)[1] for h, w in batch["hw"].tolist()])
+                count = _cell_counts(batch, S, g)
                 logcount = torch.from_numpy(count).to(scores.device).float().log()
                 if K:
                     logcount = logcount[:, None]
@@ -236,6 +235,19 @@ class PolicyEpisode:
             return xy if temperature == 0 and not K else clamp_to_content(xy, batch["content"])
 
         return self._episode(batch, n, draw, all_cues=K)[1]
+
+
+def _frame(batch: dict, b: int) -> tuple[int, int] | None:
+    """Sample b's display frame (data.ScanpathDataset ``frame``; (0, 0) = none)."""
+    fr = tuple(int(v) for v in batch["frame"][b].tolist()) if "frame" in batch else (0, 0)
+    return None if fr == (0, 0) else fr
+
+
+def _cell_counts(batch: dict, scene: int, grid: int) -> np.ndarray:
+    """[B, G*G] pixels of each sample's stimulus in each cell, in the sample's display frame."""
+    from .models import _pixel_cells
+    return np.stack([_pixel_cells(int(h), int(w), scene, grid, _frame(batch, b))[1]
+                     for b, (h, w) in enumerate(batch["hw"].tolist())])
 
 
 def _check_view_scale(payload: dict, fs) -> None:
@@ -291,13 +303,12 @@ class CanViTModel:
 
         from canvit.search.data import COCO_SEARCH18_CLASSES
 
-        from .models import _pixel_cells
         if not (batch["cue"] < 0).all():
             raise ValueError("cue_mixture is for free-viewing trials (cue -1); this batch has cues")
         K, S = len(COCO_SEARCH18_CLASSES), batch["image"].shape[-1]
         lg = self.episode.run(batch, n, all_cues=K)[self.readout].double()  # [B, n, K, G*G], one backbone pass
         g = int(round(lg.shape[-1] ** 0.5))
-        count = np.stack([_pixel_cells(int(h), int(w), S, g)[1] for h, w in batch["hw"].tolist()])
+        count = _cell_counts(batch, S, g)
         logcount = torch.from_numpy(count).to(lg.device).double().log()[:, None, None]  # [B, 1, 1, G*G]
         on = logcount.isfinite()
         ld = torch.where(on, torch.log_softmax(lg + logcount, -1) - logcount, -math.inf)  # per-cue pixel log density
@@ -306,7 +317,7 @@ class CanViTModel:
         return torch.where(on, mix - math.log(K), 0.0).float()
 
 
-def precompute(model: CanViTModel, loader, *, grid: int, scene_size: int):
+def precompute(model: CanViTModel, loader, *, grid: int, scene_size: int, frame: tuple[int, int] | None = None):
     """Run the teacher-forced episode over every scanpath once (batched) and hand the predictions to
     pysaliency as a :class:`~canvit.scanpath.models.GridScanpathModel`, keyed by pysaliency's
     ``(scanpath_index, history length)``: every fixation t >= 1 of every scanpath gets one."""
@@ -322,7 +333,7 @@ def precompute(model: CanViTModel, loader, *, grid: int, scene_size: int):
             for t in range(1, L):
                 table[(sp, t)] = logits[b, t - 1]
     log.info("%s: %d predictions", model.name, len(table))
-    return GridScanpathModel(table, scene_size=scene_size, name=model.name)
+    return GridScanpathModel(table, scene_size=scene_size, name=model.name, frame=frame)
 
 
 def sample_scanpaths(ep: PolicyEpisode, loader, *, temperature: float, seed: int, max_len: int | None = None,
@@ -342,7 +353,7 @@ def sample_scanpaths(ep: PolicyEpisode, loader, *, temperature: float, seed: int
                        cue_mixture=cue_mixture).cpu().numpy()  # scene (x, y)
         S = batch["image"].shape[-1]
         for b, (h, w) in enumerate(batch["hw"].tolist()):
-            ch, cw, top, left = letterbox_geometry(h, w, S)  # the inverse of data.pixel_to_scene
+            ch, cw, top, left = letterbox_geometry(h, w, S, _frame(batch, b))  # the inverse of data.pixel_to_scene
             px = ((xy[b, :, 0] + 1) / 2 * S - left) * (w / cw)
             py = ((xy[b, :, 1] + 1) / 2 * S - top) * (h / ch)
             n = int(L[b])

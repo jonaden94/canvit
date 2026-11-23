@@ -298,3 +298,65 @@ def test_nss_auc_on_a_seeded_subset_ll_on_all(fake_search):
     shards = [per_fixation_scores(cb, sv, fx[i:i + 7], cb, density_mask=mask[i:i + 7]) for i in range(0, len(fx), 7)]
     merged = {k: np.concatenate([sh[k] for sh in shards]) for k in shards[0]}
     assert aggregate(merged) == pytest.approx(sub, rel=1e-12, abs=1e-12)
+
+
+# --- display frame (2026-11-23): stimuli letterboxed into the training display's box ----------------
+
+FRAME = (1050, 1680)  # (H, W) of COCO-Search18's display, the search runs' training geometry
+
+
+def test_display_frame_is_the_identity_for_stimuli_as_wide_as_the_frame():
+    """CS18 / FreeView (1680x1050), CAT2000 / DAEMONS (1920x1080) and anything wider are unchanged by the frame."""
+    from canvit.scanpath.data import letterbox_geometry, parse_display_frame
+    assert parse_display_frame("scene") is None and parse_display_frame("1680x1050") == FRAME
+    for hw in ((1050, 1680), (1080, 1920), (500, 1000), (321, 514)):
+        assert letterbox_geometry(*hw, 512, FRAME) == letterbox_geometry(*hw, 512)
+        _, count = _pixel_cells(*hw, 64, 32, FRAME)
+        assert np.array_equal(count, _pixel_cells(*hw, 64, 32)[1])
+
+
+def test_narrower_stimuli_stay_inside_the_frames_box():
+    from canvit.scanpath.data import letterbox_geometry
+    box_h = 320  # 1050/1680 of a 512 scene: content rows 96..415, as COCO-Search18 in training
+    for h, w in ((1000, 1000), (768, 1024), (1024, 768)):
+        ch, cw, top, left = letterbox_geometry(h, w, 512, FRAME)
+        assert ch == box_h and top == 96 and abs(cw / ch - w / h) < 0.01 and left == (512 - cw) // 2
+        assert letterbox_geometry(h, w, 512)[0] > box_h  # the plain letterbox would leave the box
+
+
+def test_framed_sample_and_density(tmp_path):
+    from torchvision.io import write_jpeg
+    p = tmp_path / "square.jpg"
+    write_jpeg(torch.randint(0, 255, (3, 80, 80), dtype=torch.uint8), str(p))
+    stim = pysaliency.FileStimuli([str(p)])
+    fix = scanpaths(1, per_stimulus=1, h=80, w=80)
+    s = ScanpathDataset(stim, fix, scene_size=64, frame=FRAME)[0]
+    assert torch.allclose(s["fix"][0], torch.zeros(2), atol=1e-6)  # the image centre is still the scene centre
+    assert torch.allclose(s["content"][[1, 3]], torch.tensor([-0.625, 0.625]), atol=1e-6)  # rows 12..51 of 64
+    assert s["frame"].tolist() == list(FRAME)
+    from canvit.core.preprocess import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
+    black = -torch.tensor(IMAGENET_DEFAULT_MEAN) / torch.tensor(IMAGENET_DEFAULT_STD)  # a zero pixel, normalised
+    assert torch.allclose(s["image"][:, :12], black[:, None, None].expand(3, 12, 64))  # padding above the box
+    ld = grid_log_density(np.random.default_rng(0).standard_normal(1024), hw=(80, 80), scene=64, frame=FRAME)
+    assert math.isclose(np.exp(ld).sum(), 1.0, rel_tol=1e-9)
+    m = GridScanpathModel({(0, 1): np.zeros(1024, np.float32)}, scene_size=64, name="x", frame=FRAME)
+    m.save(tmp_path / "m.npz")
+    assert GridScanpathModel.load(tmp_path / "m.npz").frame == FRAME
+    m2 = GridScanpathModel({(0, 1): np.zeros(1024, np.float32)}, scene_size=64, name="x")
+    m2.save(tmp_path / "m2.npz")
+    with pytest.raises(ValueError, match="predictions of"):
+        GridScanpathModel.load(tmp_path / "m.npz", tmp_path / "m2.npz")
+
+
+def test_the_display_frame_comes_from_the_checkpoints_training_data(fake_search, tmp_path):
+    from canvit.scanpath.evaluate import frame_is_identity, training_display_frame
+    assert training_display_frame("search")[0] == "1680x1050"
+    assert {training_display_frame(t)[0] for t in ("distill", "in1k", "ade20k")} == {"scene"}
+    with pytest.raises(ValueError, match="not known"):
+        training_display_frame("some_new_task")
+    sv = fake_search[2]  # 105 x 168 = COCO-Search18's 16:10: the frame changes nothing
+    assert frame_is_identity(sv, FRAME, 512)
+    from torchvision.io import write_jpeg
+    p = tmp_path / "sq.jpg"
+    write_jpeg(torch.zeros(3, 50, 50, dtype=torch.uint8), str(p))
+    assert not frame_is_identity(pysaliency.FileStimuli([str(p)]), FRAME, 512)

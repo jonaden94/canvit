@@ -34,7 +34,7 @@ import torch
 from pysaliency.baseline_utils import CrossvalidatedBaselineModel
 from pysaliency.utils import average_values
 
-from .data import DATASETS, _task_names, eval_part, fit_part, load_dataset, make_scanpath_loader
+from .data import DATASETS, _task_names, eval_part, fit_part, load_dataset, make_scanpath_loader, parse_display_frame
 from .models import (
     DensitySaliencyMap,
     GridScanpathModel,
@@ -70,6 +70,14 @@ class ScanpathConfig:
     grid: int = 32
     """Cells per axis the CanViT models predict on (the search policy's 32x32)."""
     scene_size: int = 512
+    display_frame: str | None = None
+    """How a stimulus is placed in the scene: ``"scene"`` fills the scene as far as its aspect allows; ``"<W>x<H>"``
+    letterboxes it first into the box of a W x H display centred in the scene (``data.letterbox_geometry``).
+    None (the STANDARD, owner decision 2026-11-23) = the display shape of the checkpoint's own training data
+    (:data:`TRAINING_FRAMES`; refused for a task not listed): a model only knows the geometry it was trained in.
+    The search runs saw COCO-Search18's 1680x1050 displays, so scene rows outside that box were always padding
+    for them. Set it only for a deliberate comparison (e.g. ``scene`` on FIGRIM/MIT1003). Recorded in the
+    protocol with its source."""
     centre_bias_fit: Path | None = None
     """A JSON ``{bandwidth, eps, ll}`` of the centre bias: read if it exists, else fitted on ``fit_part`` and
     written there (so every model of a dataset shares one fit). None: fitted, not written (~minutes)."""
@@ -114,6 +122,32 @@ class ScanpathConfig:
     train_seed: int = 0
     save_train_predictions: Path | None = None
     """Write the training-subset predictions here (``.npz``; keys index the SUBSET's scanpaths)."""
+
+
+TRAINING_FRAMES: dict[str, tuple[str, str]] = {
+    "search": ("1680x1050", "search trains on COCO-Search18's 1680x1050 displays letterboxed into the scene "
+                            "(search/data.py SearchDataset; crop augmentation keeps the aspect)"),
+    "distill": ("scene", "distill trains on images resized and centre-cropped to the square scene (core.preprocess)"),
+    "in1k": ("scene", "in1k trains on RandomResizedCrop to the square scene (in1k/data.py)"),
+    "ade20k": ("scene", "ade20k trains on centre-cropped or squished square scenes (Ade20kConfig ResizeMode)"),
+}
+"""The display shape of each task's training images in the scene (checked in the code, 2026-11-23)."""
+
+
+def training_display_frame(task: str | None) -> tuple[str, str]:
+    """(display_frame, why) of a task's training data; refuses a task whose training frame is not known."""
+    if task not in TRAINING_FRAMES:
+        raise ValueError(f"the training display frame of task {task!r} is not known (TRAINING_FRAMES); pass "
+                         "--cfg.display-frame explicitly after checking what its training images look like in the "
+                         "scene")
+    return TRAINING_FRAMES[task]
+
+
+def frame_is_identity(stimuli, frame: tuple[int, int] | None, scene: int) -> bool:
+    """Whether ``frame`` places every stimulus exactly as the plain scene letterbox does (stimuli at least as wide)."""
+    from .data import letterbox_geometry
+    sizes = {(int(h), int(w)) for h, w in stimuli.sizes}
+    return all(letterbox_geometry(h, w, scene, frame) == letterbox_geometry(h, w, scene) for h, w in sizes)
 
 
 def split_name(cfg: ScanpathConfig) -> str:
@@ -273,9 +307,10 @@ def predict(cfg: ScanpathConfig, canvit, stimuli, fixations, indices=None) -> Gr
     """The teacher-forced predictions of ``canvit`` for every scored fixation of ``fixations`` (or of the
     scanpaths ``indices``), keyed by the scanpath's index into ``fixations``."""
     from .canvit_models import precompute
+    frame = parse_display_frame(cfg.display_frame)
     loader = make_scanpath_loader(stimuli, fixations, scene_size=cfg.scene_size, batch_size=cfg.batch_size,
-                                  num_workers=cfg.num_workers, indices=indices)
-    return precompute(canvit, loader, grid=cfg.grid, scene_size=cfg.scene_size)
+                                  num_workers=cfg.num_workers, indices=indices, frame=frame)
+    return precompute(canvit, loader, grid=cfg.grid, scene_size=cfg.scene_size, frame=frame)
 
 
 def shard_indices(fixations, shard: tuple[int, int]) -> np.ndarray:
@@ -302,7 +337,7 @@ def write_samples(cfg: ScanpathConfig, canvit, stimuli, fixations) -> Path:
     assert cfg.save_samples is not None
     sub, keep = subset_scanpaths(fixations, cfg.samples_scanpaths or len(fixations.scanpaths), seed=cfg.sample_seed)
     loader = make_scanpath_loader(stimuli, sub, scene_size=cfg.scene_size, batch_size=cfg.batch_size,
-                                  num_workers=cfg.num_workers)
+                                  num_workers=cfg.num_workers, frame=parse_display_frame(cfg.display_frame))
     smp = sample_scanpaths(canvit.episode, loader, temperature=cfg.sample_temperature, seed=cfg.sample_seed,
                            cue_mixture=canvit.cue_mixture)
     smp["scanpath"] = keep[smp["scanpath"]]  # index into the evaluated scanpaths, as the predictions' keys
@@ -364,13 +399,23 @@ def run(cfg: ScanpathConfig) -> dict[str, Any]:
     fixations = select(fixations, condition=cfg.condition, limit=cfg.limit_scanpaths)
     in_sample = fit_part(cfg.dataset) == part  # no split: the training subset is the evaluated set itself
     record = {"task": "scanpath", "dataset": cfg.dataset, "split": split_name(cfg)}
-    protocol = {k: (str(v) if isinstance(v, Path) else v) for k, v in asdict(replace(cfg)).items()} | {
-        "part": part, "pysaliency": getattr(pysaliency, "__version__", "?")}
+
+    def resolve_frame(task: str | None) -> tuple[ScanpathConfig, str]:
+        if cfg.display_frame is not None:
+            return cfg, "--cfg.display-frame (explicit)"
+        spec, why = training_display_frame(task)
+        return replace(cfg, display_frame=spec), f"the checkpoint's training data: {why}"
+
+    def protocol_of(c: ScanpathConfig, frame_source: str) -> dict[str, Any]:
+        return {k: (str(v) if isinstance(v, Path) else v) for k, v in asdict(replace(c)).items()} | {
+            "part": part, "display_frame_source": frame_source, "pysaliency": getattr(pysaliency, "__version__", "?")}
 
     if cfg.shard is not None:  # GPU stage: predictions of one block of scanpaths, nothing scored
         if cfg.save_predictions is None:
             raise ValueError("--cfg.shard writes predictions only: give --cfg.save-predictions")
         canvit = build_model(cfg, stimuli, None, device)
+        cfg, frame_source = resolve_frame(canvit.episode.task.name)
+        protocol = protocol_of(cfg, frame_source)
         meta = canvit.episode.provenance
         preds = predict(cfg, canvit, stimuli, fixations, indices=shard_indices(fixations, cfg.shard))
         preds.save(cfg.save_predictions, meta=meta)
@@ -385,14 +430,25 @@ def run(cfg: ScanpathConfig) -> dict[str, Any]:
     fit = centre_bias_fit(cfg)
     centre_bias = centre_bias_model(stimuli, fixations, fit)
     canvit = None
+    frame_source = "n/a: a pixel-space model (no scene)"
     if cfg.predictions:  # CPU stage: score saved predictions
         model = GridScanpathModel.load(*cfg.predictions)
+        cfg, frame_source = resolve_frame((model.meta.get("run_config_argv") or [None])[0])
+        want = parse_display_frame(cfg.display_frame)
+        if model.frame != want:
+            # predictions made before the frame existed (None) are valid where the frame changes no stimulus
+            if not (model.frame is None and frame_is_identity(stimuli, want, cfg.scene_size)):
+                raise ValueError(f"the predictions were made with display frame {model.frame}, not {cfg.display_frame}")
+            frame_source += ("; the predictions were made unframed, which is identical here (every stimulus is at "
+                             "least as wide as the frame; checked)")
+            model.frame = want
         provenance = model.meta
     else:
         from .canvit_models import CanViTModel
         model = build_model(cfg, stimuli, centre_bias, device)
         if isinstance(model, CanViTModel):
             canvit = model
+            cfg, frame_source = resolve_frame(canvit.episode.task.name)
             model = predict(cfg, canvit, stimuli, fixations)
         provenance = None if canvit is None else canvit.episode.provenance
         if canvit is not None and cfg.save_predictions is not None:
@@ -424,7 +480,7 @@ def run(cfg: ScanpathConfig) -> dict[str, Any]:
         write_samples(cfg, canvit, stimuli, fixations)
     return record | {
         "model": getattr(model, "name", cfg.model) if isinstance(model, GridScanpathModel) else cfg.model,
-        "protocol": protocol | {
+        "protocol": protocol_of(cfg, frame_source) | {
             "centre_bias": fit, "off_stimulus_fixations": "clipped at load",
             "scored_fixations": "every fixation with a history (the start fixation is history only)"
             + ("; DAEMONS forced fixations after the first are scored (pysaliency's default; owner, 2026-11-23)"

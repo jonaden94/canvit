@@ -255,7 +255,7 @@ def test_sharded_predictions_equal_the_unsharded_run(fake_cs18, fake_search, tmp
     from canvit.scanpath.evaluate import ScanpathConfig, predict, shard_indices
     from canvit.scanpath.models import GridScanpathModel
     _, _, sv, fv = fake_search
-    cfg = ScanpathConfig(scene_size=S, grid=CG, batch_size=4, num_workers=0)
+    cfg = ScanpathConfig(scene_size=S, grid=CG, batch_size=4, num_workers=0, display_frame="1680x1050")
     m = CanViTModel(_episode(fake_cs18[0]), "policy")
     whole = predict(cfg, m, sv, fv)
     paths = []
@@ -264,6 +264,7 @@ def test_sharded_predictions_equal_the_unsharded_run(fake_cs18, fake_search, tmp
         predict(cfg, m, sv, fv, indices=shard_indices(fv, (i, 3))).save(paths[-1], meta={"shard": i})
     merged = GridScanpathModel.load(*paths)
     assert merged.logits.keys() == whole.logits.keys() and merged.meta == {"shard": 0}
+    assert merged.frame == whole.frame == (1050, 1680)
     for k, v in whole.logits.items():
         assert np.allclose(merged.logits[k], v, atol=1e-5)  # batch composition differs between the runs
     with pytest.raises(ValueError, match="overlap"):
