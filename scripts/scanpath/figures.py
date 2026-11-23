@@ -985,6 +985,44 @@ def scandiff_table(runs: Path, out: Path) -> None:
     (out / "scandiff_sanity.tex").write_text("\n".join(lines) + "\n")
 
 
+def scandiff_test_table(runs: Path, out: Path) -> None:
+    """ScanDiff's evaluator on the full COCO-Search18 test split (unmodified, helper_2's driver): KL(human-pair
+    || model-pair similarity distribution) in nats, lower = more human-like. 'human' is held-out subjects, the
+    noise floor. Duration-free columns only (CanViT has no fixation durations)."""
+    cols = [("MM_Vector", "vector"), ("MM_Direction", "direction"), ("MM_Length", "length"),
+            ("MM_Position", "position"), ("ScanMatchNoDur", "ScanMatch"), ("SequenceScore", "SS"),
+            ("SemanticSequenceScore", "SemSS")]
+    models = [("human", "humans (held out)"), ("canvit_mr-r0-base-s0", "CanViT policy"),
+              ("centre", "centre dummy"), ("random", "random dummy")]
+    lines = [r"\begin{tabular}{ll" + "r" * len(cols) + "}", r"\toprule",
+             r" & & \multicolumn{4}{c}{MultiMatch} & & & \\", r"\cmidrule(lr){3-6}",
+             "condition & model & " + " & ".join(c for _, c in cols) + r" \\", r"\midrule"]
+    found = False
+    for cond in ("tp", "ta"):
+        rows = {}
+        for model, label in models:
+            p = runs / f"cocosearch18_{cond}_test_{model}.json"
+            if p.exists():
+                rows[label] = json.loads(p.read_text())["kld"]
+        if not rows:
+            continue
+        found = True
+        best = {k: min(v[k] for lab, v in rows.items() if lab != "humans (held out)") for k, _ in cols}
+        for label, kld in rows.items():
+            vals = [(r"\textbf{%.2f}" if label != "humans (held out)" and kld[k] == best[k] else "%.2f") % kld[k]
+                    for k, _ in cols]
+            lines.append(f"{'present' if cond == 'tp' else 'absent'} & {label} & " + " & ".join(vals) + r" \\")
+        if cond == "tp":
+            lines.append(r"\midrule")
+    if not found:
+        print("ScanDiff test runs missing; skipped tables/scandiff.tex")
+        return
+    if lines[-1] == r"\midrule":
+        lines.pop()
+    lines += [r"\bottomrule", r"\end{tabular}"]
+    (out / "scandiff.tex").write_text("\n".join(lines) + "\n")
+
+
 # ---------------------------------------------------------------------------------------------------- main
 def env_dir(arg: Path | None, *names: str, sub: str = "") -> Path | None:
     if arg is not None:
@@ -1029,6 +1067,7 @@ def main() -> None:
     ent = entropy_figure(sv, fv, figs)
     curve, auc = tfp_figure(sv, fv, figs)
     scandiff_table(a.scandiff_runs, tabs)
+    scandiff_test_table(a.scandiff_runs, tabs)
     cb_macros = baselines_table(a.results, tabs)
     recs = load_records(a.results)
     ig_figure(recs, figs)
