@@ -4,7 +4,8 @@
 # Head and policy were trained through ONE retina (the run's --cfg.retina): every other retina is out of
 # distribution for them (a proper test needs a policy per retina).
 #   cd <canvit clone> && for r in <retina names>; do
-#     sbatch --job-name=retina_$r slurm/runs/scanpath/retina_sweep.sbatch <best.pt> <name> $r; done
+#     sbatch --job-name=retina_$r slurm/runs/scanpath/retina_sweep.sbatch <best.pt> <name> $r [dataset[:cond] ...]; done
+# Datasets: default coco_search18:tp coco_search18:ta; finished records (and the search eval) are skipped.
 # Records: $LOGS_DIR/scanpath_eval/<name>/retina/<retina>/{search_validation,coco_search18_{tp,ta}_validation}.json
 # Lane: one A100 on grete:shared with --qos=2h (skill grete-cluster). Runs the clone's working tree.
 # Written by Claude (AI, Claude Opus 5.5), 2026-11-23.
@@ -21,7 +22,8 @@ set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 source ./.envrc
 export TMPDIR=/mnt/lustre-grete/tmp/$USER
-CKPT=${1:?checkpoint}; NAME=${2:?name}; RET=${3:?retina}
+CKPT=${1:?checkpoint}; NAME=${2:?name}; RET=${3:?retina}; shift 3
+SETS=("$@"); [ ${#SETS[@]} -gt 0 ] || SETS=(coco_search18:tp coco_search18:ta)
 OUT="$LOGS_DIR/scanpath_eval/$NAME/retina/$RET"; mkdir -p "$OUT"
 nvidia-smi -L; git rev-parse --short HEAD
 if [ ! -f "$OUT/search_validation.json" ]; then
@@ -29,5 +31,4 @@ if [ ! -f "$OUT/search_validation.json" ]; then
     --cfg.num-workers 6 --opts.out "$OUT/search_validation.json.tmp" > "$OUT/search_validation.log" 2>&1
   mv "$OUT/search_validation.json.tmp" "$OUT/search_validation.json"
 fi
-RETINA=$RET NUM_WORKERS=6 PROCESSES=6 bash scripts/scanpath/eval_checkpoint.sh "$CKPT" "$NAME/retina/$RET" \
-  coco_search18:tp coco_search18:ta
+RETINA=$RET NUM_WORKERS=6 PROCESSES=6 bash scripts/scanpath/eval_checkpoint.sh "$CKPT" "$NAME/retina/$RET" "${SETS[@]}"
