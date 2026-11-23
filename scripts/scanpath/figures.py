@@ -31,7 +31,7 @@ import torch  # noqa: E402
 from matplotlib import font_manager  # noqa: E402
 from scipy.stats import norm  # noqa: E402
 
-from canvit.scanpath.data import eval_part, load_dataset  # noqa: E402
+from canvit.scanpath.data import eval_part, letterbox_geometry, load_dataset  # noqa: E402
 from canvit.scanpath.evaluate import select  # noqa: E402
 from canvit.scanpath.generative import target_hit_index, tfp_auc, tfp_curve  # noqa: E402
 from canvit.scanpath.models import GridScanpathModel, grid_log_density, policy_entropy  # noqa: E402
@@ -391,8 +391,8 @@ def load_records(results: Path) -> list[dict]:
             r = json.loads(p.read_text())
         except json.JSONDecodeError:
             continue
-        if not isinstance(r, dict) or r.get("task") != "scanpath":
-            continue
+        if not isinstance(r, dict) or r.get("task") != "scanpath" or "metrics" not in r:
+            continue  # also a shard of a sharded run (no metrics until merged)
         top = p.parent == results
         if top and (results / "baselines").is_dir():
             continue
@@ -406,7 +406,7 @@ def load_records(results: Path) -> list[dict]:
         if r["source"] in ("baselines", "deepgaze3"):
             r["kind"] = r["model"] if r["source"] == "baselines" else "deepgaze3"
         else:
-            r["kind"] = "canvit_heatmap" if r["model"] == "canvit_heatmap" else "canvit"
+            r["kind"] = "canvit_heatmap" if "heatmap" in r["model"] else "canvit"  # canvit_search_heatmap
         r["path"] = p
         recs.append(r)
     for ds in {r["dataset"] for r in recs}:  # every IG and every reference row against ONE centre bias per dataset
@@ -620,6 +620,90 @@ def qualitative_figure(recs: list[dict], out: Path, steps=(1, 2, 3, 4), n_rows: 
     return True
 
 
+def argmax_points(logits: np.ndarray, hw: tuple[int, int], scene: int) -> np.ndarray:
+    """[N, G*G] grid logits of one stimulus -> [N, 2] (x, y) stimulus pixels of each argmax cell, the argmax taken
+    over the cells that overlap the image (letterbox padding excluded); the point is the centre of the part of
+    the cell that lies on the image. Also returns that centre for every image cell ([M, 2], for a random cell)."""
+    h, w = hw
+    g = int(round(logits.shape[1] ** 0.5))
+    ch, cw, top, left = letterbox_geometry(h, w, scene)
+    edges = np.arange(g + 1) * scene / g  # cell edges in scene pixels
+    x0, x1 = np.clip(edges[:-1], left, left + cw), np.clip(edges[1:], left, left + cw)
+    y0, y1 = np.clip(edges[:-1], top, top + ch), np.clip(edges[1:], top, top + ch)
+    on = ((y1 - y0) > 0)[:, None] & ((x1 - x0) > 0)[None, :]  # [row, col]
+    cx, cy = ((x0 + x1) / 2 - left) * w / cw, ((y0 + y1) / 2 - top) * h / ch  # stimulus pixels
+    centres = np.stack(np.broadcast_arrays(cx[None, :], cy[:, None]), -1).reshape(-1, 2)
+    best = np.where(on.ravel()[None], logits, -np.inf).argmax(1)
+    return centres[best], centres[on.ravel()]
+
+
+def policy_vs_human(recs: list[dict], out: Path, steps=(1, 2, 3, 4), near: float = 0.05) -> dict[str, str]:
+    """tables/policy_vs_human.tex: for fixation t after the human's fixations 0..t-1 (teacher forced), the human's
+    fixation t vs the policy's argmax cell: saccade amplitude from fixation t-1, distance to the nearest earlier
+    fixation (both means, fraction of the longer side), share within ``near`` of an earlier fixation; and at t = 1
+    (target present) the share inside the target box, with the expectation for a uniformly random image cell."""
+    rows, macros = [], {}
+    for cond in CONDITIONS:
+        r = next((r for r in canvit_records(recs, "coco_search18", f"{cond}_validation") if predictions(r)), None)
+        if r is None:
+            continue
+        st, fx, m = predictions(r)
+        sp = fx.scanpaths
+        L = np.asarray(sp.length)
+        stat = {t: {k: [] for k in ("amp_h", "amp_p", "near_h", "near_p")} for t in steps}
+        box = {"h": [], "p": [], "rand": []}
+        for i in range(len(L)):
+            ts = [t for t in steps if t < L[i] and (i, t) in m.logits]
+            if not ts:
+                continue
+            n = int(sp.n[i])
+            hw = tuple(int(v) for v in st.sizes[n])
+            side = max(hw)
+            xy = np.stack([np.asarray(sp.xs[i])[: L[i]], np.asarray(sp.ys[i])[: L[i]]], -1)
+            pts, cells = argmax_points(np.stack([m.logits[(i, t)] for t in ts]), hw, m.scene)
+            for t, pp in zip(ts, pts):
+                for who, q in (("h", xy[t]), ("p", pp)):
+                    stat[t][f"amp_{who}"].append(np.hypot(*(q - xy[t - 1])) / side)
+                    stat[t][f"near_{who}"].append(np.hypot(*(xy[:t] - q).T).min() / side)
+            if cond == "tp" and ts[0] == 1:
+                b = np.asarray(sp.scanpath_attributes["target_bbox"][i])  # xywh pixels
+
+                def inside(q):
+                    return ((q[..., 0] >= b[0]) & (q[..., 0] <= b[0] + b[2])
+                            & (q[..., 1] >= b[1]) & (q[..., 1] <= b[1] + b[3]))
+
+                box["h"].append(inside(xy[1]))
+                box["p"].append(inside(pts[0]))
+                box["rand"].append(inside(cells).mean())
+        for t in steps:
+            v = {k: np.asarray(x) for k, x in stat[t].items()}
+            if not len(v["amp_h"]):
+                continue
+            rows.append(f"{CONDITIONS[cond].split()[1]} & {t} & {len(v['amp_h']):,} & {v['amp_h'].mean():.2f} & "
+                        f"{v['amp_p'].mean():.2f} & {v['near_h'].mean():.2f} & {v['near_p'].mean():.2f} & "
+                        f"{(v['near_h'] < near).mean():.2f} & {(v['near_p'] < near).mean():.2f} \\\\"
+                        .replace(",", "{,}"))
+        if box["h"]:
+            vals = {k: float(np.mean(x)) for k, x in box.items()}
+            macros |= {"pvhBoxHumanTP": f"{vals['h']:.3f}", "pvhBoxPolicyTP": f"{vals['p']:.3f}",
+                       "pvhBoxRandomTP": f"{vals['rand']:.3f}", "pvhBoxN": f"{len(box['h'])}"}
+    if not rows:
+        print("policy_vs_human: no CanViT COCO-Search18 predictions yet")
+        return {}
+    lines = [r"\begin{tabular}{lrrrrrrrr}", r"\toprule",
+             r" & & & \multicolumn{2}{c}{amplitude} & \multicolumn{2}{c}{nearest earlier fixation} & "
+             rf"\multicolumn{{2}}{{c}}{{within {near:g} of an earlier one}} \\",
+             r"condition & $t$ & fixations & humans & policy & humans & policy & humans & policy \\", r"\midrule",
+             *rows]
+    if macros:
+        lines += [r"\midrule", rf"\multicolumn{{9}}{{l}}{{target present, $t=1$, inside the target box: humans "
+                               rf"{macros['pvhBoxHumanTP']}, policy argmax {macros['pvhBoxPolicyTP']}, random image "
+                               rf"cell {macros['pvhBoxRandomTP']} ({macros['pvhBoxN']} scanpaths)}} \\"]
+    lines += [r"\bottomrule", r"\end{tabular}"]
+    (out / "policy_vs_human.tex").write_text("\n".join(lines) + "\n")
+    return macros
+
+
 # The evaluated (dataset, split) pairs in the order of the cross-dataset figure and table.
 EVALS = [("coco_search18", "tp_validation", "COCO-Search18 TP"), ("coco_search18", "ta_validation", "COCO-Search18 TA"),
          ("coco_freeview", "validation", "COCO-FreeView"), ("mit1003", "all", "MIT1003"), ("cat2000", "all", "CAT2000"),
@@ -682,7 +766,7 @@ def cross_dataset_figure(recs: list[dict], out: Path, refs: list[dict] = ()) -> 
                 r = next((r for r in recs if r["kind"] == kind and r["dataset"] == ds and r["split"] == split), None)
                 if r is None or key not in r["metrics"]:
                     continue
-                handles[label] = ax.plot(r["metrics"][key], row + (k - (len(kinds) - 1) / 2) * 0.22, marker=marker,
+                handles[label] = ax.plot(r["metrics"][key], row + (k - (len(kinds) - 1) / 2) * 0.15, marker=marker,
                                          ms=4, color=color, ls="none")[0]
         for f in refs:
             if f["metric"] != key:
@@ -691,14 +775,14 @@ def cross_dataset_figure(recs: list[dict], out: Path, refs: list[dict] = ()) -> 
             kind, lab = PUBLISHED[f["model"]]
             c, mk = STYLE[kind][:2] if kind else (OKABE_ITO["purple"], "P")
             lab += "" if f["comparable"] == "yes" else " (other split)"
-            handles[lab] = ax.plot(f["value"], row + 0.33, marker=mk, ms=4, mfc="none", mec=c, ls="none")[0]
+            handles[lab] = ax.plot(f["value"], row + 0.38, marker=mk, ms=4, mfc="none", mec=c, ls="none")[0]
         if key == "ig_image":
             ax.axvline(0, color=BASELINE_COLOR, lw=0.5)
         ax.set(xlabel=name)
         despine(ax)
     axes[0].set(yticks=range(len(EVALS)), yticklabels=[e[2] for e in EVALS], ylim=(len(EVALS) - 0.5, -0.5))
     fig.legend(handles=list(handles.values()), labels=list(handles), loc="outside upper center",
-               ncol=min(len(handles), 4))
+               ncol=min(len(handles), 3))
     save(fig, out / "cross_dataset.pdf")
     return True
 
@@ -719,16 +803,20 @@ def results_table(recs: list[dict], out: Path) -> dict[str, str]:
             m = r["metrics"]
             vals = " & ".join(f"{m[k]:.3f}".replace("-", "$-$") for k in ("ig_image", "ll_image", "auc_image",
                                                                             "nss_image"))
-            rows.append(f" & {STYLE[kind][2]} & {int(m['n_fixations'])} & {vals} \\\\")
-            if kind == "canvit" and ds == "coco_search18":
-                tag = split[:2].upper()
+            name = "CanViT policy, cue mixture" if r["model"].endswith("cuemix") else STYLE[kind][2]  # 18 cues
+            rows.append(f" & {name} & {int(m['n_fixations'])} & {vals} \\\\")
+            tag = {"tp_validation": "TP", "ta_validation": "TA"}.get(split) if ds == "coco_search18" else \
+                {"coco_freeview": "FV"}.get(ds)
+            if kind in ("canvit", "canvit_heatmap") and tag:
+                pre = "cv" if kind == "canvit" else "hm"
                 d = r.get("diagnostics", {}).get("tempered_global", {})
-                vals = {f"cvIG{tag}": m["ig_image"], f"cvLL{tag}": m["ll_image"], f"cvAUC{tag}": m["auc_image"],
-                        f"cvNSS{tag}": m["nss_image"]} | {f"cvIG{tag}t{w}": m[f"ig_t{i}"]  # no digits in a macro name
+                vals = {f"{pre}IG{tag}": m["ig_image"], f"{pre}LL{tag}": m["ll_image"],
+                        f"{pre}AUC{tag}": m["auc_image"],
+                        f"{pre}NSS{tag}": m["nss_image"]} | {f"{pre}IG{tag}t{w}": m[f"ig_t{i}"]  # no digits in names
                                                           for i, w in ((1, "One"), (2, "Two"), (3, "Three"))
                                                           if f"ig_t{i}" in m}
                 if d:  # the temperature diagnostic: global tau and the IG at that tau
-                    vals |= {f"cvTau{tag}": d["temperature"], f"cvIGtau{tag}": d["ig_image"]}
+                    vals |= {f"{pre}Tau{tag}": d["temperature"], f"{pre}IGtau{tag}": d["ig_image"]}
                 fmt = {k: (".3f" if "AUC" in k else ".2f") for k in vals}
                 macros |= {k: f"{v:{fmt[k]}}".replace("-", r"\ensuremath{-}") for k, v in vals.items()}
         if rows:
@@ -845,6 +933,7 @@ def main() -> None:
     qualitative_figure(recs, figs)
     cross_dataset_figure(recs, figs, read_references(a.references))
     res_macros = results_table(recs, tabs)
+    res_macros |= policy_vs_human(recs, tabs)
 
     sacc = {}
     for slug, cond, title in PANELS:
