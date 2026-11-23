@@ -25,6 +25,13 @@
 #   ARM=bvit  bash slurm/runs/exp48_recurrence/exp48.sh
 #   ARM=revit bash slurm/runs/exp48_recurrence/exp48.sh
 #   ARM=bvit SEED=1 ARRAY=0-24%1 bash slurm/runs/exp48_recurrence/exp48.sh
+#
+# Baseline: ARM=vit s0 is the same config as jon_exp32_pretrain_lrdrop/exp32-uniform16
+# (older code pin), whose logs reach 1.43M steps — no need to re-run it for seed 0.
+# Smoke 2026-11-19 (job 17408686, ARM=bvit, 2 x 8192 steps, ~65 min/job): ran, resumed,
+# no NaN; loss tracks exp32 within ~0.03 at 16k steps, val scene_cos_raw@8192 0.6630 vs
+# 0.6633. Harmless shutdown noise: DataLoader workers fail to rmtree their pymp-* dirs
+# on the NFS $TMPDIR ("Device or resource busy") after wandb has finished.
 # NOTHING IS SUBMITTED by writing this file.
 set -euo pipefail
 
@@ -40,13 +47,15 @@ MEM=128G
 NGPU=1
 TASK=distill
 
-# === config (= exp32-uniform16, plus seed + more frequent val for the smoke) ===
+# === config (= exp32-uniform16, plus an explicit seed) ===
 CFG_WANDB_PROJECT=caglar_exp48_recurrence
 CFG_SEED=$SEED
 CFG_PEAK_LR=0.0004
 CFG_BATCH_SIZE_PER_GPU=64
 CFG_STEPS_PER_JOB=8192
-CFG_VAL_EVERY=${VAL_EVERY:-4096}
+# 8192 = exp32-uniform16's cadence (once per job, at each job's start), so every val
+# point lands on a step exp32 also validated. Keep it fixed for the life of a run.
+CFG_VAL_EVERY=${VAL_EVERY:-8192}
 CFG_LOG_EVERY=512
 CFG_NUM_WORKERS=4
 case "$ARM" in
