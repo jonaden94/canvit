@@ -220,6 +220,8 @@ class DistillCmd:
             seed=self.opts.seed if self.opts.seed is not None else self.cfg.seed,
             device=str(self.cfg.device), compile=self.cfg.compile,
             seed_ckpt=self.cfg.seed_ckpt,
+            seed_optimizer=self.cfg.seed_optimizer,
+            seed_exp_avg_sq_scale=self.cfg.seed_exp_avg_sq_scale,
             resume=self.opts.resume if self.opts.resume is not None else True,
             **_identity(self.cfg, self.opts, prefix=""),
             # Break `patcher` down into kpe / embed_head / conditioner (and the

@@ -86,6 +86,13 @@ class JointPolicyConfig:
     the FULL-start branches become policy branches while the RANDOM-start branches
     stay pure continuous-random (distill-only, no policy loss) for broad view
     coverage — needs n_full_start_branches>=1 and n_random_start_branches>=1."""
+    second_branch: Literal["none", "random_start", "center_start"] | None = None
+    """None (default): branches come from the task (``n_full_start_branches`` /
+    ``n_random_start_branches``) and ``keep_random_branch`` decides which are policy branches.
+    Set: exactly one policy branch (center start, then policy glimpses) plus the given second
+    branch, which takes random glimpses and no policy loss: ``none`` = no second branch,
+    ``random_start`` = random start, ``center_start`` = center start. Overrides the task's
+    branch counts; not combinable with ``keep_random_branch``."""
 
     # Objective
     objective: Literal["qreg", "pg", "vpg"] = "qreg"

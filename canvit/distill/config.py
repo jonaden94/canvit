@@ -108,6 +108,11 @@ class Config:
     seed_ckpt: Path | None = None
     """Seed model weights from external checkpoint (.pt in CheckpointData format).
     Starts fresh (new experiment, step=0). Only used if no checkpoint exists in run_dir."""
+    seed_optimizer: bool = False
+    """With ``seed_ckpt``: also take over the seed's AdamW state for the task (backbone) group
+    (RunSettings.seed_optimizer). The LR schedule is still this run's (use warmup_steps 0)."""
+    seed_exp_avg_sq_scale: float = 1.0
+    """Multiply the taken-over exp_avg_sq by this (RunSettings.seed_exp_avg_sq_scale)."""
     hf_seed_ckpt: str | None = None
     """Seed model weights from HF Hub repo (e.g. '<org>/canvitb16-add-vpe-...'). Downloads
     config.json + model.safetensors, overrides cfg.model with the checkpoint's config.

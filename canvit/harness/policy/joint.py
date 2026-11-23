@@ -64,6 +64,7 @@ class JointPolicy:
     keep_random_branch: bool
     target_momentum: float
     device: torch.device
+    second_branch: str | None = None  # JointPolicyConfig.second_branch (None = the task's branches)
     prime_target: float = 1.0  # ε-curriculum: prime_on_policy ramps 0 -> this...
     prime_warmup: int = 0  # ...over this many steps (0 = constant target)
     running: dict[int, RunningNorm] = field(default_factory=dict)
@@ -75,12 +76,25 @@ class JointPolicy:
     _rollout_entropies: list = field(default_factory=list)  # entropy_update='per_rollout' accumulator
     _logged_entropies: list = field(default_factory=list)  # inline PG: this rollout's entropies, for logging
 
-    def branch_selector(self, t0_type: ViewpointType) -> tuple[object, bool]:
+    def branches(self, task_branches: list[ViewpointType]) -> list[ViewpointType]:
+        """The rollout's branch t0 types: the task's, or with ``second_branch`` set one policy
+        branch (FULL) plus the second branch (none / RANDOM start / FULL start)."""
+        if self.second_branch is None:
+            return task_branches
+        second = {"none": [], "random_start": [ViewpointType.RANDOM],
+                  "center_start": [ViewpointType.FULL]}[self.second_branch]
+        return [ViewpointType.FULL] + second
+
+    def branch_selector(self, t0_type: ViewpointType, branch_idx: int = 0) -> tuple[object, bool]:
         """(selector, is_policy_branch) for a branch with this t0 type. Policy
         branches are FULL-anchored (the caller forces t0=FULL and rewards t>=1);
         with ``keep_random_branch`` the RANDOM-start branches stay pure-random
-        (distill-only, no policy loss). Off => every branch is a policy branch."""
-        is_policy = (not self.keep_random_branch) or (t0_type == ViewpointType.FULL)
+        (distill-only, no policy loss). Off => every branch is a policy branch.
+        With ``second_branch`` set, branch 0 is the policy branch and the other is random."""
+        if self.second_branch is not None:
+            is_policy = branch_idx == 0
+        else:
+            is_policy = (not self.keep_random_branch) or (t0_type == ViewpointType.FULL)
         return (self.policy_selector, True) if is_policy else (self.random_selector, False)
 
     def set_prime_for_step(self, step: int) -> None:

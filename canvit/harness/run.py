@@ -111,6 +111,14 @@ class RunSettings:
     model. Distinct from ``resume`` (full state, continues the step count), which takes
     priority: resume > seed_ckpt > fresh. Task-level HF seeding (distill's
     ``cfg.hf_seed_ckpt``, ade20k/in1k's ``cfg.model_repo``) happens in ``build_model``."""
+    seed_optimizer: bool = False
+    """With ``seed_ckpt``: also take over the seed's AdamW state (exp_avg, exp_avg_sq, step) for
+    the parameters of the seed's single optimizer group, matched by name, into this run's
+    ``backbone`` group (see :func:`load_seed_optimizer_state`). Other groups (policy) start
+    fresh; lr, weight decay, betas and the schedule stay this run's."""
+    seed_exp_avg_sq_scale: float = 1.0
+    """Multiply the taken-over exp_avg_sq by this: the squared-gradient average grows when the
+    batch shrinks (measured ~3x from exp38's 4x64 to 1x64, 2026-11-24)."""
     compile: bool = False        # torch.compile the model after build (perf)
     run_dir: Path | None = None
     """Root for this run's artifacts (`{run_dir}/checkpoints`, `{run_dir}/visualization`),
@@ -200,6 +208,42 @@ def _infinite(loader: Any):
     while True:
         for batch in loader:
             yield batch
+
+
+def load_seed_optimizer_state(optimizer: Any, names: list[str], params: list[Any], seed_payload: dict,
+                              *, exp_avg_sq_scale: float = 1.0) -> int:
+    """Copy a seed checkpoint's AdamW state into ``optimizer`` for ``params`` (named ``names``).
+
+    The seed optimizer must have ONE param group; its params are identified by name through the
+    seed's ``model_state`` order (a state_dict lists parameters in ``named_parameters`` order).
+    The seed's parameters must be exactly ``names`` minus the ones new in this run (absent from
+    the seed's model_state); every shape must match. Returns the number of tensors with state."""
+    o = seed_payload.get("optimizer_state")
+    if not o:
+        raise ValueError("seed_optimizer: the seed checkpoint has no optimizer_state")
+    if len(o["param_groups"]) != 1:
+        raise ValueError(f"seed_optimizer: seed has {len(o['param_groups'])} param groups, expected 1")
+    want = set(names)
+    seed_names = [k for k in seed_payload["model_state"] if k in want]
+    seed_ids = o["param_groups"][0]["params"]
+    if len(seed_names) != len(seed_ids):
+        raise ValueError(f"seed_optimizer: seed group has {len(seed_ids)} params, its model_state "
+                         f"{len(seed_names)} of this run's backbone params")
+    by_name = {n: o["state"][i] for n, i in zip(seed_names, seed_ids) if i in o["state"]}
+    n_loaded = 0
+    for name, p in zip(names, params, strict=True):
+        st = by_name.get(name)
+        if st is None:
+            continue
+        if st["exp_avg"].shape != p.shape:
+            raise ValueError(f"seed_optimizer: {name} shape {tuple(st['exp_avg'].shape)} != {tuple(p.shape)}")
+        optimizer.state[p] = {
+            "step": st["step"].detach().to("cpu", torch.float32).clone(),  # as AdamW keeps it (not fused/capturable)
+            "exp_avg": st["exp_avg"].to(device=p.device, dtype=p.dtype).clone(),
+            "exp_avg_sq": (st["exp_avg_sq"].to(device=p.device, dtype=p.dtype) * exp_avg_sq_scale).clone(),
+        }
+        n_loaded += 1
+    return n_loaded
 
 
 def run(*, task: RunTask, spec: TrainSpec, settings: RunSettings) -> dict:
@@ -347,6 +391,13 @@ def run(*, task: RunTask, spec: TrainSpec, settings: RunSettings) -> dict:
             # (now pretrained) trunk: at step 0 it computes what read-only tokens would.
             stream.copy_from_trunk(core)
             log.info("SEED: isolated policy stream initialised from the seeded trunk")
+        if settings.seed_optimizer:
+            named = {id(p): n for n, p in core.named_parameters()}
+            n = load_seed_optimizer_state(
+                optimizer, [named[id(p)] for p in param_groups["backbone"]],
+                list(param_groups["backbone"]), seed_payload, exp_avg_sq_scale=settings.seed_exp_avg_sq_scale)
+            log.info("SEED: AdamW state of %d backbone tensors taken over (exp_avg_sq x %g)",
+                     n, settings.seed_exp_avg_sq_scale)
         start_step = 0
     else:
         log.info("FRESH mode: no checkpoint, starting from scratch")
@@ -363,6 +414,11 @@ def run(*, task: RunTask, spec: TrainSpec, settings: RunSettings) -> dict:
     train_batches = _infinite(train_loader)
     selector = task.build_selector(device=device, canvas_grid=canvas_grid, is_foveated=is_foveated)
     branches = task.branches()
+    if joint is not None and joint.second_branch is not None:
+        if joint.keep_random_branch:
+            raise ValueError("rl.second_branch replaces rl.keep_random_branch; set only one")
+        branches = joint.branches(branches)
+        log.info("branches (rl.second_branch=%s): %s", joint.second_branch, [b.name for b in branches])
 
     amp_ctx: Any = nullcontext()
     if settings.amp and use_cuda:

@@ -137,6 +137,7 @@ def build_policy(
             policy_selector=tok_sel, random_selector=tok_random,
             scorer=canvit.policy_parameters_module(),  # type: ignore[arg-type]
             objective=obj, rl_weight=rl.rl_weight, keep_random_branch=rl.keep_random_branch,
+            second_branch=rl.second_branch,
             target_momentum=rl.target_momentum, device=device, prime_target=1.0, prime_warmup=0,
             reward=reward,
         )
@@ -225,7 +226,7 @@ def build_policy(
 
     jp = JointPolicy(
         policy_selector=policy_sel, random_selector=random_sel, scorer=scorer, objective=obj,
-        rl_weight=rl.rl_weight, keep_random_branch=rl.keep_random_branch,
+        rl_weight=rl.rl_weight, keep_random_branch=rl.keep_random_branch, second_branch=rl.second_branch,
         target_momentum=rl.target_momentum, device=device,
         prime_target=rl.prime_on_policy, prime_warmup=rl.policy_warmup_steps,
         reward=reward,

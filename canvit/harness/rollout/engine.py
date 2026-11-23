@@ -282,7 +282,7 @@ def run_rollout(
         # Joint mode: pick this branch's selector. Policy branches are FULL-anchored
         # and carry the in-graph policy loss; non-policy branches run pure-random.
         if joint is not None:
-            sel, is_policy = joint.branch_selector(t0_type)
+            sel, is_policy = joint.branch_selector(t0_type, branch_idx)
             if is_policy:
                 t0_type = ViewpointType.FULL
         else:
