@@ -90,10 +90,13 @@ class ScanpathConfig:
     """CanViT models: write the predicted maps here (``.npz``, ``GridScanpathModel.save``), e.g. for figures."""
     save_samples: Path | None = None
     """CanViT policy models: also sample the model's OWN scanpaths, one per evaluated human scanpath and as long
-    as it (``canvit_models.sample_scanpaths``), and write them here (``.npz``, stimulus pixels)."""
+    as it (``canvit_models.sample_scanpaths``), and write them here (``.npz``, stimulus pixels); a cue mixture
+    writes ``<stem>_cuemix.npz``."""
     sample_temperature: float = 1.0
     """Softmax temperature of the sampled scanpaths (1 = the policy's own distribution; 0 = its argmax)."""
     sample_seed: int = 0
+    samples_scanpaths: int | None = 2000
+    """Sample for a seeded random subset of at most this many evaluated scanpaths (None: all)."""
     train_scanpaths: int = 0
     """CanViT models: > 0 also runs the model on a seeded random subset of this many TRAINING scanpaths (``fit_part``,
     same condition; :func:`subset_scanpaths`), for what is FITTED on train: the temperature DIAGNOSTIC (one global
@@ -127,10 +130,10 @@ def select(fixations, *, condition: str, limit: int | None):
 
 
 def subset_scanpaths(fixations, n: int, *, seed: int):
-    """A seeded random subset of ``n`` scanpaths (all if fewer), in their original order."""
+    """A seeded random subset of ``n`` scanpaths (all if fewer), in their original order, and their indices."""
     m = len(fixations.scanpaths)
     keep = np.arange(m) if m <= n else np.sort(np.random.default_rng(seed).choice(m, size=n, replace=False))
-    return fixations.filter_scanpaths(keep)
+    return fixations.filter_scanpaths(keep), keep
 
 
 def scored_fixations(fixations):
@@ -332,8 +335,8 @@ def run(cfg: ScanpathConfig) -> dict[str, Any]:
                 train = (stimuli, fixations, model)
             else:
                 st, ft = load(cfg, fit_part(cfg.dataset))
-                ft = subset_scanpaths(select(ft, condition=cfg.condition, limit=None), cfg.train_scanpaths,
-                                      seed=cfg.train_seed)
+                ft, _ = subset_scanpaths(select(ft, condition=cfg.condition, limit=None), cfg.train_scanpaths,
+                                         seed=cfg.train_seed)
                 train = (st, ft, predict(st, ft))
                 if cfg.save_train_predictions is not None:
                     train[2].save(cfg.save_train_predictions)
@@ -344,13 +347,20 @@ def run(cfg: ScanpathConfig) -> dict[str, Any]:
         if canvit is None or canvit.readout != "policy":
             raise ValueError("--cfg.save-samples needs a CanViT policy model (--cfg.model canvit_policy)")
         from .canvit_models import sample_scanpaths
-        loader = make_scanpath_loader(stimuli, fixations, scene_size=cfg.scene_size, batch_size=cfg.batch_size,
+        sub, keep = subset_scanpaths(fixations, cfg.samples_scanpaths or len(fixations.scanpaths),
+                                     seed=cfg.sample_seed)
+        loader = make_scanpath_loader(stimuli, sub, scene_size=cfg.scene_size, batch_size=cfg.batch_size,
                                       num_workers=cfg.num_workers)
         smp = sample_scanpaths(canvit.episode, loader, temperature=cfg.sample_temperature, seed=cfg.sample_seed,
                                cue_mixture=canvit.cue_mixture)
+        smp["scanpath"] = keep[smp["scanpath"]]  # index into the evaluated scanpaths, as the predictions' keys
         smp["n"] = np.asarray(fixations.scanpaths.n)[smp["scanpath"]]  # the stimulus index of each sample
-        cfg.save_samples.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(cfg.save_samples, **smp)
+        smp["model"] = np.array(canvit.name)
+        samples_path = cfg.save_samples
+        if canvit.cue_mixture:  # the file name says which model the samples come from
+            samples_path = samples_path.with_name(f"{samples_path.stem}_cuemix{samples_path.suffix}")
+        samples_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(samples_path, **smp)
     return {
         "task": "scanpath",
         "model": getattr(model, "name", cfg.model) if isinstance(model, GridScanpathModel) else cfg.model,

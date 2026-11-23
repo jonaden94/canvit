@@ -124,11 +124,11 @@ class PolicyEpisode:
         [B, n, G*G] (row t-1 read after glimpse t-1, i.e. the prediction for fixation t), and the centres
         of glimpses 0..n-1 [B, n, 2] (x, y).
 
-        ``all_cues = K`` (search, centres that do not depend on the scores, i.e. teacher forcing): the readouts
-        for EVERY cue 0..K-1, [B, n, K, G*G]. The cue enters the policy only as the scorer's ``cond`` (the
-        encoder's features, and the backbone state, do not depend on it) and the heatmap only through the
-        head, so the backbone runs once and the scorer and head run on the same features for each cue; the
-        episode itself runs with cue 0."""
+        ``all_cues = K`` (search): the readouts for EVERY cue 0..K-1, [B, n, K, G*G], and ``next_xy`` gets the
+        [B, K, G*G] scores of all cues. The cue enters the policy only as the scorer's ``cond`` (the encoder's
+        features, and the backbone state, do not depend on it) and the heatmap only through the head, so the
+        backbone runs once and the scorer and head run on the same features for each cue. The selector runs
+        with cue 0, but its choice is never used: ``next_xy`` places every glimpse t >= 1."""
         from canvit.harness.rollout.engine import _to_vp
         from canvit.harness.rollout.eval_viewpoints import deploy_selector
         from canvit.harness.rollout.viewpoint import ViewpointType
@@ -166,7 +166,8 @@ class PolicyEpisode:
             if scores is not None and all_cues:
                 feats = sel.last_aux["feats"].float().repeat_interleave(all_cues, 0)  # (b, k) rows, k fastest
                 k_cue = torch.arange(all_cues, device=images.device).repeat(B)
-                out["policy"].append(sel.net(feats, cond=embed(k_cue)).float().reshape(B, all_cues, -1))
+                scores = sel.net(feats, cond=embed(k_cue)).float().reshape(B, all_cues, -1)
+                out["policy"].append(scores)
             elif scores is not None:
                 out["policy"].append(scores)
             if t == n:
@@ -196,23 +197,45 @@ class PolicyEpisode:
         return self._episode(batch, n, lambda t, scores: clamp_to_content(human[:, t], batch["content"]),
                              all_cues=all_cues)[0]
 
-    def sample(self, batch: dict, n: int, *, temperature: float, generator: torch.Generator | None = None) -> Tensor:
-        """The model's OWN scanpath of n fixations (the anchor + n-1 chosen) [B, n, 2] scene (x, y): fixation t
-        is the centre of a cell drawn from softmax(scores / temperature); temperature 0 = the argmax, i.e. the
-        deploy rollout. Needs the policy."""
+    def sample(self, batch: dict, n: int, *, temperature: float, generator: torch.Generator | None = None,
+               cue_mixture: bool = False) -> Tensor:
+        """The model's OWN scanpath of n fixations (the anchor + n-1 chosen) [B, n, 2] scene (x, y), drawn from
+        the SAME density the likelihood scores: fixation t is a cell drawn with p(cell) = softmax(scores /
+        temperature + log pixels of the image in the cell) (``models.grid_log_density``), placed at the cell
+        centre clamped onto the image. ``cue_mixture`` (a search model on free viewing): p(cell) is the
+        equal-weight mixture of the per-cue p(cell) at every step (``CanViTModel.mixed_logits``), from one
+        backbone pass. Temperature 0 = the argmax of the scores (cue mixture: of the mixed p), i.e. the deploy
+        rollout for one cue. Needs the policy and ``batch["hw"]``."""
+        import math
+
+        from .models import _pixel_cells
         if self.joint is None:
             raise ValueError("sampling scanpaths needs the learned policy")
+        K = 0
+        if cue_mixture:
+            from canvit.search.data import COCO_SEARCH18_CLASSES
+            K = len(COCO_SEARCH18_CLASSES)
+        S = batch["image"].shape[-1]
 
-        def draw(t, scores):
-            g = int(round(scores.shape[1] ** 0.5))
-            if temperature == 0:
-                idx = scores.argmax(1)
+        def draw(t, scores):  # scores [B, G*G], or [B, K, G*G] for the cue mixture
+            g = int(round(scores.shape[-1] ** 0.5))
+            if temperature == 0 and not K:
+                idx = scores.argmax(-1)
             else:
-                idx = torch.multinomial(torch.softmax(scores / temperature, 1), 1, generator=generator).squeeze(1)
+                count = np.stack([_pixel_cells(int(h), int(w), S, g)[1] for h, w in batch["hw"].tolist()])
+                logcount = torch.from_numpy(count).to(scores.device).float().log()
+                if K:
+                    logcount = logcount[:, None]
+                logp = torch.log_softmax(scores.float() / (temperature or 1.0) + logcount, -1)
+                if K:
+                    logp = torch.logsumexp(logp, 1) - math.log(K)
+                idx = logp.argmax(-1) if temperature == 0 else torch.multinomial(
+                    logp.exp(), 1, generator=generator).squeeze(1)
             c = (torch.arange(g, device=scores.device, dtype=torch.float32) + 0.5) * (2.0 / g) - 1.0
-            return torch.stack([c[idx % g], c[idx // g]], -1)  # cell (row, col) = (idx // g, idx % g)
+            xy = torch.stack([c[idx % g], c[idx // g]], -1)  # cell (row, col) = (idx // g, idx % g)
+            return xy if temperature == 0 and not K else clamp_to_content(xy, batch["content"])
 
-        return self._episode(batch, n, draw)[1]
+        return self._episode(batch, n, draw, all_cues=K)[1]
 
 
 def _check_view_scale(payload: dict, fs) -> None:
@@ -306,21 +329,17 @@ def sample_scanpaths(ep: PolicyEpisode, loader, *, temperature: float, seed: int
                      cue_mixture: bool = False) -> dict[str, np.ndarray]:
     """The model's OWN scanpaths (:meth:`PolicyEpisode.sample`), one per human scanpath of ``loader``, each as long
     as that human's (the model has no stop; at most ``max_len``), fixation 0 the centre anchor. ``cue_mixture``
-    (a search model on free viewing): the cue of each sample is drawn uniformly. Returns ``xs``, ``ys`` [N, L]
-    in STIMULUS pixels (NaN-padded), ``scanpath`` (the human scanpath's index), ``n_fix`` and ``cue`` [N]."""
-    from canvit.search.data import COCO_SEARCH18_CLASSES
-
+    (a search model on free viewing): every fixation from the per-step cue mixture, the scored model. Returns
+    ``xs``, ``ys`` [N, L] in STIMULUS pixels (NaN-padded), ``scanpath`` (the human scanpath's index), ``n_fix`` and
+    ``cue`` [N] (-1: the mixture)."""
     from .data import letterbox_geometry
     gen = torch.Generator(device=ep.device).manual_seed(seed)
-    cue_gen = torch.Generator().manual_seed(seed)
     xs, ys, sp, lens, cues = [], [], [], [], []
     for batch in loader:
         batch = {k: v.to(ep.device) for k, v in batch.items()}
         L = batch["n_fix"].clamp(max=max_len) if max_len else batch["n_fix"]
-        if cue_mixture:
-            cue = torch.randint(len(COCO_SEARCH18_CLASSES), batch["cue"].shape, generator=cue_gen)
-            batch["cue"] = cue.to(ep.device)
-        xy = ep.sample(batch, int(L.max()), temperature=temperature, generator=gen).cpu().numpy()  # scene (x, y)
+        xy = ep.sample(batch, int(L.max()), temperature=temperature, generator=gen,
+                       cue_mixture=cue_mixture).cpu().numpy()  # scene (x, y)
         S = batch["image"].shape[-1]
         for b, (h, w) in enumerate(batch["hw"].tolist()):
             ch, cw, top, left = letterbox_geometry(h, w, S)  # the inverse of data.pixel_to_scene

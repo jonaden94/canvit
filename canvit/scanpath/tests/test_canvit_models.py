@@ -31,7 +31,8 @@ def _episode(root, *, policy=True):
 def _batch(fix):
     g = torch.Generator().manual_seed(2)
     return {"image": torch.randn(B, 3, S, S, generator=g), "cue": torch.tensor([0, 5]), "fix": fix,
-            "content": torch.tensor([[-1.0, -1.0, 1.0, 1.0]]).repeat(B, 1)}  # no letterbox: no clamping
+            "content": torch.tensor([[-1.0, -1.0, 1.0, 1.0]]).repeat(B, 1),  # no letterbox: no clamping
+            "hw": torch.tensor([[S, S]] * B)}
 
 
 def _deploy(ep, images, cue, n):
@@ -228,3 +229,22 @@ def test_cue_mixture_is_the_mean_of_the_per_cue_pixel_densities(fake_cs18):
             assert np.allclose(grid_log_density(got, hw=hw, scene=S), expected, atol=1e-5)  # pysaliency reads it as is
     with pytest.raises(ValueError, match="free-viewing"):
         m.forced_logits(_batch(torch.zeros(B, 3, 2)) | {"hw": torch.tensor([hw] * B)}, 2, CG)
+
+
+def test_mixture_samples_come_from_the_mixed_density(fake_cs18):
+    """Sampling with cue_mixture uses the scored per-step mixture: at temperature 0 the first chosen cell is the
+    argmax of the mixed p(cell) after the anchor, and seeded draws land on the image."""
+    from canvit.scanpath.models import _pixel_cells
+    ep = _episode(fake_cs18[0])
+    hw = (150, 224)  # letterboxed: content y in [-0.67, 0.67]
+    batch = _batch(torch.zeros(B, 2, 2)) | {"cue": torch.full((B,), -1), "hw": torch.tensor([hw] * B),
+                                            "content": torch.tensor([[-1.0, -0.67, 1.0, 0.67]]).repeat(B, 1)}
+    mixed = CanViTModel(ep, "policy", cue_mixture=True).forced_logits(batch, 1, CG)[:, 0]  # log pixel density
+    _, count = _pixel_cells(*hw, S, CG)
+    p = mixed.double().exp() * torch.from_numpy(count)  # p(cell)
+    assert torch.allclose(p.sum(-1), torch.ones(B, dtype=torch.float64), atol=1e-6)
+    xy = ep.sample(batch, 2, temperature=0.0, cue_mixture=True)
+    ij = ((xy[:, 1] + 1) / 2 * CG).floor().long()
+    assert torch.equal(ij[:, 1] * CG + ij[:, 0], p.argmax(-1))
+    xy = ep.sample(batch, 3, temperature=1.0, generator=torch.Generator().manual_seed(0), cue_mixture=True)
+    assert (xy[..., 1].abs() <= 0.67).all()  # clamped onto the image
