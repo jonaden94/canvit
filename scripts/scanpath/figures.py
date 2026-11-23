@@ -1152,6 +1152,7 @@ def saccade_compare(rec: dict, ppd: float | None, out: Path, nsac: int = TRAINED
 
 # ------------------------------------------------------------------------------------------- retina sweep
 TRAINED_RETINA = "cmf0.75_res65_cps6"  # the retina exp39 s0 was trained with (helper_1, 2026-11-23)
+SEARCH_VAL_TRIALS = 326  # target-present val pairs behind found_t3 (helper_1, 2026-11-23; not in the record)
 RES_MARKER = {65: "o", 80: "s", 92: "^"}  # retina resolution -> marker; cmf -> fill lightness
 CMF_FILL = {0.75: OKABE_ITO["blue"], 2.2: "#6AA6D8", 7.7: "white"}
 
@@ -1195,6 +1196,8 @@ def retina_figure(results: Path, out: Path) -> bool:
                 x = r["search"]["found_t3_policy"]
                 y = (r[cond]["diagnostics"]["tempered_global"]["ig_image"] if at == "fitted"
                      else r[cond]["metrics"]["ig_image"])
+                ax.errorbar(x, y, xerr=np.sqrt(x * (1 - x) / SEARCH_VAL_TRIALS), color=OKABE_ITO["blue"], lw=0.5,
+                            capsize=0, zorder=1)  # binomial SE of found_t3
                 ax.plot(x, y, marker=RES_MARKER.get(r["res"], "D"), ms=5, ls="none", mec=OKABE_ITO["blue"],
                         mfc=CMF_FILL.get(r["cmf"], "0.5"), mew=0.8)
                 if r["name"] == TRAINED_RETINA:
