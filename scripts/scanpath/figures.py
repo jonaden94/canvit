@@ -1150,6 +1150,74 @@ def saccade_compare(rec: dict, ppd: float | None, out: Path, nsac: int = TRAINED
     return True
 
 
+# ------------------------------------------------------------------------------------------- retina sweep
+TRAINED_RETINA = "cmf0.75_res65_cps6"  # the retina exp39 s0 was trained with (helper_1, 2026-11-23)
+RES_MARKER = {65: "o", 80: "s", 92: "^"}  # retina resolution -> marker; cmf -> fill lightness
+CMF_FILL = {0.75: OKABE_ITO["blue"], 2.2: "#6AA6D8", 7.7: "white"}
+
+
+def load_retinas(results: Path) -> list[dict]:
+    """helper_1's retina sweep, <ckpt>/retina/<cmf..._res..._cps...>/: search_validation.json (Jonathan's search
+    harness) and coco_search18_{tp,ta}_validation.json (our records). One dict per retina with what exists."""
+    import re
+    out = []
+    for d in sorted(results.glob("*/retina/cmf*_res*_cps*")):
+        m = re.fullmatch(r"cmf([\d.]+)_res(\d+)_cps(\d+)", d.name)
+        if m is None or not (d / "search_validation.json").exists():
+            continue
+        r = {"name": d.name, "cmf": float(m[1]), "res": int(m[2]), "cps": int(m[3]),
+             "search": json.loads((d / "search_validation.json").read_text())["metrics"]}
+        for c in CONDITIONS:
+            p = d / f"coco_search18_{c}_validation.json"
+            if p.exists():
+                r[c] = json.loads(p.read_text())
+        out.append(r)
+    return out
+
+
+def retina_figure(results: Path, out: Path) -> bool:
+    """H1 (search vs human alignment) across retinas: x = targets found within 3 fixations (policy, Jonathan's
+    search harness, COCO-Search18 validation), y = IG over the centre bias (top: at the tau fitted on training
+    scanpaths, bottom: at tau = 1), columns TP | TA. Marker = retina resolution, fill = cortical magnification;
+    the trained retina ringed. Only the trained retina is in distribution: head and policy saw no other."""
+    rets = [r for r in load_retinas(results) if any(c in r for c in CONDITIONS)]
+    if len(rets) < 2:
+        print(f"retina_figure: {len(rets)} retinas with scanpath records, need 2")
+        return False
+    fig, axes = plt.subplots(2, 2, figsize=(TEXTWIDTH_IN, 3.8), sharex=True, sharey="row", layout="constrained")
+    for j, cond in enumerate(CONDITIONS):
+        for i, at in enumerate(("fitted", "one")):
+            ax = axes[i, j]
+            ax.axhline(0, color=STYLE["centre_bias"][0], lw=0.5)
+            for r in rets:
+                if cond not in r:
+                    continue
+                x = r["search"]["found_t3_policy"]
+                y = (r[cond]["diagnostics"]["tempered_global"]["ig_image"] if at == "fitted"
+                     else r[cond]["metrics"]["ig_image"])
+                ax.plot(x, y, marker=RES_MARKER.get(r["res"], "D"), ms=5, ls="none", mec=OKABE_ITO["blue"],
+                        mfc=CMF_FILL.get(r["cmf"], "0.5"), mew=0.8)
+                if r["name"] == TRAINED_RETINA:
+                    ax.plot(x, y, marker="o", ms=11, mfc="none", mec="k", mew=0.6, ls="none")
+                    ax.annotate("trained", (x, y), xytext=(7, 4), textcoords="offset points", fontsize=FS - 1)
+            ax.set(title=CONDITIONS[cond] if i == 0 else None)
+            if i == 1:
+                ax.set_xlabel("targets found within 3 fixations (policy)")
+            despine(ax)
+    axes[0, 0].set_ylabel("IG over centre bias\n" + r"at fitted $\tau$ (bits/fix)")
+    axes[1, 0].set_ylabel("IG over centre bias\n" + r"at $\tau$ = 1 (bits/fix)")
+    handles = [plt.Line2D([], [], marker=m, ms=5, ls="none", mec=OKABE_ITO["blue"], mfc="white")
+               for m in RES_MARKER.values()]
+    labels = [f"resolution {k}" for k in RES_MARKER]
+    handles += [plt.Line2D([], [], marker="o", ms=5, ls="none", mec=OKABE_ITO["blue"], mfc=c) for c in
+                CMF_FILL.values()]
+    labels += [f"cortical magnification {k:g}" for k in CMF_FILL]
+    fig.legend(handles, labels, loc="outside upper center", ncol=3,
+               title=f"CanViT search policy {CKPT}, evaluated through {len(rets)} retinas (trained through one)")
+    save(fig, out / "retina.pdf")
+    return True
+
+
 # --------------------------------------------------------------------------------------- temperature sweep
 TAU_EVALS = [("coco_search18", "tp_validation", "COCO-Search18 TP"), ("coco_search18", "ta_validation",
              "COCO-Search18 TA"), ("coco_freeview", "validation", "COCO-FreeView"), ("mit1003", "all", "MIT1003")]
@@ -1537,6 +1605,7 @@ def main() -> None:
     res_macros |= priors_figure(recs, a.results, figs, tabs)
     priors_index_figure(recs, a.results, figs)
     res_macros |= temperature_figure(recs, figs)
+    retina_figure(a.results, figs)
 
     sacc = {}
     for slug, cond, title in PANELS:
