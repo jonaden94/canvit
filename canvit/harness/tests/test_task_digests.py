@@ -30,6 +30,7 @@ Run: ``.venv-cu126/bin/python -m pytest canvit/harness/tests/test_task_digests.p
 import hashlib
 from contextlib import nullcontext
 
+import pytest
 import torch
 
 from canvit.ade20k.data import IGNORE_LABEL, NUM_CLASSES
@@ -52,6 +53,9 @@ from canvit.harness.rollout.selector import RandomSelector
 from canvit.harness.rollout.viewpoint import ViewpointType
 from canvit.harness.spec import BpttSpec
 from canvit.in1k.task import BoundIn1kTask
+
+# The digests were recorded with one CPU thread (see conftest.one_cpu_thread).
+pytestmark = pytest.mark.usefixtures("one_cpu_thread")
 
 _B, _G, _IMG, _N_CLS = 2, 8, 224, 10
 _D = 384  # teacher width for the distill config (vits16)

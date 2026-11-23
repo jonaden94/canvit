@@ -13,6 +13,7 @@ import hashlib
 import random
 from contextlib import nullcontext
 
+import pytest
 import torch
 
 from canvit import CanViTForPretraining, CanViTForPretrainingConfig
@@ -23,6 +24,9 @@ from canvit.harness.rollout import GlimpseOut, run_rollout
 from canvit.harness.rollout.selector import RandomSelector
 from canvit.harness.rollout.viewpoint import ViewpointType
 from canvit.harness.spec import BpttSpec
+
+# The digests were recorded with one CPU thread (see conftest.one_cpu_thread).
+pytestmark = pytest.mark.usefixtures("one_cpu_thread")
 
 _B, _G, _D = 2, 8, 384
 _N_STEPS = 25
