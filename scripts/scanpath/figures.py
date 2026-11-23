@@ -255,8 +255,6 @@ PANELS = [("coco_search18", "tp", "COCO-Search18\ntarget present"),
           ("coco_search18", "ta", "COCO-Search18\ntarget absent"),
           ("coco_freeview", "both", "COCO-FreeView"), ("mit1003", "both", "MIT1003"), ("cat2000", "both", "CAT2000"),
           ("daemons", "both", "DAEMONS"), ("figrim", "both", "FIGRIM")]
-LEN_BINS = np.linspace(0, 1, 41)  # saccade length, fraction of the stimulus' longer side
-DIR_BINS = np.deg2rad(np.arange(-7.5, 360, 15))  # 24 directions, bins centred on the cardinal directions
 
 
 def saccades(xs: list[np.ndarray], ys: list[np.ndarray], n: np.ndarray, sizes) -> dict[str, np.ndarray]:
@@ -265,19 +263,29 @@ def saccades(xs: list[np.ndarray], ys: list[np.ndarray], n: np.ndarray, sizes) -
     side, which is the side of CanViT's square scene, so humans and model share the unit; ``angle``: radians,
     0 = rightwards, pi/2 = upwards (image y points down); ``first``: the scanpath's first saccade; ``length_px``:
     the length in pixels.
-    (pysaliency 0.2.23 has no saccade statistics, only scanpath plotting; checked 2026-11-23.)"""
-    length, length_px, angle, first = [], [], [], []
-    for x, y, i in zip(xs, ys, n):
+    (pysaliency 0.2.23 has no saccade statistics, only scanpath plotting; checked 2026-11-23.)
+    Also per saccade: ``sp`` (scanpath number), ``index`` (1 = the saccade leaving the start fixation),
+    ``turn`` (degrees, signed angle from the previous saccade, 0 = straight on, +-180 = straight back; NaN for
+    the first), ``n`` (stimulus) and ``longer`` (the stimulus' longer side, pixels)."""
+    keys = ("length", "length_px", "angle", "first", "sp", "index", "turn", "n", "longer")
+    out: dict[str, list] = {k: [] for k in keys}
+    for j, (x, y, i) in enumerate(zip(xs, ys, n)):
         ok = np.isfinite(x) & np.isfinite(y)
         dx, dy = np.diff(np.asarray(x)[ok]), np.diff(np.asarray(y)[ok])
         if not len(dx):
             continue
-        length_px.append(np.hypot(dx, dy))
-        length.append(length_px[-1] / max(sizes[int(i)]))
-        angle.append(np.mod(np.arctan2(-dy, dx), 2 * np.pi))
-        first.append(np.arange(len(dx)) == 0)
-    return {k: np.concatenate(v) for k, v in (("length", length), ("length_px", length_px), ("angle", angle),
-                                              ("first", first))}
+        longer = max(sizes[int(i)])
+        a = np.arctan2(-dy, dx)
+        out["length_px"].append(np.hypot(dx, dy))
+        out["length"].append(out["length_px"][-1] / longer)
+        out["angle"].append(np.mod(a, 2 * np.pi))
+        out["first"].append(np.arange(len(dx)) == 0)
+        out["sp"].append(np.full(len(dx), j))
+        out["index"].append(np.arange(1, len(dx) + 1))
+        out["turn"].append(np.concatenate([[np.nan], np.degrees(np.angle(np.exp(1j * np.diff(a))))]))
+        out["n"].append(np.full(len(dx), int(i)))
+        out["longer"].append(np.full(len(dx), float(longer)))
+    return {k: np.concatenate(v) if v else np.zeros(0) for k, v in out.items()}
 
 
 def human_saccades(fixations, stimuli) -> dict[str, np.ndarray]:
@@ -299,62 +307,6 @@ def saccade_summary(s: dict[str, np.ndarray]) -> dict[str, float]:
             "median_length_px": float(np.median(s["length_px"])),
             "horizontal": float((off_h < np.pi / 8).mean()), "vertical": float((off_v < np.pi / 8).mean()),
             "first_left": float(left.mean()), "first_median_length": float(np.median(s["length"][f]))}
-
-
-def dir_hist(angle: np.ndarray) -> np.ndarray:
-    """Share of saccades per direction bin (angles in [0, 2 pi); the bin around 0 deg wraps)."""
-    h, _ = np.histogram(np.where(angle >= DIR_BINS[-1], angle - 2 * np.pi, angle), bins=DIR_BINS)
-    return h / max(h.sum(), 1)
-
-
-def saccade_figure(sacc: dict[str, dict], out: Path, model: dict[str, dict] | None = None) -> None:
-    """Columns = datasets. Top: saccade length histogram (density over the fraction of the longer side). Bottom:
-    direction histogram (share of saccades per 15 deg bin), all saccades filled, first saccades as outline.
-    ``model``: the same statistics of a model's sampled scanpaths, drawn as a blue line over the humans."""
-    keys = [k for k in sacc]
-    every = list(sacc.values()) + list((model or {}).values())
-    ymax = max(np.histogram(s["length"], LEN_BINS, density=True)[0].max() for s in every)  # one scale for all
-    rmax = max(max(dir_hist(s["angle"]).max(), dir_hist(s["angle"][s["first"]]).max()) for s in every)
-    fig = plt.figure(figsize=(TEXTWIDTH_IN, 2.6), layout="constrained")
-    fig.get_layout_engine().set(w_pad=0.01, h_pad=0.01, wspace=0.02, hspace=0.02)
-    gs = fig.add_gridspec(2, len(keys), height_ratios=(1, 1.3))
-    hc = STYLE["human"][0]
-    for j, key in enumerate(keys):
-        s = sacc[key]
-        ax = fig.add_subplot(gs[0, j])
-        ax.hist(s["length"], bins=LEN_BINS, density=True, color="0.8", ec="none")
-        ax.hist(s["length"], bins=LEN_BINS, density=True, histtype="step", color=hc, lw=0.5)
-        if model and key in model:
-            ax.hist(model[key]["length"], bins=LEN_BINS, density=True, histtype="step", color=STYLE["canvit"][0],
-                    lw=0.8)
-        ax.set_title(key, fontsize=FS - 1)
-        ax.set(xlim=(0, 0.8), xticks=(0, 0.4, 0.8), xticklabels=("0", ".4", ".8"), ylim=(0, ymax * 1.02),
-               yticks=(0, 4, 8))
-        if j:
-            ax.set_yticklabels([])
-        else:
-            ax.set_ylabel("density")
-        if j == len(keys) // 2:
-            ax.set_xlabel("saccade length (fraction of the image's longer side)")
-        despine(ax, offset=2)
-        pa = fig.add_subplot(gs[1, j], projection="polar")
-        th = DIR_BINS[:-1] + np.pi / 24  # bin centres
-        pa.bar(th, dir_hist(s["angle"]), width=np.pi / 12, color="0.8", ec="none")
-        pa.bar(th, dir_hist(s["angle"][s["first"]]), width=np.pi / 12, fill=False, ec=hc, lw=0.5)
-        if model and key in model:
-            h = dir_hist(model[key]["angle"])
-            pa.plot(np.r_[th, th[:1]], np.r_[h, h[:1]], color=STYLE["canvit"][0], lw=0.8)
-        pa.set(xticks=np.deg2rad([0, 90, 180, 270]), yticks=[], ylim=(0, rmax))
-        pa.set_xticklabels(["R", "U", "L", "D"] if j == 0 else [], fontsize=FS - 1)
-        pa.tick_params(pad=-1)
-        pa.spines["polar"].set_linewidth(0.5)
-        pa.grid(lw=0.3, color="0.7")
-    handles = [plt.Rectangle((0, 0), 1, 1, color="0.8", label="humans, all saccades"),
-               plt.Rectangle((0, 0), 1, 1, fill=False, ec=hc, lw=0.5, label="humans, first saccade")]
-    if model:
-        handles.append(plt.Line2D([], [], color=STYLE["canvit"][0], lw=0.8, label=STYLE["canvit"][2] + ", samples"))
-    fig.legend(handles=handles, loc="outside lower center", ncol=len(handles))
-    save(fig, out / "saccades.pdf")
 
 
 def saccade_table(summ: dict[str, dict], out: Path, ppd: dict[str, float] | None = None,
@@ -402,6 +354,8 @@ def load_records(results: Path) -> list[dict]:
             continue
         if not isinstance(r, dict) or r.get("task") != "scanpath" or "metrics" not in r:
             continue  # also a shard of a sharded run (no metrics until merged)
+        if "retina" in p.relative_to(results).parts:  # the retina sweep (helper_1): out-of-distribution retinas,
+            continue                                   # read only by its own figure
         top = p.parent == results
         if top and (results / "baselines").is_dir():
             continue
@@ -882,6 +836,320 @@ def priors_index_figure(recs: list[dict], results: Path, out: Path, t_max: int =
     return True
 
 
+# --------------------------------------------------------- saccade statistics in the FoAViS style (Fig. 3)
+# The unit switch (Valentin has not decided; manager's recommendation 2026-11-23): degrees for humans ACROSS
+# datasets, fraction of the longer side (= CanViT's scene) for model vs human. Values: "deg" | "frac".
+SACCADE_UNITS = {"effects": "deg", "compare": "frac"}
+SHORT = {"deg": 1.0, "frac": 0.025}  # a "short" saccade: < 1 deg, or < 2.5% of the longer side
+# Task regime per dataset (colour), one marker / line style per dataset inside a regime. Okabe-Ito hues not
+# used for models elsewhere: humans are black in model figures, but here every line is human.
+REGIME = {"search": OKABE_ITO["green"], "free viewing": OKABE_ITO["vermillion"], "memory": OKABE_ITO["purple"]}
+DATASET_STYLE = {  # PANELS title -> (regime, marker, line style)
+    "COCO-Search18\ntarget present": ("search", "o", "-"), "COCO-Search18\ntarget absent": ("search", "s", "--"),
+    "COCO-FreeView": ("free viewing", "o", "-"), "MIT1003": ("free viewing", "s", "--"),
+    "CAT2000": ("free viewing", "^", ":"), "DAEMONS": ("free viewing", "D", "-."),
+    "FIGRIM": ("memory", "o", "-")}
+RANDOM_REF = dict(color="0.8", lw=3.0, zorder=1, solid_capstyle="butt")  # FoAViS's uniform random policy line
+
+
+def scanpath_xy(fixations) -> tuple[list, list, np.ndarray]:
+    sp = fixations.scanpaths
+    L = np.asarray(sp.length)
+    return [sp.xs[r][: L[r]] for r in range(len(L))], [sp.ys[r][: L[r]] for r in range(len(L))], np.asarray(sp.n)
+
+
+def random_xy(xs, ys, n, sizes, seed: int = 0) -> tuple[list, list, np.ndarray]:
+    """The geometry-only reference: each scanpath keeps its start fixation and length, every later fixation is
+    uniform on its image (FoAViS's uniform random policy)."""
+    rng = np.random.default_rng(seed)
+    rx, ry = [], []
+    for x, y, i in zip(xs, ys, n):
+        h, w = sizes[int(i)]
+        k = int(np.isfinite(np.asarray(x, float)).sum())
+        rx.append(np.concatenate([np.asarray(x[:1], float), rng.uniform(0, w, max(k - 1, 0))]))
+        ry.append(np.concatenate([np.asarray(y[:1], float), rng.uniform(0, h, max(k - 1, 0))]))
+    return rx, ry, n
+
+
+def amplitude(s: dict, unit: str, ppd: float | None) -> np.ndarray:
+    if unit == "deg":
+        if ppd is None:
+            raise ValueError("degrees need pixels per degree")
+        return s["length_px"] / ppd
+    return s["length"]
+
+
+def _horizontal(a: np.ndarray) -> np.ndarray:  # within 22.5 deg of left/right (as saccade_summary)
+    return np.minimum(np.abs(np.angle(np.exp(1j * a))), np.abs(np.angle(np.exp(1j * (a - np.pi))))) < np.pi / 8
+
+
+def _vertical(a: np.ndarray) -> np.ndarray:
+    return _horizontal(a - np.pi / 2)
+
+
+def effect_curves(s: dict, unit: str, ppd: float | None, imax: int = 8, min_n: int = 100) -> dict[str, np.ndarray]:
+    """Per saccade index 1..imax (NaN where fewer than ``min_n`` saccades): median amplitude, share horizontal,
+    share vertical, share short (< SHORT[unit]), share returning (|turn| > 150 deg; index >= 2)."""
+    amp, idx = amplitude(s, unit, ppd), s["index"]
+    out = {k: np.full(imax, np.nan) for k in ("amplitude", "horizontal", "vertical", "short", "return", "n")}
+    for i in range(1, imax + 1):
+        m = idx == i
+        out["n"][i - 1] = m.sum()
+        if m.sum() < min_n:
+            continue
+        out["amplitude"][i - 1] = np.median(amp[m])
+        out["horizontal"][i - 1] = _horizontal(s["angle"][m]).mean()
+        out["vertical"][i - 1] = _vertical(s["angle"][m]).mean()
+        out["short"][i - 1] = (amp[m] < SHORT[unit]).mean()
+        if i >= 2:
+            out["return"][i - 1] = (np.abs(s["turn"][m]) > 150).mean()
+    return out
+
+
+def effect_summary(s: dict, unit: str, ppd: float | None) -> dict[str, float]:
+    """One number per effect: median amplitude; its change from saccade 2 to saccades >= 5 (ratio, < 1 = shorter
+    later: coarse-to-fine); shares horizontal / vertical / short / returning over all saccades; share of first
+    saccades going left."""
+    amp, idx, a = amplitude(s, unit, ppd), s["index"], s["angle"]
+    late = idx >= 5
+    first = idx == 1
+    left = (a[first] > np.pi / 2) & (a[first] < 3 * np.pi / 2)
+    later = idx >= 2
+    return {"amplitude": float(np.median(amp)),
+            "decline": float(np.median(amp[late]) / np.median(amp[idx == 2])) if late.sum() >= 100 else np.nan,
+            "horizontal": float(_horizontal(a).mean()), "vertical": float(_vertical(a).mean()),
+            "short": float((amp < SHORT[unit]).mean()), "return": float((np.abs(s["turn"][later]) > 150).mean()),
+            "first_left": float(left.mean())}
+
+
+def saccade_effects(ppd: dict[str, float], out: Path, tabs: Path, imax: int = 8) -> dict[str, str]:
+    """(a) Humans across all datasets: per saccade index, median amplitude, share horizontal / vertical, share
+    returning, share short; and the first saccade's share leftward per dataset. Grey band: the uniform random
+    reference (each scanpath's start and length, later fixations uniform on the image), range over datasets.
+    Unit: SACCADE_UNITS["effects"]. Also tables/saccade_effects.tex (human value and random reference per
+    dataset, mean over datasets) and macros sfx<Effect><Hum|Rnd>Mean."""
+    unit = SACCADE_UNITS["effects"]
+    hum, rnd, summ = {}, {}, {}
+    for slug, cond, title in PANELS:
+        st, fx = dataset(slug, eval_part(slug))
+        xs, ys, n = scanpath_xy(select(fx, condition=cond, limit=None))
+        p = ppd.get(title)
+        if unit == "deg" and p is None:
+            print(f"saccade_effects: no ppd for {title!r}, skipped")
+            continue
+        h, r = saccades(xs, ys, n, st.sizes), saccades(*random_xy(xs, ys, n, st.sizes), st.sizes)
+        hum[title], rnd[title] = effect_curves(h, unit, p, imax), effect_curves(r, unit, p, imax)
+        summ[title] = (effect_summary(h, unit, p), effect_summary(r, unit, p))
+    ulab = {"deg": "deg", "frac": "fraction of longer side"}[unit]
+    panels = [("amplitude", f"median amplitude ({ulab})", 1), ("horizontal", "share horizontal (±22.5°)", 1),
+              ("vertical", "share vertical (±22.5°)", 1), ("return", "share returning (turn > 150°)", 2),
+              ("short", f"share short (< {SHORT[unit]:g}{'°' if unit == 'deg' else ''})", 1)]
+    fig, axs = plt.subplots(2, 3, figsize=(TEXTWIDTH_IN, 3.9), layout="constrained")
+    t = np.arange(1, imax + 1)
+    for ax, (key, ylab, i0) in zip(axs.flat, panels):
+        lo = np.nanmin([r[key] for r in rnd.values()], axis=0)
+        hi = np.nanmax([r[key] for r in rnd.values()], axis=0)
+        ok = (t >= i0) & np.isfinite(lo)
+        ax.fill_between(t[ok], lo[ok], hi[ok], color="0.88", lw=0, zorder=0)
+        for title, c in hum.items():
+            reg, mk, ls = DATASET_STYLE[title]
+            ax.plot(t[t >= i0], c[key][t >= i0], color=REGIME[reg], marker=mk, ls=ls, ms=2.5, lw=0.8)
+        ax.set(xticks=t, xlabel="saccade index", ylabel=ylab)
+        if key != "amplitude":
+            ax.set_ylim(0, None)
+        despine(ax)
+    ax = axs.flat[5]  # first saccade: share leftward, one row per dataset
+    names = list(summ)
+    for j, title in enumerate(names):
+        reg, mk, _ = DATASET_STYLE[title]
+        hv, rv = summ[title][0]["first_left"], summ[title][1]["first_left"]
+        ax.plot([rv], [j], marker="|", color="0.5", ms=6, ls="none")
+        ax.plot([hv], [j], marker=mk, color=REGIME[reg], ms=4, ls="none")
+    ax.axvline(0.5, color=BASELINE_COLOR, lw=0.5)
+    ax.set(yticks=range(len(names)), yticklabels=[k.replace("\n", " ").replace("COCO-Search18 target ", "CS18 ")
+                                                  for k in names],
+           ylim=(len(names) - 0.5, -0.5), xlabel="first saccade: share leftward", xlim=(0.25, 0.85))
+    despine(ax)
+    handles = [plt.Line2D([], [], color=REGIME[DATASET_STYLE[k][0]], marker=DATASET_STYLE[k][1],
+                          ls=DATASET_STYLE[k][2], ms=3, lw=0.8) for k in hum]
+    short = {"COCO-Search18\ntarget present": "CS18 TP", "COCO-Search18\ntarget absent": "CS18 TA"}
+    labels = [short.get(k, k) + f" ({DATASET_STYLE[k][0]})" for k in hum]
+    handles.append(plt.Rectangle((0, 0), 1, 1, color="0.88", lw=0))
+    labels.append("uniform random (range; last panel |)")
+    fig.legend(handles, labels, loc="outside upper center", ncol=4)
+    save(fig, out / "saccade_effects.pdf")
+
+    cols = [("amplitude", "{:.1f}" if unit == "deg" else "{:.2f}", "amplitude" + (r" ($^\circ$)" if unit == "deg"
+                                                                                  else "")),
+            ("decline", "{:.2f}", r"late / 2nd"), ("horizontal", "{:.0%}", r"horiz.\ \%"),
+            ("vertical", "{:.0%}", r"vert.\ \%"), ("first_left", "{:.0%}", r"1st left \%"),
+            ("return", "{:.0%}", r"return \%"), ("short", "{:.0%}", r"short \%")]
+    lines = [r"\begin{tabular}{l" + "r" * len(cols) + "}", r"\toprule",
+             "dataset & " + " & ".join(c[2] for c in cols) + r" \\", r"\midrule"]
+
+    def cell(v, f, pct=False):  # in the table the % sits in the header
+        return "--" if not np.isfinite(v) else f.format(v).replace("%", "" if pct else r"\%")
+
+    for title, (h, r) in summ.items():
+        name = {"COCO-Search18\ntarget present": "CS18 TP", "COCO-Search18\ntarget absent": "CS18 TA"}.get(title, title)
+        lines.append(name + " & " + " & ".join(f"{cell(h[k], f, True)} ({cell(r[k], f, True)})" for k, f, _ in cols)
+                     + r" \\")
+    mean_h = {k: float(np.nanmean([v[0][k] for v in summ.values()])) for k, _, _ in cols}
+    mean_r = {k: float(np.nanmean([v[1][k] for v in summ.values()])) for k, _, _ in cols}
+    lines += [r"\midrule", "mean & " + " & ".join(
+        f"{cell(mean_h[k], f, True)} ({cell(mean_r[k], f, True)})" for k, f, _ in cols) + r" \\", r"\bottomrule",
+        r"\end{tabular}"]
+    (tabs / "saccade_effects.tex").write_text("\n".join(lines) + "\n")
+    tag = {"amplitude": "Amp", "decline": "Decline", "horizontal": "Hor", "vertical": "Ver", "first_left": "Left",
+           "return": "Ret", "short": "Short"}
+    macros = {}
+    for k, f, _ in cols:
+        macros[f"sfx{tag[k]}HumMean"] = cell(mean_h[k], f)
+        macros[f"sfx{tag[k]}RndMean"] = cell(mean_r[k], f)
+    return macros
+
+
+def _kde_reflect(x: np.ndarray, grid: np.ndarray, bw: float) -> np.ndarray:
+    """Gaussian KDE on ``grid``, reflected at 0 (amplitudes are >= 0). From FoAViS notebooks/paper_plots.py."""
+    x = np.asarray(x, float).ravel()
+    z, zr = (grid[:, None] - x[None]) / bw, (grid[:, None] + x[None]) / bw
+    return (np.exp(-0.5 * z ** 2) + np.exp(-0.5 * zr ** 2)).mean(1) / (bw * np.sqrt(2 * np.pi))
+
+
+def _kde_circ(a_deg: np.ndarray, grid: np.ndarray, bw: float) -> np.ndarray:
+    """Gaussian KDE of angles in degrees on (-180, 180], wrapped. From FoAViS notebooks/paper_plots.py."""
+    d = grid[:, None] - np.asarray(a_deg, float).ravel()[None]
+    return sum(np.exp(-0.5 * ((d + o) / bw) ** 2) for o in (-360, 0, 360)).mean(1) / (bw * np.sqrt(2 * np.pi))
+
+
+def _after(s: dict, amp: np.ndarray, grid: np.ndarray, bw: float = 0.35, min_w: float = 30.0) -> np.ndarray:
+    """FoAViS's 'after a long saccade': next vs preceding amplitude, both z-scored within the scanpath (saccades
+    from the start fixation left out), Nadaraya-Watson on ``grid``; NaN where the kernel weight is < ``min_w``."""
+    keep = s["index"] >= 2
+    sp, a = s["sp"][keep], amp[keep]
+    xs, ys = [], []
+    for j in np.unique(sp):
+        v = a[sp == j]
+        if len(v) >= 3 and v.std() > 0:
+            z = (v - v.mean()) / v.std()
+            xs.append(z[:-1])
+            ys.append(z[1:])
+    if not xs:
+        return np.full(len(grid), np.nan)
+    x, y = np.concatenate(xs), np.concatenate(ys)
+    w = np.exp(-0.5 * ((grid[:, None] - x[None]) / bw) ** 2)
+    sw = w.sum(1)
+    return np.where(sw >= min_w, (w * y[None]).sum(1) / np.maximum(sw, 1e-12), np.nan)
+
+
+def _min_fixations(xs, ys, n, k: int):
+    keep = [j for j, x in enumerate(xs) if np.isfinite(np.asarray(x, float)).sum() >= k]
+    return [xs[j] for j in keep], [ys[j] for j in keep], np.asarray(n)[keep]
+
+
+def saccade_compare(rec: dict, ppd: float | None, out: Path, nsac: int = TRAINED_FIXATIONS) -> bool:
+    """(b) CanViT's sampled scanpaths vs the humans', FoAViS Fig. 3 layout: row 1 amplitude of saccades f1-f2 ..
+    (reflected KDE + 10/25/50/75/90 quantile strips), row 2 their direction (wrapped KDE), row 3 next vs
+    preceding amplitude and the turn angle at f2, f3. Only scanpaths with >= nsac + 1 fixations (both sides).
+    Humans black dashed, CanViT blue, the uniform random reference thick grey behind. Unit:
+    SACCADE_UNITS["compare"] (frac: % of the longer side, with degrees on a secondary axis when ``ppd``)."""
+    sm = samples(rec)
+    if sm is None:
+        return False
+    st, z = sm
+    ds, split = rec["dataset"], rec["split"]
+    cond = split.split("_")[0] if ds == "coco_search18" else "both"
+    _, fx = dataset(ds, rec["protocol"].get("part", eval_part(ds)))
+    hxy = _min_fixations(*scanpath_xy(select(fx, condition=cond, limit=None)), nsac + 1)
+    cxy = _min_fixations(list(z["xs"]), list(z["ys"]), z["n"], nsac + 1)
+    src = {"humans": saccades(*hxy, st.sizes), "canvit": saccades(*cxy, st.sizes),
+           "random": saccades(*random_xy(*hxy, st.sizes), st.sizes)}
+    unit = SACCADE_UNITS["compare"]
+    scale = 100.0 if unit == "frac" else 1.0
+    amp = {k: amplitude(s, unit, ppd) * scale for k, s in src.items()}
+    sty = {"humans": dict(color=STYLE["human"][0], ls="--", lw=0.9), "canvit": dict(color=STYLE["canvit"][0],
+                                                                                   ls="-", lw=0.9),
+           "random": RANDOM_REF}
+    gx = np.linspace(0, 100 if unit == "frac" else float(np.percentile(amp["random"], 99)), 401)
+    ga = np.linspace(-180, 180, 361)
+    fig = plt.figure(figsize=(TEXTWIDTH_IN, 0.9 * TEXTWIDTH_IN), layout="constrained")
+    gs = fig.add_gridspec(3, nsac)
+    A = [fig.add_subplot(gs[0, t]) for t in range(nsac)]
+    D = [fig.add_subplot(gs[1, t]) for t in range(nsac)]
+    C = fig.add_subplot(gs[2, 0])
+    T = [fig.add_subplot(gs[2, t]) for t in range(1, nsac)]
+    peak = dmax = tmax = 0.0
+    for k, s in src.items():
+        for t in range(1, nsac + 1):
+            m = s["index"] == t
+            h = _kde_reflect(amp[k][m], gx, 2.0 if unit == "frac" else 0.5)
+            A[t - 1].plot(gx, h, **sty[k])
+            peak = max(peak, float(h.max()))
+            dirs = np.degrees(np.angle(np.exp(1j * s["angle"][m & (s["length"] >= 0.01)])))
+            d = _kde_circ(dirs, ga, 8.0)
+            D[t - 1].plot(ga, d, **sty[k])
+            dmax = max(dmax, float(d.max()))
+            if t >= 2:
+                mt = m & np.isfinite(s["turn"]) & (s["length"] >= 0.01)
+                tt = _kde_circ(s["turn"][mt], ga, 8.0)
+                T[t - 2].plot(ga, tt, **sty[k])
+                tmax = max(tmax, float(tt.max()))
+    grid = np.linspace(-1.5, 2.0, 71)
+    for k, s in src.items():
+        C.plot(grid, _after(s, amp[k], grid), **sty[k])
+    dy = 0.075 * peak
+    for t in range(1, nsac + 1):
+        ax = A[t - 1]
+        for i, k in enumerate(("humans", "canvit")):
+            q = np.percentile(amp[k][src[k]["index"] == t], (10, 25, 50, 75, 90))
+            y = -(i + 0.8) * dy
+            c = sty[k]["color"]
+            ax.plot([q[0], q[4]], [y, y], color=c, lw=0.6, solid_capstyle="butt")
+            ax.plot([q[1], q[3]], [y, y], color=c, lw=3.0, alpha=0.45, solid_capstyle="butt")
+            ax.plot([q[2]], [y], marker=STYLE["human" if k == "humans" else "canvit"][1], ms=3, color=c,
+                    mec="white", mew=0.4, ls="none")
+        ax.axhline(0, color="0.6", lw=0.5, zorder=1)
+        ax.set_title(f"$f_{{{t}}}$–$f_{{{t + 1}}}$", loc="left")
+        ax.set(ylim=(-2.4 * dy, peak * 1.05), xlim=(gx[0], gx[-1]),
+               xlabel="amplitude (% of longer side)" if unit == "frac" else "amplitude (deg)")
+        ax.spines["left"].set_bounds(0, peak * 1.05)
+        if unit == "frac" and ppd:
+            longer = float(np.median(src["humans"]["longer"]))
+            sec = ax.secondary_xaxis("top", functions=(lambda v, f=longer / ppd / 100: v * f,
+                                                       lambda v, f=longer / ppd / 100: v / f))
+            sec.xaxis.set_major_formatter(lambda v, _: f"{v:.0f}°")
+            sec.tick_params(labelsize=FS - 1)
+        D[t - 1].set(xlim=(-180, 180), xticks=[-180, -90, 0, 90, 180], ylim=(0, dmax * 1.08),
+                     xticklabels=["left", "down", "right", "up", "left"], xlabel="direction",
+                     title=f"$f_{{{t}}}$–$f_{{{t + 1}}}$")
+        if t > 1:
+            A[t - 1].set_yticklabels([])
+            D[t - 1].set_yticklabels([])
+    for j, ax in enumerate(T):
+        ax.set(xlim=(-180, 180), xticks=[-180, -90, 0, 90, 180], ylim=(0, tmax * 1.08), xlabel="turn angle (deg)",
+               title=f"at $f_{{{j + 2}}}$")
+        if j:
+            ax.set_yticklabels([])
+    C.axhline(0, color="0.6", lw=0.5)
+    C.axvline(0, color="0.85", lw=0.5)
+    C.set(xlabel="preceding amplitude (z)", ylabel="next amplitude (z)", ylim=(-0.9, 0.9))
+    A[0].set_ylabel("density")
+    D[0].set_ylabel("density")
+    T[0].set_ylabel("density") if T else None
+    for ax in A + D + T + [C]:
+        despine(ax)
+    title = {"tp_validation": "COCO-Search18 target present", "ta_validation": "COCO-Search18 target absent"}.get(
+        split, dict((s, t.replace("\n", " ")) for s, _, t in PANELS).get(ds, ds))
+    handles = [plt.Line2D([], [], **{k: v for k, v in sty[k].items() if k in ("color", "ls", "lw")}) for k in sty]
+    names = [f"humans (n = {len(hxy[0]):,})", f"CanViT samples, {CKPT} (n = {len(cxy[0]):,})",
+             "uniform random fixations"]
+    fig.legend(handles, names, loc="outside upper center", ncol=3, title=f"{title}, scanpaths with ≥ {nsac + 1}"
+               " fixations")
+    slug = {"tp_validation": "cs18_tp", "ta_validation": "cs18_ta"}.get(split, ds)
+    save(fig, out / f"saccade_compare_{slug}.pdf")
+    return True
+
+
 # --------------------------------------------------------------------------------------- temperature sweep
 TAU_EVALS = [("coco_search18", "tp_validation", "COCO-Search18 TP"), ("coco_search18", "ta_validation",
              "COCO-Search18 TA"), ("coco_freeview", "validation", "COCO-FreeView"), ("mit1003", "all", "MIT1003")]
@@ -1275,10 +1543,15 @@ def main() -> None:
         st, fx = dataset(slug, eval_part(slug))
         sacc[title] = human_saccades(select(fx, condition=cond, limit=None), st)
     cv_sacc = canvit_saccades(recs)
-    saccade_figure(sacc, figs, model=cv_sacc or None)
     summ = {k: saccade_summary(s) for k, s in sacc.items()}
     ppd = {title: float(r["protocol"]["deepgaze"]["ppd"]) for slug, cond, title in PANELS for r in recs
            if r["kind"] == "deepgaze3" and r["dataset"] == slug and r["protocol"].get("deepgaze", {}).get("ppd")}
+    res_macros |= saccade_effects(ppd, figs, tabs)  # replaces saccades.pdf (manager, 2026-11-23)
+    for ds, split in (("coco_search18", "tp_validation"), ("coco_search18", "ta_validation"),
+                      ("coco_freeview", "validation")):
+        for r in canvit_records(recs, ds, split)[:1]:
+            title = next(t for s_, c, t in PANELS if s_ == ds and (ds != "coco_search18" or split.startswith(c)))
+            saccade_compare(r, ppd.get(title), figs)
     sacc_macros = saccade_table(summ, tabs, ppd, {k: saccade_summary(s) for k, s in cv_sacc.items()})
 
     tp = present_mask(fv)
