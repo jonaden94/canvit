@@ -26,9 +26,15 @@ policy also picks a zoom, which has no human counterpart (owner, 2026-11-18), so
 Forced centres are the human's continuous positions (clamped onto the image), not snapped to the
 policy's candidate cells: the backbone accepts any centre, and the human saw that one.
 
-Built with the TRAINING constructors (each task's ``build_model`` / ``build_policy``, from the run's own
-task and policy flags, ``sources.py``), then loaded STRICTLY: the checkpoint does not record the
-policy's architecture, so a mismatched flag must fail loudly rather than score a half-initialised scorer.
+**The checkpoint is enough** (canvit main b029fd3+, Jonathan's self-contained checkpoints): the task and
+policy configs come from the run config saved in it (``metadata["run_config"]``), rebuilt by
+``harness.evaluate.parse`` exactly as ``harness.evaluate <task> --opts.ckpt`` does; the architecture from its
+``model_config``; the policy from the same file (``policy_state_of``). Everything is loaded STRICTLY. A
+checkpoint without a run config is refused: such a run predates the fovi port's checkpoints, so neither its
+flags nor its foveation geometry are known (a run config implies canvit.core.foveation = fovi 27b1bde).
+
+Free viewing with a SEARCH model (no cue): the readout is the uniform mixture over the cues of the per-cue
+conditional densities, equal weights, nothing fitted (owner decision, 2026-11-23); named ``..._cuemix``.
 """
 
 from __future__ import annotations
@@ -39,6 +45,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -53,20 +60,31 @@ log = logging.getLogger(__name__)
 class PolicyEpisode:
     """A loaded CanViT (+ policy) of any task and its teacher-forced / sampled episode."""
 
-    task: Any  # the task's RunTask (sources.py builds it as the training CLI does)
+    task: Any  # the task's RunTask, built from the checkpoint's run config (load)
     model: Any
     joint: Any | None  # JointPolicy; None only for a search probe (heatmap readout)
     device: torch.device
     amp: bool = True
+    provenance: dict | None = None  # where the task came from (load); for the record
 
     @property
     def is_search(self) -> bool:
         return getattr(self.task, "name", None) == "search"
 
     @classmethod
-    def load(cls, *, task, ckpt: Path, device: torch.device, need_policy: bool) -> PolicyEpisode:
+    def load(cls, ckpt: Path, *, device: torch.device, need_policy: bool) -> PolicyEpisode:
+        """The task, model and policy of a self-contained checkpoint, as ``harness.evaluate`` builds them."""
+        from canvit.harness.evaluate import adopt_checkpoint_provenance, parse
+        from canvit.harness.infra.checkpoint import policy_state_of
         payload = torch.load(ckpt, map_location=device, weights_only=False)
-        # distill rebuilds its architecture FROM the checkpoint (as harness.evaluate does); the others ignore it
+        run_config = (payload.get("metadata") or {}).get("run_config")
+        if run_config is None:
+            raise ValueError(f"{ckpt} carries no run config (metadata['run_config'], written by canvit main since "
+                             "2026-11-22). Scanpath evaluation reads the task, the policy and the foveation geometry "
+                             "from it; an older checkpoint has none of them on record, so it is refused.")
+        cmd, source = parse([run_config["argv"][0], "--opts.ckpt", str(ckpt)])
+        task, _ = cmd.build()
+        adopted = adopt_checkpoint_provenance(task.cfg, payload, source=ckpt)
         model, _ = task.build_model(device, prior_model_config=payload.get("model_config"))
         if not task.is_foveated(model):
             raise ValueError(f"{ckpt}: not a foveated model. Scanpath evaluation needs fixation policies; a "
@@ -75,19 +93,22 @@ class PolicyEpisode:
         model.load_state_dict(payload["model_state"], strict=True)
         model.eval()
         joint = None
-        sidecar = Path(ckpt).with_suffix(".policy.pt")
         if need_policy:
-            if not sidecar.exists():
-                raise FileNotFoundError(f"{sidecar} not found: the policy is saved beside the checkpoint as "
-                                        "<ckpt>.policy.pt; a probe-only run has none (search: --cfg.model "
-                                        "canvit_heatmap)")
+            state = policy_state_of(payload, path=Path(ckpt), device=device)
+            if state is None:
+                raise ValueError(f"{ckpt} holds no learned policy (its run trained none); a search probe has the "
+                                 "task heatmap only (--cfg.model canvit_heatmap)")
             joint = task.build_policy(model, device=device, canvas_grid=task.canvas_grid(model),
                                       generator=torch.Generator(device=device))
-            joint.load_state_dict(torch.load(sidecar, map_location=device, weights_only=False))  # strict
+            joint.load_state_dict(state)  # strict
             joint.scorer.eval()
+        provenance = {"ckpt": str(ckpt), "step": payload.get("step"), "run_config_argv": run_config["argv"],
+                      "run_config_drift": source["drift"] if source else None, "adopted_from_checkpoint": adopted,
+                      "foveation": "canvit.core.foveation (fovi 27b1bde port; implied by the run config)"}
         log.info("loaded %s %s (step %s)%s", getattr(task, "name", "?"), ckpt, payload.get("step"),
                  " + policy" if joint else "")
-        return cls(task=task, model=model, joint=joint, device=device, amp=getattr(task.cfg, "amp", True))
+        return cls(task=task, model=model, joint=joint, device=device, amp=getattr(task.cfg, "amp", True),
+                   provenance=provenance)
 
     def _amp(self):
         if self.device.type == "cuda" and self.amp:  # the training loop's rule, as search's evaluate
@@ -162,7 +183,7 @@ class PolicyEpisode:
         is the centre of a cell drawn from softmax(scores / temperature); temperature 0 = the argmax, i.e. the
         deploy rollout. Needs the policy."""
         if self.joint is None:
-            raise ValueError("sampling scanpaths needs the policy (<ckpt>.policy.pt)")
+            raise ValueError("sampling scanpaths needs the learned policy")
 
         def draw(t, scores):
             g = int(round(scores.shape[1] ** 0.5))
@@ -190,27 +211,61 @@ def _check_view_scale(payload: dict, fs) -> None:
 @dataclass
 class CanViTModel:
     """``readout='policy'`` (the learned scorer, any task) or ``'heatmap'`` (search's task head) as a scanpath
-    model."""
+    model. ``cue_mixture``: a search model on free-viewing data -- every cue is run and the per-cue conditional
+    densities are mixed with equal weights (:meth:`mixed_logits`)."""
 
     episode: PolicyEpisode
     readout: Literal["policy", "heatmap"]
+    cue_mixture: bool = False
 
     def __post_init__(self):
         if self.readout == "heatmap" and not self.episode.is_search:
             raise ValueError(f"readout 'heatmap' is the search task head; a {self.episode.task.name} model has "
                              "only the 'policy' readout")
+        if self.cue_mixture and not self.episode.is_search:
+            raise ValueError("cue_mixture is for search models (a cue per class); this model takes no cue")
 
     @property
     def name(self) -> str:
-        return f"canvit_{getattr(self.episode.task, 'name', '?')}_{self.readout}"
+        return f"canvit_{getattr(self.episode.task, 'name', '?')}_{self.readout}" + ("_cuemix" if self.cue_mixture
+                                                                                     else "")
 
     def forced_logits(self, batch: dict, n: int, grid: int) -> Tensor:
-        logits = self.episode.run(batch, n)[self.readout]
+        if self.cue_mixture:
+            logits = self.mixed_logits(batch, n)
+        else:
+            logits = self.episode.run(batch, n)[self.readout]
         g = int(round(logits.shape[-1] ** 0.5))
         if g != grid:
             raise ValueError(f"the {self.readout} predicts on a {g}x{g} grid but --cfg.grid is {grid}: "
                              f"compare all models at the model's grid (--cfg.grid {g})")
         return logits
+
+    def mixed_logits(self, batch: dict, n: int) -> Tensor:
+        """[B, n, G*G] log of (1/K) sum_k p_k: p_k the per-pixel density (``models.grid_log_density``) of the
+        episode run with cue k (k = every COCO-Search18 class), taken per cell. Already normalised over the
+        image's pixels, so ``grid_log_density`` returns it unchanged; cells off the image are set to 0 (they
+        hold no pixel). Costs K episodes."""
+        import math
+
+        from canvit.search.data import COCO_SEARCH18_CLASSES
+
+        from .models import _pixel_cells
+        if not (batch["cue"] < 0).all():
+            raise ValueError("cue_mixture is for free-viewing trials (cue -1); this batch has cues")
+        K, S = len(COCO_SEARCH18_CLASSES), batch["image"].shape[-1]
+        mix = logcount = on = None
+        for k in range(K):
+            lg = self.episode.run(batch | {"cue": torch.full_like(batch["cue"], k)}, n)[self.readout].double()
+            if logcount is None:
+                g = int(round(lg.shape[-1] ** 0.5))
+                count = np.stack([_pixel_cells(int(h), int(w), S, g)[1] for h, w in batch["hw"].tolist()])
+                logcount = torch.from_numpy(count).to(lg.device).double().log()[:, None]  # [B, 1, G*G]
+                on = logcount.isfinite()
+            ld = torch.where(on, torch.log_softmax(lg + logcount, -1) - logcount, -math.inf)
+            mix = ld if mix is None else torch.logaddexp(mix, ld)
+        assert mix is not None and on is not None
+        return torch.where(on, mix - math.log(K), 0.0).float()
 
 
 def precompute(model: CanViTModel, loader, *, grid: int, scene_size: int):

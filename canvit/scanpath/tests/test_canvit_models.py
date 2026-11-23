@@ -170,3 +170,61 @@ def test_non_search_policy_reproduces_its_deploy_rollout_without_a_cue():
     assert torch.allclose(ep.sample(batch, 3, temperature=0.0), batch["fix"], atol=1e-6)
     with pytest.raises(ValueError, match="only the 'policy' readout"):
         CanViTModel(ep, "heatmap")
+
+
+# --- self-contained checkpoints (main b029fd3+): the checkpoint alone builds the episode ---------------
+
+from canvit.search.tests.test_search_eval import trained  # noqa: E402,F401 -- trains the tiny search run once
+
+
+def test_load_builds_the_runs_task_and_policy_from_the_checkpoint_alone(trained):  # noqa: F811
+    _, run_dir, _, argv = trained
+    ckpt = run_dir / "checkpoints" / "best.pt"
+    payload = torch.load(ckpt, map_location="cpu", weights_only=False)
+    ep = PolicyEpisode.load(ckpt, device=torch.device("cpu"), need_policy=True)
+    assert ep.is_search and ep.task.cfg.head_width == 16 and ep.task.rl.width == 16 and ep.amp is False
+    assert ep.provenance["run_config_argv"] == argv and ep.provenance["run_config_drift"] == []
+
+    def same(a, b):  # the joint's state is nested (scorer, encoder, ...)
+        if isinstance(a, dict):
+            return a.keys() == b.keys() and all(same(a[k], b[k]) for k in a)
+        return torch.equal(a, b) if isinstance(a, torch.Tensor) else a == b
+    assert same(ep.joint.state_dict(), payload["policy_state"])
+    # the loaded episode is still the deploy rollout (forcing its own choices reproduces its scores)
+    batch = _batch(torch.zeros(B, 3, 2))
+    centres, deploy_scores = _deploy(ep, batch["image"], batch["cue"], n=3)
+    batch["fix"] = centres
+    forced = ep.run(batch, n=2)["policy"]
+    for t in range(2):
+        assert torch.equal(forced[:, t], deploy_scores[t])
+
+
+def test_a_checkpoint_without_run_config_is_refused(tmp_path):
+    ckpt = tmp_path / "old.pt"
+    torch.save({"model_state": {}, "metadata": {}}, ckpt)
+    with pytest.raises(ValueError, match="no run config"):
+        PolicyEpisode.load(ckpt, device=torch.device("cpu"), need_policy=True)
+
+
+# --- free viewing with a search model: the uniform mixture over the cues ------------------------------
+
+def test_cue_mixture_is_the_mean_of_the_per_cue_pixel_densities(fake_cs18):
+    from canvit.scanpath.models import _pixel_cells, grid_log_density
+    from canvit.search.data import COCO_SEARCH18_CLASSES
+    ep = _episode(fake_cs18[0])
+    hw = (150, 224)  # a letterboxed stimulus, so some cells are cut and some off the image
+    batch = _batch(torch.zeros(B, 3, 2)) | {"cue": torch.full((B,), -1), "hw": torch.tensor([hw] * B)}
+    m = CanViTModel(ep, "policy", cue_mixture=True)
+    assert m.name == "canvit_search_policy_cuemix"
+    mixed = m.forced_logits(batch, 2, CG)  # [B, 2, G*G]
+    cell, _ = _pixel_cells(*hw, S, CG)
+    for b in range(B):
+        for t in range(2):
+            dens = [np.exp(grid_log_density(ep.run(batch | {"cue": torch.full((B,), k)}, 2)["policy"][b, t].numpy(),
+                                            hw=hw, scene=S)) for k in range(len(COCO_SEARCH18_CLASSES))]
+            expected = np.log(np.mean(dens, 0))
+            got = mixed[b, t].numpy()
+            assert np.allclose(got[cell], expected, atol=1e-5)  # the mixture, per pixel
+            assert np.allclose(grid_log_density(got, hw=hw, scene=S), expected, atol=1e-5)  # pysaliency reads it as is
+    with pytest.raises(ValueError, match="free-viewing"):
+        m.forced_logits(_batch(torch.zeros(B, 3, 2)) | {"hw": torch.tensor([hw] * B)}, 2, CG)

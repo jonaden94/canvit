@@ -7,7 +7,9 @@ CanViT episode needs on top: the stimulus letterboxed into the square scene and 
 scene coordinates [-1, 1] -- with the same letterbox as ``search.data.SearchDataset``, so a
 fixation and the pixels under it cannot disagree.
 
-COCO-Search18 comes from ``pysaliency.external_datasets.get_COCO_Search18`` with
+Every dataset comes from pysaliency's own loader (:func:`load_dataset`, ``DATASETS``), reading the cache
+under ``$SCANPATH_DATA_DIR`` (built 2026-11-20, journal). COCO-Search18 comes from
+``pysaliency.external_datasets.get_COCO_Search18`` with
 ``merge_tasks=False, unique_images=True`` (one stimulus per (image, target category), the cue in
 the stimulus attribute ``task``; the default ``merge_tasks=True, unique_images=True`` raises in
 pysaliency 0.2.23). Its download step is pointed at local copies of the four release files
@@ -23,6 +25,7 @@ A sample (one human scanpath):
     n_fix:    long  []         number of fixations (fixation 0 included)
     boxes:    float [1, 4]     target box, scene xyxy (NaN: no target / target absent)
     content:  float [4]        the stimulus inside the scene, xyxy [-1, 1]
+    hw:       long  [2]        the stimulus size in pixels (h, w)
     scanpath: long  []         index into ``fixations.scanpaths`` (pysaliency's ``scanpath_index``)
 """
 
@@ -39,7 +42,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import Tensor
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision.transforms import v2
 from torchvision.transforms.v2 import functional as TF
 
@@ -112,6 +115,84 @@ def coco_search18(location: Path, files: dict[str, Path]):
             return cs18.get_COCO_Search18(location=str(location), merge_tasks=False, unique_images=True)
     finally:
         cs18._modify_image = original
+
+
+RELEASE_FILES = ("COCOSearch18-images-TP.zip", "COCOSearch18-images-TA.zip", "COCOSearch18-fixations-TP.zip",
+                 "coco_search18_fixations_TA_trainval.json")
+
+DATASETS: dict[str, tuple[str, ...]] = {
+    "coco_search18": ("train", "validation"),  # split1; target present AND absent (evaluate.select by condition)
+    "coco_freeview": ("train", "validation"),
+    "daemons": ("train", "validation"),
+    "mit1003": ("all",),  # with the initial central fixation (as DeepGaze III), so it is history
+    "cat2000": ("all",),  # train v1.1 (the test set has no public fixations)
+    "figrim": ("all",),
+}
+"""The parts each dataset has: a train/validation split where the release has one, else the whole set."""
+
+
+def eval_part(dataset: str) -> str:
+    """The part scored: the validation split where one exists, else the whole set."""
+    return "validation" if "validation" in DATASETS[dataset] else "all"
+
+
+def fit_part(dataset: str) -> str:
+    """The part the centre bias (and the temperature diagnostic) is fitted on: train where it exists, else the
+    evaluated set itself (the centre bias is leave-one-image-out anyway)."""
+    return "train" if "train" in DATASETS[dataset] else "all"
+
+
+def load_dataset(dataset: str, part: str, *, location: Path, release_dirs: tuple[Path, ...] = ()):
+    """``(stimuli, fixations)`` of one part of a dataset, from pysaliency's loader (cached under ``location``),
+    off-stimulus fixations clipped onto the stimulus (:func:`clip_to_stimuli`). ``release_dirs``: only for
+    COCO-Search18's first build (the four release files)."""
+    from pysaliency import external_datasets as ed
+    if part not in DATASETS[dataset]:
+        raise ValueError(f"{dataset} has the parts {DATASETS[dataset]}, not {part!r}")
+    loc = str(location)
+    if dataset == "coco_search18":
+        files = {name: d / name for d in release_dirs for name in RELEASE_FILES if (d / name).exists()}
+        st, ft, sv, fv = coco_search18(location, files)
+        stimuli, fixations = (st, ft) if part == "train" else (sv, fv)
+    elif dataset == "coco_freeview":
+        stimuli, fixations = getattr(ed, f"get_COCO_Freeview_{part}")(location=loc)
+    elif dataset == "daemons":
+        stimuli, fixations = getattr(ed, f"get_DAEMONS_{part}")(location=loc)
+    elif dataset == "mit1003":
+        stimuli, fixations = ed.get_mit1003_with_initial_fixation(location=loc)
+    elif dataset == "cat2000":
+        stimuli, fixations = ed.get_cat2000_train(location=loc, version="1.1")
+    else:
+        stimuli, fixations = ed.get_FIGRIM(location=loc)
+    # Do not keep decoded images: the centre bias looks stimuli up by pixel hash (`stimulus_ids.index`), which
+    # decodes EVERY stimulus once; with pysaliency's default cache that kept all 4326 COCO-Search18 training
+    # images (~22 GB, the OOM of 2026-11-20). The hashes themselves stay cached.
+    stimuli.cached = False
+    fixations, n = clip_to_stimuli(stimuli, fixations)
+    log.info("%s %s: %d stimuli, %d scanpaths; clipped %d off-stimulus fixations onto the stimulus", dataset, part,
+             len(stimuli), len(fixations.scanpaths), n)
+    return stimuli, fixations
+
+
+def clip_to_stimuli(stimuli, fixations):
+    """-> (new ``ScanpathFixations`` with every fixation clipped onto its stimulus, number clipped).
+
+    pysaliency does not clip, and an off-stimulus fixation indexes outside the map; the convention
+    (pysaliency's ``clip_out_of_stimulus_fixations``, which fails on ``ScanpathFixations`` in 0.2.23)
+    is to clip onto the edge. Clipped on a COPY of the scanpaths and rebuilt: ``ScanpathFixations``
+    copies the coordinates at construction, so editing its scanpaths afterwards would not reach the
+    scored fixations or their histories."""
+    import pysaliency
+    sp = fixations.scanpaths.copy()
+    sizes = np.array([stimuli.sizes[int(n)] for n in sp.n], dtype=np.float64).reshape(-1, 2)  # (h, w) per scanpath
+    clipped = 0
+    for arr, lim in ((sp.xs, sizes[:, 1]), (sp.ys, sizes[:, 0])):
+        data = arr._data
+        valid = ~np.isnan(data)
+        new = np.clip(data, 0, (lim - 1e-6)[:, None])
+        clipped += int(np.sum(valid & (new != data)))
+        data[valid] = new[valid]
+    return pysaliency.ScanpathFixations(sp), clipped
 
 
 # --- scene geometry ------------------------------------------------------------------------------
@@ -188,7 +269,8 @@ class ScanpathDataset(Dataset):
         return {"image": image.as_subclass(Tensor),
                 "cue": torch.tensor(-1 if self.cues is None else self.cues[n], dtype=torch.long),
                 "fix": pixel_to_scene(xy, hw=hw, scene=self.scene), "n_fix": torch.tensor(L, dtype=torch.long),
-                "boxes": boxes, "content": content.reshape(4), "scanpath": torch.tensor(i, dtype=torch.long)}
+                "boxes": boxes, "content": content.reshape(4), "hw": torch.tensor(hw, dtype=torch.long),
+                "scanpath": torch.tensor(i, dtype=torch.long)}
 
 
 def collate_scanpath(batch: list[dict]) -> dict:
@@ -197,14 +279,19 @@ def collate_scanpath(batch: list[dict]) -> dict:
     fix = torch.full((len(batch), L, 2), math.nan)
     for i, s in enumerate(batch):
         fix[i, : s["fix"].shape[0]] = s["fix"]
-    out = {k: torch.stack([s[k] for s in batch]) for k in ("image", "cue", "n_fix", "boxes", "content", "scanpath")}
+    out = {k: torch.stack([s[k] for s in batch]) for k in ("image", "cue", "n_fix", "boxes", "content", "hw", "scanpath")}
     return out | {"fix": fix}
 
 
 def make_scanpath_loader(stimuli, fixations, *, scene_size: int, batch_size: int, num_workers: int) -> DataLoader:
-    return DataLoader(ScanpathDataset(stimuli, fixations, scene_size=scene_size), batch_size=batch_size,
-                      shuffle=False, num_workers=num_workers, collate_fn=collate_scanpath, pin_memory=True)
+    """The scanpaths with at least one fixation after the start (the others have nothing to score), in order;
+    samples keep their index into ``fixations.scanpaths``."""
+    ds = ScanpathDataset(stimuli, fixations, scene_size=scene_size)
+    keep = np.flatnonzero(np.asarray(fixations.scanpaths.length) >= 2).tolist()
+    return DataLoader(Subset(ds, keep), batch_size=batch_size, shuffle=False, num_workers=num_workers,
+                      collate_fn=collate_scanpath, pin_memory=True)
 
 
-__all__ = ["ScanpathDataset", "clamp_to_content", "coco_search18", "collate_scanpath", "letterbox_geometry",
-           "local_mirror", "make_scanpath_loader", "pixel_to_scene"]
+__all__ = ["DATASETS", "ScanpathDataset", "clamp_to_content", "clip_to_stimuli", "coco_search18", "collate_scanpath",
+           "eval_part", "fit_part", "letterbox_geometry", "load_dataset", "local_mirror", "make_scanpath_loader",
+           "pixel_to_scene"]

@@ -5,8 +5,11 @@ pysaliency provides the models and the metrics; this file only adapts what it ca
 - :class:`GridScanpathModel` -- a ``pysaliency.ScanpathModel`` whose conditional log density comes
   from logits a CanViT episode precomputed on the G x G scene grid (``canvit_models.py``), keyed by
   pysaliency's ``(scanpath_index, history length)``. Each stimulus pixel takes the cell its centre
-  falls in (letterbox of ``data.py``); a cell's mass is spread evenly over its pixels; cells with no
-  stimulus pixel (letterbox padding) are dropped and the rest renormalised.
+  falls in (letterbox of ``data.py``). The cells are equal in SCENE area, so a cell's logit is a density
+  per area: every pixel of a cell gets exp(logit), renormalised over the stimulus pixels -- a cell the
+  letterbox edge cuts keeps its per-pixel density and loses mass with its lost pixels; cells with no
+  stimulus pixel (letterbox padding) get none. (Before 2026-11-23 a cut cell kept the whole cell's mass,
+  concentrated on its few pixels.)
 - :class:`DensitySaliencyMap` -- the density as a ``ScanpathSaliencyMapModel``, so pysaliency's
   NSS / AUC score the density itself (as in Kümmerer et al.), not the log density.
 - :func:`fit_centre_bias` -- bandwidth and eps of pysaliency's ``CrossvalidatedBaselineModel``
@@ -41,15 +44,20 @@ def _pixel_cells(h: int, w: int, scene: int, grid: int) -> tuple[np.ndarray, np.
     return cell, np.bincount(cell.ravel(), minlength=grid * grid)
 
 
+def _log_count(count: np.ndarray) -> np.ndarray:
+    with np.errstate(divide="ignore"):
+        return np.log(count)  # -inf for cells without a stimulus pixel
+
+
 def grid_log_density(logits: np.ndarray, *, hw: tuple[int, int], scene: int) -> np.ndarray:
-    """[G*G] scene-grid logits -> [h, w] log density over the stimulus pixels (sums to 1)."""
+    """[G*G] scene-grid logits -> [h, w] log density over the stimulus pixels (sums to 1): every pixel gets
+    its cell's logit, normalised over the pixels (= cell probabilities ``softmax(logits + log pixels)``,
+    spread evenly over each cell's pixels)."""
     grid = int(round(len(logits) ** 0.5))
     cell, count = _pixel_cells(hw[0], hw[1], scene, grid)
-    on = count > 0
-    logp = np.full(len(logits), -np.inf)
-    logp[on] = log_softmax(logits[on].astype(np.float64))
-    with np.errstate(divide="ignore"):
-        return (logp - np.log(count))[cell]
+    logp = log_softmax(logits.astype(np.float64) + _log_count(count))
+    with np.errstate(invalid="ignore"):  # -inf - -inf in cells no pixel reads
+        return (logp - _log_count(count))[cell]
 
 
 class GridScanpathModel(pysaliency.ScanpathModel):
@@ -93,23 +101,25 @@ class GridScanpathModel(pysaliency.ScanpathModel):
 
 
 def _scored_cells(model: GridScanpathModel, stimuli, fixations):
-    """For every fixation with a history: its logits [N, G*G], the cell it landed in [N], which cells show
-    the image [N, G*G], and its history length [N]. (pysaliency's LL = log p(cell) - log(pixels in cell);
-    the second term does not depend on the temperature, so fitting on cells is exact.)"""
+    """For every fixation with a history: its logits [N, G*G], the cell it landed in [N], log(pixels of the
+    image in each cell) [N, G*G] (-inf: none), and its history length [N]. (pysaliency's LL = log p(cell) -
+    log(pixels in cell); the second term does not depend on the temperature, so fitting on cells is exact.)"""
     fx = without_start_fixations(fixations)
-    logits, cells, on = [], [], []
+    logits, cells, logcount = [], [], []
     for i in range(len(fx)):
         h, w = stimuli.sizes[int(fx.n[i])]
         lg = model.logits[(int(fx.scanpath_index[i]), int(fx.scanpath_history_length[i]))]
         cell, count = _pixel_cells(int(h), int(w), model.scene, int(round(len(lg) ** 0.5)))
         logits.append(lg)
         cells.append(cell[fx.y_int[i], fx.x_int[i]])
-        on.append(count > 0)
-    return np.stack(logits).astype(np.float64), np.array(cells), np.stack(on), np.asarray(fx.scanpath_history_length)
+        logcount.append(_log_count(count))
+    return (np.stack(logits).astype(np.float64), np.array(cells), np.stack(logcount),
+            np.asarray(fx.scanpath_history_length))
 
 
-def _cell_log_probs(logits: np.ndarray, on: np.ndarray, tau: float) -> np.ndarray:
-    return log_softmax(np.where(on, logits / tau, -np.inf), axis=1)
+def _cell_log_probs(logits: np.ndarray, logcount: np.ndarray, tau) -> np.ndarray:
+    """log p(cell) at temperature ``tau`` (scalar or [N, 1]): the temperature scales the logits, not the area."""
+    return log_softmax(logits / tau + logcount, axis=1)
 
 
 def fit_temperature(model: GridScanpathModel, stimuli, fixations, *, per_index: bool = False,
@@ -117,12 +127,12 @@ def fit_temperature(model: GridScanpathModel, stimuli, fixations, *, per_index: 
     """The temperature maximising the mean log-likelihood of the human fixations (fit on the TRAINING split).
     ``per_index``: one per history length t with >= ``min_fixations`` fixations (a secondary diagnostic)."""
     from scipy.optimize import minimize_scalar
-    logits, cells, on, t = _scored_cells(model, stimuli, fixations)
+    logits, cells, logcount, t = _scored_cells(model, stimuli, fixations)
     rows = np.arange(len(cells))
 
     def fit(mask) -> float:
         def nll(log_tau):
-            logp = _cell_log_probs(logits[mask], on[mask], float(np.exp(log_tau)))
+            logp = _cell_log_probs(logits[mask], logcount[mask], float(np.exp(log_tau)))
             return -logp[rows[: mask.sum()], cells[mask]].mean()
         log_tau = minimize_scalar(nll, bounds=(-4.0, 4.0), method="bounded").x
         if abs(abs(log_tau) - 4.0) < 1e-3:  # e.g. an uninformative map: flattening it is all the fit can do
@@ -135,12 +145,12 @@ def fit_temperature(model: GridScanpathModel, stimuli, fixations, *, per_index: 
 
 
 def policy_entropy(model: GridScanpathModel, stimuli, fixations) -> tuple[np.ndarray, np.ndarray]:
-    """Entropy (nats) of the predicted next-fixation distribution over the image's cells, at the model's
-    temperature, per scored fixation; and the history length t of each."""
-    logits, _, on, t = _scored_cells(model, stimuli, fixations)
+    """Entropy (nats) of the predicted next-fixation distribution over the image's cells (``p(cell)`` as in
+    :func:`grid_log_density`), at the model's temperature, per scored fixation; and the history length t."""
+    logits, _, logcount, t = _scored_cells(model, stimuli, fixations)
     taus = np.array([model.tau(int(i)) for i in t])[:, None]
-    logp = log_softmax(np.where(on, logits / taus, -np.inf), axis=1)
-    return -(np.where(on, np.exp(logp) * logp, 0.0)).sum(1), t
+    logp = _cell_log_probs(logits, logcount, taus)
+    return -(np.exp(logp) * np.where(np.isfinite(logp), logp, 0.0)).sum(1), t
 
 
 class DensitySaliencyMap(pysaliency.ScanpathSaliencyMapModel):

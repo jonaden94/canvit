@@ -3,6 +3,7 @@ clipping, the scores, the release-file mirror (design §7)."""
 
 import hashlib
 import math
+from pathlib import Path
 
 import numpy as np
 import pysaliency
@@ -10,8 +11,8 @@ import pytest
 import torch
 from pysaliency.baseline_utils import CrossvalidatedBaselineModel
 
-from canvit.scanpath.data import ScanpathDataset, collate_scanpath, local_mirror, pixel_to_scene
-from canvit.scanpath.evaluate import clip_to_stimuli, scores, select
+from canvit.scanpath.data import ScanpathDataset, clip_to_stimuli, collate_scanpath, local_mirror, pixel_to_scene
+from canvit.scanpath.evaluate import scores, select
 from canvit.scanpath.models import GridScanpathModel, _pixel_cells, fit_centre_bias, grid_log_density
 
 from .conftest import H, W, scanpaths
@@ -71,13 +72,26 @@ def test_collate_pads_with_nan(fake_search):
 
 # --- grid -> pixel density -----------------------------------------------------------------------
 
-def test_grid_density_sums_to_one_and_area_weighted_logits_give_pysaliencys_uniform():
-    cell, count = _pixel_cells(H, W, 64, 32)
+def test_grid_density_sums_to_one_and_flat_logits_give_pysaliencys_uniform():
     ld = grid_log_density(np.random.default_rng(0).standard_normal(1024), hw=(H, W), scene=64)
     assert ld.shape == (H, W) and math.isclose(np.exp(ld).sum(), 1.0, rel_tol=1e-9)
-    with np.errstate(divide="ignore"):
-        uniform = grid_log_density(np.log(count), hw=(H, W), scene=64)
+    uniform = grid_log_density(np.zeros(1024), hw=(H, W), scene=64)
     assert np.allclose(uniform, pysaliency.UniformModel().log_density(np.zeros((H, W, 3))))
+
+
+def test_a_cell_cut_by_the_letterbox_keeps_its_per_pixel_density():
+    """Cells are equal in scene area, so a logit is a density per area: a cell the image edge cuts must not
+    concentrate the whole cell's mass on its few pixels (the bug before 2026-11-23)."""
+    h, w = 100, 168  # letterboxed into 64 px: content rows 13..51, so the top and bottom cell rows are cut
+    cell, count = _pixel_cells(h, w, 64, 32)
+    cut = 6 * 32 + 16  # cell row 6 = scene rows 12-13, of which only row 13 shows the image
+    assert 0 < count[cut] < 0.75 * np.median(count[count > 0])
+    logits = np.zeros(1024)
+    logits[cut] = 1.0  # the cut cell is e times as dense as every other cell
+    d = np.exp(grid_log_density(logits, hw=(h, w), scene=64))
+    inside, other = d[cell == cut], d[cell != cut]
+    assert np.allclose(inside, inside[0]) and np.allclose(other, other[0])
+    assert math.isclose(inside[0] / other[0], math.e, rel_tol=1e-9) and math.isclose(d.sum(), 1.0, rel_tol=1e-9)
 
 
 def test_grid_model_scores_the_cell_of_the_fixation(fake_search):
@@ -150,21 +164,20 @@ def test_cli_parses_the_scanpath_subcommand():
     import tyro
 
     from canvit.harness.evaluate import Command, ScanpathEval
+    from canvit.scanpath.evaluate import split_name
     cmd = tyro.cli(Command, args=["scanpath", "--cfg.model", "uniform", "--cfg.condition", "tp"])  # pyright: ignore
     assert isinstance(cmd, ScanpathEval) and cmd.cfg.model == "uniform" and cmd.cfg.condition == "tp"
+    assert split_name(cmd.cfg) == "tp_validation"
+    cmd = tyro.cli(Command, args=["scanpath", "--cfg.dataset", "mit1003"])  # pyright: ignore
+    assert cmd.cfg.dataset == "mit1003" and split_name(cmd.cfg) == "all"
 
 
-def test_cli_takes_the_policys_task_with_its_training_flags():
-    import tyro
-
-    from canvit.harness.evaluate import Command
-    from canvit.scanpath.sources import In1kSource, SearchSource
-    cmd = tyro.cli(Command, args=["scanpath", "--cfg.model", "canvit_policy", "cfg.source:in1k",  # pyright: ignore
-                                  "--cfg.source.cfg.canvas-grid", "8", "--cfg.source.rl.width", "32"])
-    assert isinstance(cmd.cfg.source, In1kSource)
-    assert cmd.cfg.source.cfg.canvas_grid == 8 and cmd.cfg.source.rl.width == 32
-    default = tyro.cli(Command, args=["scanpath"])  # pyright: ignore
-    assert isinstance(default.cfg.source, SearchSource) and default.cfg.source.rl.centers_per_axis == 32
+def test_dataset_parts():
+    from canvit.scanpath.data import DATASETS, eval_part, fit_part, load_dataset
+    assert [eval_part(d) for d in DATASETS] == ["validation"] * 3 + ["all"] * 3
+    assert [fit_part(d) for d in DATASETS] == ["train"] * 3 + ["all"] * 3
+    with pytest.raises(ValueError, match="parts"):
+        load_dataset("mit1003", "validation", location=Path("/nonexistent"))
 
 
 def test_flat_density_has_nss_zero(fake_search):
@@ -172,22 +185,6 @@ def test_flat_density_has_nss_zero(fake_search):
     _, _, sv, fv = fake_search
     fx = fv[fv.scanpath_history_length > 0][:20]
     assert np.allclose(DensitySaliencyMap(pysaliency.UniformModel()).NSSs(sv, fx), 0.0)
-
-
-def test_canvit_models_need_the_new_foveation_geometry_declared():
-    from pathlib import Path
-
-    from canvit.scanpath.evaluate import ScanpathConfig, build_model
-    for geometry, match in ((None, "source-geometry is required"), ("fovi-c399d3b", "no longer builds")):
-        cfg = ScanpathConfig(model="canvit_policy", ckpt=Path("run.pt"), source_geometry=geometry)
-        with pytest.raises(ValueError, match=match):
-            build_model(cfg, None, None, None, torch.device("cpu"))  # refused before anything is loaded
-    import tyro
-
-    from canvit.harness.evaluate import Command
-    cmd = tyro.cli(Command, args=["scanpath", "--cfg.model", "canvit_policy",  # pyright: ignore
-                                  "--cfg.source-geometry", "fovi-27b1bde"])
-    assert cmd.cfg.source_geometry == "fovi-27b1bde"
 
 
 # --- temperature, entropy, saved predictions (diagnostics for the CanViT results) --------------------
@@ -227,7 +224,8 @@ def test_flat_logits_have_the_entropy_of_the_image_cells(fake_search):
     m = GridScanpathModel({k: np.zeros(1024) for k in m.logits}, scene_size=64, name="flat")
     H_, _ = policy_entropy(m, sv, fv)
     _, count = _pixel_cells(H, W, 64, 32)
-    assert np.allclose(H_, np.log((count > 0).sum()))
+    p = count[count > 0] / count.sum()  # flat per pixel: each cell weighted by its pixels on the image
+    assert np.allclose(H_, -(p * np.log(p)).sum())
 
 
 def test_saved_predictions_load_back(fake_search, tmp_path):
@@ -252,3 +250,15 @@ def test_grid_diagnostics_report_entropy_and_tempered_likelihoods(fake_search):
     for k in ("tempered_global", "tempered_per_index"):
         assert {"temperature", "ll_image", "ig_image"} <= set(d[k])
     assert d["tempered_global"]["temperature"] > 0 and np.isfinite(d["tempered_global"]["entropy_fix"])
+
+
+def test_sharded_per_fixation_scores_aggregate_to_the_same_numbers(fake_search):
+    from canvit.scanpath.evaluate import aggregate, per_fixation_scores, scored_fixations
+    _, _, sv, fv = fake_search
+    cb = CrossvalidatedBaselineModel(sv, fv, bandwidth=0.1, eps=1e-3)
+    fx = scored_fixations(fv)
+    shards = [per_fixation_scores(cb, sv, fx[i:i + 7], cb) for i in range(0, len(fx), 7)]
+    merged = {k: np.concatenate([sh[k] for sh in shards]) for k in shards[0]}
+    whole = scores(cb, sv, fv, cb)
+    assert aggregate(merged) == pytest.approx(whole, rel=1e-12, abs=1e-12)
+    assert whole["n_scanpaths"] == len(np.unique(fv[fv.scanpath_history_length > 0].scanpath_index))
