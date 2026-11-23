@@ -210,6 +210,28 @@ def evaluate_priors(train: CellBatch, val: CellBatch, record: dict, variants=VAR
     return out
 
 
+def annotate(res: dict) -> dict:
+    """Unambiguous labels: every variant's ``ig_over_centre_bias`` is ABSOLUTE (bits/fix over the dataset's centre
+    bias), and ``gain`` is its difference to its base row: CanViT@tau over CanViT at tau = 1, CanViT@tau + priors
+    over CanViT@tau, a no-image variant over the centre bias; CanViT@tau + all also over priors only."""
+    who = "heatmap" if "heatmap" in res["model"] else "CanViT"
+    v = res["variants"]
+    for name, x in v.items():
+        ig = x["ig_image"]
+        if name == "canvit_tau":
+            label, base, base_ig = f"{who}@tau", f"{who} at tau = 1", res["record_ig_image"]
+        elif x["with_canvit"]:
+            what = "all four priors" if len(x["priors"]) == len(PRIORS) else " + ".join(x["priors"])
+            label, base, base_ig = f"{who}@tau + {what}", f"{who}@tau", v["canvit_tau"]["ig_image"]
+        else:
+            what = "all four priors" if len(x["priors"]) == len(PRIORS) else " + ".join(x["priors"])
+            label, base, base_ig = f"no image: {what}", "the centre bias", 0.0
+        x |= {"label": label, "ig_over_centre_bias": ig, "gain": {"over": base, "bits": ig - base_ig}}
+    if "canvit_tau+all" in v and "priors_only" in v:
+        v["canvit_tau+all"]["gain_over_priors_only"] = v["canvit_tau+all"]["ig_image"] - v["priors_only"]["ig_image"]
+    return res
+
+
 def main() -> None:
     from .data import load_dataset
     from .evaluate import ScanpathConfig, centre_bias_model, select, train_subset
@@ -217,9 +239,16 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("records", type=Path, nargs="+", help="CanViT records (<stem>.json with <stem>.npz and "
                                                           "<stem>_train<N>.npz beside them)")
+    ap.add_argument("--annotate-only", action="store_true",
+                    help="only (re)write the labels and gains of existing priors/<stem>.json (no fit)")
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     for path in a.records:
+        out = path.parent / "priors" / f"{path.stem}.json"
+        if a.annotate_only:
+            out.write_text(json.dumps(annotate(json.loads(out.read_text())), indent=1))
+            log.info("annotated %s", out)
+            continue
         rec = json.loads(path.read_text())
         pr = rec["protocol"]
         train_npz = Path(pr.get("save_train_predictions")
@@ -238,7 +267,7 @@ def main() -> None:
                "train_predictions": str(train_npz), "n_train_fixations": len(train), "n_val_fixations": len(val),
                "centre_bias": fit_cb, "record_ig_image": rec["metrics"]["ig_image"],
                "variants": evaluate_priors(train, val, rec), "evaluated_at": datetime.now(UTC).isoformat()}
-        out = path.parent / "priors" / f"{path.stem}.json"
+        annotate(res)
         out.parent.mkdir(exist_ok=True)
         out.write_text(json.dumps(res, indent=1))
         log.info("wrote %s", out)

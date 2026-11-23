@@ -380,6 +380,9 @@ def saccade_table(summ: dict[str, dict], out: Path, ppd: dict[str, float] | None
 
 
 # ------------------------------------------------------------------------------------------------- records
+HELD_OUT = {"figrim": "CanViT numbers under check: square images vs the trained letterbox (helper_1, 2026-11-23)"}
+
+
 def load_records(results: Path) -> list[dict]:
     """Every scanpath evaluation record under ``results``, with ``source`` = its directory (``baselines``,
     ``deepgaze3`` or a CanViT checkpoint name) and ``kind`` = the STYLE key. Records written before 2026-11-23
@@ -397,6 +400,9 @@ def load_records(results: Path) -> list[dict]:
         if top and (results / "baselines").is_dir():
             continue
         pr = r["protocol"]
+        if r.get("dataset") in HELD_OUT and p.parent != results and p.parent.name not in ("baselines", "deepgaze3"):
+            print(f"load_records: held out {p} ({HELD_OUT[r['dataset']]})")
+            continue
         if pr.get("limit_scanpaths") is not None:  # a smoke test on part of the data, not a result
             print(f"load_records: skipped {p} (limit_scanpaths={pr['limit_scanpaths']})")
             continue
@@ -704,53 +710,100 @@ def policy_vs_human(recs: list[dict], out: Path, steps=(1, 2, 3, 4), near: float
     return macros
 
 
-# Post-hoc human-bias priors (canvit.scanpath.priors): variant -> (row label, macro tag)
-PRIOR_ROWS = [("canvit_tau", "CanViT, fitted tau", "Tau"),
-              ("canvit_tau+amplitude", "+ saccade amplitude", "Amp"),
-              ("canvit_tau+return", "+ return (IOR / facilitation)", "Ret"),
-              ("canvit_tau+direction", "+ direction", "Dir"),
-              ("canvit_tau+centre", "+ centre bias", "Cb"),
-              ("canvit_tau+all", "+ all four priors", "All"),
-              ("priors_only", "priors only (no image)", "Only"),
-              ("centre_only", "centre-bias prior only (check)", "CbOnly")]
+# Post-hoc human-bias priors (canvit.scanpath.priors): (source, variant, macro tag), in the figure/table order.
+# source "policy" = <ckpt>/priors/, "heatmap" = <ckpt>/heatmap/priors/.
+PRIOR_ROWS = [("policy", "canvit_tau", "Tau"), ("policy", "canvit_tau+amplitude", "Amp"),
+              ("policy", "canvit_tau+return", "Ret"), ("policy", "canvit_tau+direction", "Dir"),
+              ("policy", "canvit_tau+centre", "Cb"), ("policy", "canvit_tau+all", "All"),
+              ("heatmap", "canvit_tau", "HmTau"), ("heatmap", "canvit_tau+all", "HmAll"),
+              ("policy", "priors_only", "Only"), ("policy", "centre_only", "CbOnly")]
 
 
-def priors_figure(results: Path, out: Path) -> dict[str, str]:
-    """IG over the centre bias (bits/fix, validation) of CanViT with each post-hoc prior, fitted on training
-    scanpaths, COCO-Search18 TP | TA; grey rows are without CanViT. Returns macros prIG<variant><TP|TA>."""
-    recs = {}
-    for p in sorted(results.glob("*/priors/coco_search18_*_validation.json")):
-        r = json.loads(p.read_text())
-        if r.get("model") == "canvit_search_policy":
-            recs[r["split"][:2]] = r
-    if not recs:
-        print("priors_figure: no priors results yet")
+def load_priors(results: Path) -> dict[tuple[str, str], dict]:
+    """{(source, condition): priors JSON} for COCO-Search18 TP/TA (canvit.scanpath.priors, annotated)."""
+    out = {}
+    for src, pattern in (("policy", "*/priors/coco_search18_*_validation.json"),
+                         ("heatmap", "*/heatmap/priors/coco_search18_*_validation.json")):
+        for p in sorted(results.glob(pattern)):
+            r = json.loads(p.read_text())
+            if all("label" in v for v in r["variants"].values()):
+                out[(src, r["split"][:2])] = r
+    return out
+
+
+def _tex_label(label: str) -> str:
+    return label.replace("tau", r"$\tau$")
+
+
+def _signed(v: float) -> str:
+    return f"{v:+.2f}".replace("-", r"$-$")
+
+
+def priors_figure(recs: list[dict], results: Path, out: Path, tabs: Path) -> dict[str, str]:
+    """ABSOLUTE IG over the centre bias (bits/fix, validation) of CanViT (policy; heatmap rows sky blue) with the
+    post-hoc priors fitted on training scanpaths, and of the priors without any image (grey), COCO-Search18 TP | TA;
+    DeepGaze III as a dashed reference line. Also tables/priors.tex (IG and gain over each row's base) and macros
+    prIG<tag><TP|TA>, prGain<tag><TP|TA>, prGainAllOverOnly<TP|TA>, prGainHmAllOverOnly<TP|TA>."""
+    pri = load_priors(results)
+    conds = [c for c in CONDITIONS if ("policy", c) in pri]
+    if not conds:
+        print("priors_figure: no annotated priors results yet")
         return {}
-    macros = {}
-    conds = [c for c in CONDITIONS if c in recs]
-    fig, axes = plt.subplots(1, len(conds), figsize=(TEXTWIDTH_IN, 0.22 * len(PRIOR_ROWS) + 0.7), sharey=True,
+    macros: dict[str, str] = {}
+    cell: dict[tuple[str, str, str], dict] = {}  # (source, variant, cond) -> variant entry
+    for (src, cond), r in pri.items():
+        for k, v in r["variants"].items():
+            cell[(src, k, cond)] = v
+    rows = [r for r in PRIOR_ROWS if any((r[0], r[1], c) in cell for c in conds)]
+    fig, axes = plt.subplots(1, len(conds), figsize=(TEXTWIDTH_IN, 0.2 * len(rows) + 0.75), sharey=True,
                              squeeze=False, layout="constrained")
     for ax, cond in zip(axes[0], conds):
-        v = recs[cond]["variants"]
         ax.axvline(0, color=BASELINE_COLOR, lw=0.5)
-        cv0 = recs[cond]["record_ig_image"]  # CanViT at tau = 1, open square on the first row
-        ax.plot(cv0, 0, marker="s", ms=4, mfc="white", mec=STYLE["canvit"][0], ls="none")
-        ax.annotate(f"tau = 1: {cv0:+.2f}", (cv0, 0), xytext=(0, -9), textcoords="offset points", ha="center",
-                    fontsize=FS - 1)
-        for row, (key, _, tag) in enumerate(PRIOR_ROWS):
-            if key not in v:
+        dg = next((r["metrics"]["ig_image"] for r in recs if r["kind"] == "deepgaze3" and r["dataset"] ==
+                   "coco_search18" and r["split"] == f"{cond}_validation"), None)
+        if dg is not None:
+            ax.axvline(dg, color=STYLE["deepgaze3"][0], ls="--", lw=0.8)
+            ax.annotate(f"DeepGaze III {dg:+.2f}", (dg, len(rows) - 0.5), xytext=(3, 0), textcoords="offset points",
+                        color=STYLE["deepgaze3"][0], fontsize=FS - 1, va="bottom")
+        for row, (src, key, tag) in enumerate(rows):
+            v = cell.get((src, key, cond))
+            if v is None:
                 continue
-            ig = v[key]["ig_image"]
+            ig = v["ig_over_centre_bias"]
             macros[f"prIG{tag}{cond.upper()}"] = f"{ig:.2f}".replace("-", r"\ensuremath{-}")
-            color, marker = STYLE["canvit"][:2] if v[key]["with_canvit"] else (BASELINE_COLOR, "D")
+            macros[f"prGain{tag}{cond.upper()}"] = f"{v['gain']['bits']:.2f}".replace("-", r"\ensuremath{-}")
+            if "gain_over_priors_only" in v:
+                g = f"{v['gain_over_priors_only']:.2f}".replace("-", r"\ensuremath{-}")
+                macros[f"prGain{'Hm' if src == 'heatmap' else ''}AllOverOnly{cond.upper()}"] = g
+            color, marker = ((STYLE["canvit"][:2] if src == "policy" else STYLE["canvit_heatmap"][:2])
+                             if v["with_canvit"] else (BASELINE_COLOR, "D"))
             ax.plot(ig, row, marker=marker, ms=4, color=color, ls="none")
-            ax.annotate(f"{ig:+.2f}", (ig, row), xytext=(6, 0), textcoords="offset points", va="center",
+            ax.annotate(f"{ig:+.2f}", (ig, row), xytext=(5, 0), textcoords="offset points", va="center",
                         fontsize=FS - 1)
-        ax.set(title=CONDITIONS[cond], xlabel="IG over centre bias (bits/fix, validation)")
+        cv0 = pri[("policy", cond)]["record_ig_image"]
+        ax.set(title=rf"{CONDITIONS[cond]} (CanViT at $\tau$ = 1: {cv0:+.2f})",
+               xlabel="IG over centre bias (bits/fix, validation, absolute)")
         despine(ax)
-    axes[0, 0].set(yticks=range(len(PRIOR_ROWS)), yticklabels=[r[1] for r in PRIOR_ROWS],
-                   ylim=(len(PRIOR_ROWS) - 0.5, -0.8))
+    labels = [_tex_label(next(cell[(s_, k, c)]["label"] for c in conds if (s_, k, c) in cell)) for s_, k, _ in rows]
+    axes[0, 0].set(yticks=range(len(rows)), yticklabels=labels, ylim=(len(rows) - 0.5, -0.6))
     save(fig, out / "priors.pdf")
+
+    lines = [r"\begin{tabular}{llrrrr}", r"\toprule",
+             r" & & \multicolumn{2}{c}{target present} & \multicolumn{2}{c}{target absent} \\",
+             r"model & gain over & IG & gain & IG & gain \\", r"\midrule"]
+    for src, key, _ in rows:
+        vs = [cell.get((src, key, c)) for c in CONDITIONS]
+        v0 = next(v for v in vs if v)
+        vals = " & ".join(f"{_signed(v['ig_over_centre_bias'])} & {_signed(v['gain']['bits'])}" if v else "&"
+                          for v in vs)
+        lines.append(f"{_tex_label(v0['label'])} & {_tex_label(v0['gain']['over'])} & {vals} \\\\")
+    dgs = [next((r["metrics"]["ig_image"] for r in recs if r["kind"] == "deepgaze3" and r["dataset"] ==
+                 "coco_search18" and r["split"] == f"{c}_validation"), None) for c in CONDITIONS]
+    if any(d is not None for d in dgs):
+        lines += [r"\midrule", "DeepGaze III (reference) & the centre bias & " + " & ".join(
+            f"{_signed(d)} & {_signed(d)}" if d is not None else "&" for d in dgs) + r" \\"]
+    lines += [r"\bottomrule", r"\end{tabular}"]
+    (tabs / "priors.tex").write_text("\n".join(lines) + "\n")
     return macros
 
 
@@ -984,7 +1037,7 @@ def main() -> None:
     cross_dataset_figure(recs, figs, read_references(a.references))
     res_macros = results_table(recs, tabs)
     res_macros |= policy_vs_human(recs, tabs)
-    res_macros |= priors_figure(a.results, figs)
+    res_macros |= priors_figure(recs, a.results, figs, tabs)
 
     sacc = {}
     for slug, cond, title in PANELS:
