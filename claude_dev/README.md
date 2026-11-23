@@ -20,7 +20,6 @@ tree is the long form those rules were derived from.
 | [`dataloading/`](dataloading/) | the original data-loading and DDP design notes (April 2026), from before the unification. `canvit/harness/infra/dist.py` and `unification/ddp_transport_probe.py` both cite them. |
 | [`search/`](search/) | the visual-search task (COCO-Search18), started 2026-11-05: design notes, and under `external_info_provided_by_jonathan/` the material the owner handed over. **In progress.** |
 | [`fovi_port/`](fovi_port/) | the 2026-11-12 port of fovi's geometry into `canvit/core/foveation/`: what was kept, and the bit-identity gate (`gate.py`) with its result. **Finished.** |
-| [`scanpath/`](scanpath/) | human scanpath evaluation (COCO-Search18 first, then free viewing), started 2026-11-18 on branch `scanpath-eval`: how human-like CanViT's fixations are, by pysaliency-style teacher-forced likelihood and the COCO-Search18 benchmark metrics. **In progress.** *(AI edit, Claude Opus 5.5, 2026-11-18: row added.)* |
 | [`papers/`](papers/) | material handed to Claude to read. Notes (`*.md`) are tracked; the sources are not — see its `.gitignore`. |
 
 ## Conventions

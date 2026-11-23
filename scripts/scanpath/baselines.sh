@@ -1,5 +1,5 @@
 #!/bin/bash
-# Reference lines for the scanpath evaluation (claude_dev/scanpath/00-design.md §4.1): pysaliency's uniform model
+# Reference lines for the scanpath evaluation (canvit_claude/scanpath/00-design.md §4.1, outside the repo): pysaliency's uniform model
 # and centre bias on COCO-Search18 split1 validation, target present and absent. The centre bias's bandwidth/eps is
 # fitted ONCE on the training split (written to $OUT/centre_bias_fit.json) and reused by every run.
 #   source .envrc && bash scripts/scanpath/baselines.sh            # ~1 h on one CPU

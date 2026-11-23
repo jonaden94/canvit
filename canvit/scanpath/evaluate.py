@@ -2,7 +2,7 @@
 
     python -m canvit.harness.evaluate scanpath --cfg.model centre_bias --out results/cb.json
 
-Conventions (pysaliency's and Kümmerer et al.'s, claude_dev/papers/scanpath_likelihood_eval.md):
+Conventions (pysaliency's and Kümmerer et al.'s, notes: canvit_claude/papers/, outside the repo):
 every fixation with a history is scored -- fixation 0, the start fixation, is history only -- with
 the full history; scores in bits/fixation. ``ll`` = information gain over pysaliency's
 ``UniformModel``, ``ig`` = over the centre bias (``CrossvalidatedBaselineModel``: leave-one-image-out

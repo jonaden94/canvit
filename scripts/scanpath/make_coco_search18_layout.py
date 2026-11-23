@@ -1,7 +1,7 @@
 """Build the RESTRUCTURED COCO-Search18 layout that ``canvit/search/data.py`` reads, as symlinks
 into a copy in the ORIGINAL release layout (per-task ``images/<task>/``, JSONs in the root).
 
-    python claude_dev/scanpath/make_coco_search18_layout.py <original root> <new root>
+    python scripts/scanpath/make_coco_search18_layout.py <original root> <new root>
 
 <new root>/images/<name>.jpg    -> <original root>/images/<task>/<name>.jpg   (any task folder)
 <new root>/fixations/<f>.json   -> <original root>/<f>.json                   (every fixation JSON)
@@ -45,7 +45,7 @@ def main(src: Path, dst: Path) -> None:
     has_ta = any("_TA_" in j.name for j in jsons)
     (dst / "README.md").write_text(
         f"COCO-Search18 in the restructured layout canvit reads, as symlinks into {src.resolve()}\n"
-        f"(built by canvit claude_dev/scanpath/make_coco_search18_layout.py).\n\n"
+        f"(built by canvit scripts/scanpath/make_coco_search18_layout.py).\n\n"
         f"images/: {len(images)} padded 1680x1050 images. fixations/: {', '.join(j.name for j in jsons)}.\n"
         + ("" if has_ta else "\nNo target-absent (TA) data: use --cfg.condition tp.\n"))
     print(f"{dst}: {len(images)} images, {len(jsons)} fixation files, target-absent: {has_ta}")
