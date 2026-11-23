@@ -807,8 +807,8 @@ def results_table(recs: list[dict], out: Path) -> dict[str, str]:
             rows.append(f" & {name} & {int(m['n_fixations'])} & {vals} \\\\")
             tag = {"tp_validation": "TP", "ta_validation": "TA"}.get(split) if ds == "coco_search18" else \
                 {"coco_freeview": "FV"}.get(ds)
-            if kind in ("canvit", "canvit_heatmap") and tag:
-                pre = "cv" if kind == "canvit" else "hm"
+            if kind in ("canvit", "canvit_heatmap", "deepgaze3") and tag:
+                pre = {"canvit": "cv", "canvit_heatmap": "hm", "deepgaze3": "dg"}[kind]
                 d = r.get("diagnostics", {}).get("tempered_global", {})
                 vals = {f"{pre}IG{tag}": m["ig_image"], f"{pre}LL{tag}": m["ll_image"],
                         f"{pre}AUC{tag}": m["auc_image"],
