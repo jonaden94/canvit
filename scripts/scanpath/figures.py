@@ -352,7 +352,7 @@ def saccade_figure(sacc: dict[str, dict], out: Path, model: dict[str, dict] | No
 
 def saccade_table(summ: dict[str, dict], out: Path, ppd: dict[str, float] | None = None) -> dict[str, str]:
     """``ppd``: pixels per degree of visual angle per panel title, where the viewing geometry is known (helper_2's
-    DeepGaze III records, protocol.ppd); the degrees column shows a dash elsewhere."""
+    DeepGaze III records, protocol.deepgaze.ppd); the degrees column shows a dash elsewhere."""
     ppd = ppd or {}
     lines = [r"\begin{tabular}{lrrrrrrr}", r"\toprule",
              r"dataset & saccades & median length & median length (deg) & horizontal & vertical & "
@@ -609,10 +609,18 @@ METRICS = [("ig_image", "IG over centre bias\n(bits/fix)"), ("ll_image", "LL ove
            ("auc_image", "AUC"), ("nss_image", "NSS")]
 
 
+# Published models drawn in the cross-dataset figure (reference_numbers.csv names -> (STYLE key or None, label)):
+# DeepGaze3.5-VL's Table 1 covers all five free-viewing datasets and its search model COCO-Search18 TP/TA, with
+# IG over each dataset's centre bias (helper_2, 2026-11-23). The csv holds many more; one figure shows these.
+PUBLISHED = {"DeepGaze III-6B": ("deepgaze3", "DeepGaze III-6B, published"),
+             "DeepGaze3.5-VL (combined)": (None, "DeepGaze3.5-VL, published"),
+             "DeepGaze3.5-VL (search)": (None, "DeepGaze3.5-VL, published")}
+
+
 def read_references(path: Path | None) -> list[dict]:
     """helper_2's reference_numbers.csv (model, dataset, split, condition, metric, value, unit, comparable,
-    protocol_notes, source): the published rows with one of our metrics (ig, ll, auc, nss) whose numbers are at
-    least defined like ours (``comparable`` yes / metric_only), mapped onto our EVALS rows."""
+    protocol_notes, source): the PUBLISHED models' rows with one of our metrics (ig, ll, auc, nss) whose numbers
+    are at least defined like ours (``comparable`` yes / metric_only), mapped onto our EVALS rows."""
     import csv
     if path is None or not path.exists():
         return []
@@ -620,8 +628,8 @@ def read_references(path: Path | None) -> list[dict]:
     out = []
     for row in csv.DictReader(path.open()):
         ds = norm_.get(row["dataset"].lower().replace("-", "").replace("_", "").replace(" ", ""))
-        if ds is None or row["metric"] not in ("ig", "ll", "auc", "nss") or row["comparable"] not in ("yes",
-                                                                                                    "metric_only"):
+        if (ds is None or row["model"] not in PUBLISHED or row["metric"] not in ("ig", "ll", "auc", "nss")
+                or row["comparable"] not in ("yes", "metric_only")):
             continue
         cond = row["condition"].strip().lower()
         split = next((e[1] for e in EVALS if e[0] == ds and (ds != "coco_search18" or e[1].startswith(cond))), None)
@@ -636,12 +644,9 @@ def read_references(path: Path | None) -> list[dict]:
     return out
 
 
-REF_MARKERS = ["P", "X", "*", "h"]  # published models other than DeepGaze III, in order of appearance
-
-
 def cross_dataset_figure(recs: list[dict], out: Path, refs: list[dict] = ()) -> bool:
     """Rows = evaluated (dataset, split), columns = metrics (per-image means, pysaliency); one marker per model.
-    Published numbers (``read_references``) are hollow markers: DeepGaze III in its colour, other models purple.
+    Published numbers (``read_references``) are hollow markers: DeepGaze III in its colour, DeepGaze3.5-VL purple.
     None of them is on exactly our split (comparable = metric_only), so they place our numbers, not rank them."""
     models = [k for k in ("canvit", "deepgaze3") if any(r["kind"] == k for r in recs)]
     if not models:
@@ -660,15 +665,13 @@ def cross_dataset_figure(recs: list[dict], out: Path, refs: list[dict] = ()) -> 
                     continue
                 handles[label] = ax.plot(r["metrics"][key], row + (k - (len(kinds) - 1) / 2) * 0.22, marker=marker,
                                          ms=4, color=color, ls="none")[0]
-        others = sorted({f["model"] for f in refs if "deepgaze iii" not in f["model"].lower()})
         for f in refs:
             if f["metric"] != key:
                 continue
             row = next(i for i, e in enumerate(EVALS) if e[:2] == (f["dataset"], f["split"]))
-            dg3 = "deepgaze iii" in f["model"].lower()
-            c, mk = (STYLE["deepgaze3"][0], STYLE["deepgaze3"][1]) if dg3 else \
-                (OKABE_ITO["purple"], REF_MARKERS[others.index(f["model"]) % len(REF_MARKERS)])
-            lab = f"{f['model']}, published" + ("" if f["comparable"] == "yes" else " (other split)")
+            kind, lab = PUBLISHED[f["model"]]
+            c, mk = STYLE[kind][:2] if kind else (OKABE_ITO["purple"], "P")
+            lab += "" if f["comparable"] == "yes" else " (other split)"
             handles[lab] = ax.plot(f["value"], row + 0.33, marker=mk, ms=4, mfc="none", mec=c, ls="none")[0]
         if key == "ig_image":
             ax.axvline(0, color=BASELINE_COLOR, lw=0.5)
@@ -823,8 +826,8 @@ def main() -> None:
         sacc[title] = human_saccades(select(fx, condition=cond, limit=None), st)
     saccade_figure(sacc, figs, model=canvit_saccades(recs) or None)
     summ = {k: saccade_summary(s) for k, s in sacc.items()}
-    ppd = {title: float(r["protocol"]["ppd"]) for slug, cond, title in PANELS for r in recs
-           if r["kind"] == "deepgaze3" and r["dataset"] == slug and r["protocol"].get("ppd")}
+    ppd = {title: float(r["protocol"]["deepgaze"]["ppd"]) for slug, cond, title in PANELS for r in recs
+           if r["kind"] == "deepgaze3" and r["dataset"] == slug and r["protocol"].get("deepgaze", {}).get("ppd")}
     sacc_macros = saccade_table(summ, tabs, ppd)
 
     tp = present_mask(fv)
