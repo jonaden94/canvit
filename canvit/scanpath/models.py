@@ -87,17 +87,35 @@ class GridScanpathModel(pysaliency.ScanpathModel):
         return grid_log_density(self.logits[key] / self.tau(key[1]), hw=as_stimulus(stimulus).size,
                                 scene=self.scene)
 
-    def save(self, path) -> None:
-        """The predictions as ``.npz`` (keys [N, 2] = (scanpath_index, t), float16 logits), e.g. for figures."""
+    def save(self, path, *, meta: dict | None = None) -> None:
+        """The predictions as ``.npz`` (keys [N, 2] = (scanpath_index, t), float32 logits; ``meta``: JSON, e.g. the
+        checkpoint's provenance). float32, not float16: logits reach ~40, where float16 steps are 0.03."""
+        import json
         keys = np.array(list(self.logits), dtype=np.int64).reshape(-1, 2)
-        np.savez_compressed(path, keys=keys, logits=np.stack([self.logits[tuple(k)] for k in keys]).astype(np.float16),
-                            scene_size=self.scene, name=self.name)
+        np.savez_compressed(path, keys=keys, logits=np.stack([self.logits[tuple(k)] for k in keys]).astype(np.float32),
+                            scene_size=self.scene, name=self.name, meta=json.dumps(meta or {}, default=str))
 
     @classmethod
-    def load(cls, path) -> GridScanpathModel:
-        z = np.load(path)
-        return cls({(int(a), int(b)): v.astype(np.float32) for (a, b), v in zip(z["keys"], z["logits"])},
-                   scene_size=int(z["scene_size"]), name=str(z["name"]))
+    def load(cls, *paths) -> GridScanpathModel:
+        """One or several saved prediction files (e.g. the shards of one run) as one model; ``.meta`` = the first
+        file's meta. Refuses files of different models and overlapping keys."""
+        import json
+        logits: dict[tuple[int, int], np.ndarray] = {}
+        first = None
+        for path in paths:
+            z = np.load(path)
+            head = (int(z["scene_size"]), str(z["name"]))
+            if first is not None and head != first[0]:
+                raise ValueError(f"{path}: predictions of {head}, not {first[0]}")
+            part = {(int(a), int(b)): v.astype(np.float32) for (a, b), v in zip(z["keys"], z["logits"])}
+            if logits.keys() & part.keys():
+                raise ValueError(f"{path}: predictions overlap with the files before it")
+            logits |= part
+            first = first or (head, json.loads(str(z["meta"])) if "meta" in z else {})
+        assert first is not None, "no prediction file given"
+        model = cls(logits, scene_size=first[0][0], name=first[0][1])
+        model.meta = first[1]
+        return model
 
 
 def _scored_cells(model: GridScanpathModel, stimuli, fixations):

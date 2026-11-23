@@ -248,3 +248,23 @@ def test_mixture_samples_come_from_the_mixed_density(fake_cs18):
     assert torch.equal(ij[:, 1] * CG + ij[:, 0], p.argmax(-1))
     xy = ep.sample(batch, 3, temperature=1.0, generator=torch.Generator().manual_seed(0), cue_mixture=True)
     assert (xy[..., 1].abs() <= 0.67).all()  # clamped onto the image
+
+
+def test_sharded_predictions_equal_the_unsharded_run(fake_cs18, fake_search, tmp_path):
+    """--cfg.shard i N writes one block's predictions; --cfg.predictions merges the files: the same table."""
+    from canvit.scanpath.evaluate import ScanpathConfig, predict, shard_indices
+    from canvit.scanpath.models import GridScanpathModel
+    _, _, sv, fv = fake_search
+    cfg = ScanpathConfig(scene_size=S, grid=CG, batch_size=4, num_workers=0)
+    m = CanViTModel(_episode(fake_cs18[0]), "policy")
+    whole = predict(cfg, m, sv, fv)
+    paths = []
+    for i in range(3):
+        paths.append(tmp_path / f"shard{i}.npz")
+        predict(cfg, m, sv, fv, indices=shard_indices(fv, (i, 3))).save(paths[-1], meta={"shard": i})
+    merged = GridScanpathModel.load(*paths)
+    assert merged.logits.keys() == whole.logits.keys() and merged.meta == {"shard": 0}
+    for k, v in whole.logits.items():
+        assert np.allclose(merged.logits[k], v, atol=1e-5)  # batch composition differs between the runs
+    with pytest.raises(ValueError, match="overlap"):
+        GridScanpathModel.load(paths[0], paths[0])

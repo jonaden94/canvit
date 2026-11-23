@@ -284,13 +284,17 @@ def collate_scanpath(batch: list[dict]) -> dict:
     return out | {"fix": fix}
 
 
-def make_scanpath_loader(stimuli, fixations, *, scene_size: int, batch_size: int, num_workers: int) -> DataLoader:
-    """The scanpaths with at least one fixation after the start (the others have nothing to score), sorted by
-    length (a batch runs as many glimpses as its longest scanpath; sorting cuts the padding); samples keep their
-    index into ``fixations.scanpaths``."""
+def make_scanpath_loader(stimuli, fixations, *, scene_size: int, batch_size: int, num_workers: int,
+                         indices=None) -> DataLoader:
+    """The scanpaths (only ``indices``, if given) with at least one fixation after the start (the others have
+    nothing to score), sorted by length (a batch runs as many glimpses as its longest scanpath; sorting cuts the
+    padding); samples keep their index into ``fixations.scanpaths``."""
     ds = ScanpathDataset(stimuli, fixations, scene_size=scene_size)
     length = np.asarray(fixations.scanpaths.length)
-    keep = [i for i in np.argsort(length, kind="stable").tolist() if length[i] >= 2]
+    order = np.argsort(length, kind="stable")
+    if indices is not None:
+        order = order[np.isin(order, indices)]
+    keep = [i for i in order.tolist() if length[i] >= 2]
     return DataLoader(Subset(ds, keep), batch_size=batch_size, shuffle=False, num_workers=num_workers,
                       collate_fn=collate_scanpath, pin_memory=True)
 

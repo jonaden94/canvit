@@ -86,6 +86,14 @@ class ScanpathConfig:
     device: str = "cuda"
     ckpt: Path | None = None
     """A self-contained harness checkpoint (run config, architecture and policy inside; canvit main b029fd3+)."""
+    shard: tuple[int, int] | None = None
+    """``i N``: GPU stage only -- run the CanViT model on the i-th of N contiguous blocks of the evaluated scanpaths
+    and write its predictions to ``save_predictions`` (no scoring). Shard 0 also writes the training-subset
+    predictions and the samples. Then score once with ``--cfg.predictions <all shards>``."""
+    predictions: tuple[Path, ...] = ()
+    """Score these saved predictions (``GridScanpathModel.save``, e.g. every shard of one run) instead of running
+    the model: CPU only. With ``train_scanpaths``, the training-subset predictions come from
+    ``save_train_predictions``."""
     save_predictions: Path | None = None
     """CanViT models: write the predicted maps here (``.npz``, ``GridScanpathModel.save``), e.g. for figures."""
     save_samples: Path | None = None
@@ -241,15 +249,13 @@ def centre_bias_model(stimuli, fixations, fit: dict[str, float]) -> Crossvalidat
                                        eps=fit["eps"], memory_cache_size=4)  # fixations sorted by stimulus
 
 
-def build_model(cfg: ScanpathConfig, stimuli, fixations, centre_bias, device: torch.device):
-    """-> (the model scored on ``fixations``, and for CanViT models a ``predict(stimuli, fixations)`` that runs
-    the same model on other scanpaths -- the temperature diagnostic needs the training split -- and the
-    ``CanViTModel``; for the baselines None, None)."""
+def build_model(cfg: ScanpathConfig, stimuli, centre_bias, device: torch.device):
+    """The baseline (a pysaliency model), or the ``CanViTModel`` of ``cfg.ckpt`` (run it with :func:`predict`)."""
     if cfg.model == "uniform":
-        return pysaliency.UniformModel(), None, None
+        return pysaliency.UniformModel()
     if cfg.model == "centre_bias":
-        return centre_bias, None, None
-    from .canvit_models import CanViTModel, PolicyEpisode, precompute
+        return centre_bias
+    from .canvit_models import CanViTModel, PolicyEpisode
     if cfg.ckpt is None:
         raise ValueError(f"--cfg.model {cfg.model} needs --cfg.ckpt (a run's .pt)")
     readout = "policy" if cfg.model == "canvit_policy" else "heatmap"
@@ -260,14 +266,54 @@ def build_model(cfg: ScanpathConfig, stimuli, fixations, centre_bias, device: to
         raise ValueError(f"the {ep.task.name} run's scene is {task_scene} px but --cfg.scene-size is "
                          f"{cfg.scene_size}: the human fixations must be letterboxed into the scene the model was "
                          "trained on")
-    model = CanViTModel(ep, readout, cue_mixture=ep.is_search and _task_names(stimuli) is None)
+    return CanViTModel(ep, readout, cue_mixture=ep.is_search and _task_names(stimuli) is None)
 
-    def predict(stimuli, fixations):
-        loader = make_scanpath_loader(stimuli, fixations, scene_size=cfg.scene_size, batch_size=cfg.batch_size,
-                                      num_workers=cfg.num_workers)
-        return precompute(model, loader, grid=cfg.grid, scene_size=cfg.scene_size)
 
-    return predict(stimuli, fixations), predict, model
+def predict(cfg: ScanpathConfig, canvit, stimuli, fixations, indices=None) -> GridScanpathModel:
+    """The teacher-forced predictions of ``canvit`` for every scored fixation of ``fixations`` (or of the
+    scanpaths ``indices``), keyed by the scanpath's index into ``fixations``."""
+    from .canvit_models import precompute
+    loader = make_scanpath_loader(stimuli, fixations, scene_size=cfg.scene_size, batch_size=cfg.batch_size,
+                                  num_workers=cfg.num_workers, indices=indices)
+    return precompute(canvit, loader, grid=cfg.grid, scene_size=cfg.scene_size)
+
+
+def shard_indices(fixations, shard: tuple[int, int]) -> np.ndarray:
+    """The scanpath indices of block ``i`` of ``N`` (contiguous, near-equal counts)."""
+    i, n = shard
+    if not 0 <= i < n:
+        raise ValueError(f"--cfg.shard {i} {n}: need 0 <= i < N")
+    m = len(fixations.scanpaths)
+    return np.arange(m * i // n, m * (i + 1) // n)
+
+
+def train_subset(cfg: ScanpathConfig):
+    """The seeded training subset (``fit_part``, same condition) that ``train_scanpaths`` runs the model on."""
+    st, ft = load(cfg, fit_part(cfg.dataset))
+    ft, _ = subset_scanpaths(select(ft, condition=cfg.condition, limit=None), cfg.train_scanpaths, seed=cfg.train_seed)
+    return st, ft
+
+
+def write_samples(cfg: ScanpathConfig, canvit, stimuli, fixations) -> Path:
+    """The model's own scanpaths for a seeded subset of the evaluated ones (``save_samples``)."""
+    from .canvit_models import sample_scanpaths
+    if canvit is None or canvit.readout != "policy":
+        raise ValueError("--cfg.save-samples needs a CanViT policy model (--cfg.model canvit_policy)")
+    assert cfg.save_samples is not None
+    sub, keep = subset_scanpaths(fixations, cfg.samples_scanpaths or len(fixations.scanpaths), seed=cfg.sample_seed)
+    loader = make_scanpath_loader(stimuli, sub, scene_size=cfg.scene_size, batch_size=cfg.batch_size,
+                                  num_workers=cfg.num_workers)
+    smp = sample_scanpaths(canvit.episode, loader, temperature=cfg.sample_temperature, seed=cfg.sample_seed,
+                           cue_mixture=canvit.cue_mixture)
+    smp["scanpath"] = keep[smp["scanpath"]]  # index into the evaluated scanpaths, as the predictions' keys
+    smp["n"] = np.asarray(fixations.scanpaths.n)[smp["scanpath"]]  # the stimulus index of each sample
+    smp["model"] = np.array(canvit.name)
+    path = cfg.save_samples
+    if canvit.cue_mixture:  # the file name says which model the samples come from
+        path = path.with_name(f"{path.stem}_cuemix{path.suffix}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, **smp)
+    return path
 
 
 def centre_bias_fit(cfg: ScanpathConfig) -> dict[str, float]:
@@ -316,69 +362,80 @@ def run(cfg: ScanpathConfig) -> dict[str, Any]:
         raise ValueError(f"{cfg.dataset} has the parts {DATASETS[cfg.dataset]}, not {part!r}")
     stimuli, fixations = load(cfg, part)
     fixations = select(fixations, condition=cfg.condition, limit=cfg.limit_scanpaths)
+    in_sample = fit_part(cfg.dataset) == part  # no split: the training subset is the evaluated set itself
+    record = {"task": "scanpath", "dataset": cfg.dataset, "split": split_name(cfg)}
+    protocol = {k: (str(v) if isinstance(v, Path) else v) for k, v in asdict(replace(cfg)).items()} | {
+        "part": part, "pysaliency": getattr(pysaliency, "__version__", "?")}
+
+    if cfg.shard is not None:  # GPU stage: predictions of one block of scanpaths, nothing scored
+        if cfg.save_predictions is None:
+            raise ValueError("--cfg.shard writes predictions only: give --cfg.save-predictions")
+        canvit = build_model(cfg, stimuli, None, device)
+        meta = canvit.episode.provenance
+        preds = predict(cfg, canvit, stimuli, fixations, indices=shard_indices(fixations, cfg.shard))
+        preds.save(cfg.save_predictions, meta=meta)
+        if cfg.shard[0] == 0 and cfg.train_scanpaths > 0 and not in_sample and cfg.save_train_predictions:
+            st, ft = train_subset(cfg)
+            predict(cfg, canvit, st, ft).save(cfg.save_train_predictions, meta=meta)
+        if cfg.shard[0] == 0 and cfg.save_samples is not None:
+            write_samples(cfg, canvit, stimuli, fixations)
+        return record | {"model": canvit.name, "protocol": protocol | {"checkpoint": meta},
+                         "n_predictions": len(preds.logits), "evaluated_at": datetime.now(UTC).isoformat()}
+
     fit = centre_bias_fit(cfg)
     centre_bias = centre_bias_model(stimuli, fixations, fit)
-    model, predict, canvit = build_model(cfg, stimuli, fixations, centre_bias, device)
+    canvit = None
+    if cfg.predictions:  # CPU stage: score saved predictions
+        model = GridScanpathModel.load(*cfg.predictions)
+        provenance = model.meta
+    else:
+        from .canvit_models import CanViTModel
+        model = build_model(cfg, stimuli, centre_bias, device)
+        if isinstance(model, CanViTModel):
+            canvit = model
+            model = predict(cfg, canvit, stimuli, fixations)
+        provenance = None if canvit is None else canvit.episode.provenance
+        if canvit is not None and cfg.save_predictions is not None:
+            model.save(cfg.save_predictions, meta=provenance)
     fx = scored_fixations(fixations)
     per_fix = parallel_per_fixation_scores(model, stimuli, fx, centre_bias, processes=cfg.processes,
                                            density_mask=density_metrics_mask(fx, cfg.density_metrics_fixations,
                                                                              cfg.density_metrics_seed))
-    metrics = aggregate(per_fix)
     diagnostics: dict[str, Any] = {}
     if isinstance(model, GridScanpathModel):
-        if cfg.save_predictions is not None:
-            model.save(cfg.save_predictions)
         train = None
-        if cfg.train_scanpaths > 0:
-            assert predict is not None
-            if fit_part(cfg.dataset) == part:  # no split: the evaluated predictions themselves (in-sample)
-                train = (stimuli, fixations, model)
+        if cfg.train_scanpaths > 0 and in_sample:
+            train = (stimuli, fixations, model)
+        elif cfg.train_scanpaths > 0:
+            st, ft = train_subset(cfg)
+            if cfg.predictions:
+                if cfg.save_train_predictions is None:
+                    raise ValueError("--cfg.predictions with --cfg.train-scanpaths: give the training-subset "
+                                     "predictions as --cfg.save-train-predictions")
+                train = (st, ft, GridScanpathModel.load(cfg.save_train_predictions))
             else:
-                st, ft = load(cfg, fit_part(cfg.dataset))
-                ft, _ = subset_scanpaths(select(ft, condition=cfg.condition, limit=None), cfg.train_scanpaths,
-                                         seed=cfg.train_seed)
-                train = (st, ft, predict(st, ft))
+                train = (st, ft, predict(cfg, canvit, st, ft))
                 if cfg.save_train_predictions is not None:
-                    train[2].save(cfg.save_train_predictions)
+                    train[2].save(cfg.save_train_predictions, meta=provenance)
         diagnostics = grid_diagnostics(model, stimuli, fx, per_fix, train=train)
         diagnostics["temperature_fit_part"] = None if train is None else (
-            f"{fit_part(cfg.dataset)} (in-sample)" if train[2] is model else fit_part(cfg.dataset))
-    if cfg.save_samples is not None:
-        if canvit is None or canvit.readout != "policy":
-            raise ValueError("--cfg.save-samples needs a CanViT policy model (--cfg.model canvit_policy)")
-        from .canvit_models import sample_scanpaths
-        sub, keep = subset_scanpaths(fixations, cfg.samples_scanpaths or len(fixations.scanpaths),
-                                     seed=cfg.sample_seed)
-        loader = make_scanpath_loader(stimuli, sub, scene_size=cfg.scene_size, batch_size=cfg.batch_size,
-                                      num_workers=cfg.num_workers)
-        smp = sample_scanpaths(canvit.episode, loader, temperature=cfg.sample_temperature, seed=cfg.sample_seed,
-                               cue_mixture=canvit.cue_mixture)
-        smp["scanpath"] = keep[smp["scanpath"]]  # index into the evaluated scanpaths, as the predictions' keys
-        smp["n"] = np.asarray(fixations.scanpaths.n)[smp["scanpath"]]  # the stimulus index of each sample
-        smp["model"] = np.array(canvit.name)
-        samples_path = cfg.save_samples
-        if canvit.cue_mixture:  # the file name says which model the samples come from
-            samples_path = samples_path.with_name(f"{samples_path.stem}_cuemix{samples_path.suffix}")
-        samples_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(samples_path, **smp)
-    return {
-        "task": "scanpath",
+            f"{fit_part(cfg.dataset)} (in-sample)" if in_sample else fit_part(cfg.dataset))
+    if cfg.save_samples is not None and not cfg.predictions:
+        write_samples(cfg, canvit, stimuli, fixations)
+    return record | {
         "model": getattr(model, "name", cfg.model) if isinstance(model, GridScanpathModel) else cfg.model,
-        "dataset": cfg.dataset,
-        "split": split_name(cfg),
-        "protocol": {k: (str(v) if isinstance(v, Path) else v) for k, v in asdict(replace(cfg)).items()}
-        | {"part": part, "centre_bias": fit, "off_stimulus_fixations": "clipped at load",
-           "scored_fixations": "every fixation with a history (the start fixation is history only)"
-           + ("; DAEMONS forced fixations after the first are scored (pysaliency's default; owner, 2026-11-23)"
-              if cfg.dataset == "daemons" else ""),
-           "checkpoint": None if canvit is None else canvit.episode.provenance,
-           "pysaliency": getattr(pysaliency, "__version__", "?")},
-        "metrics": metrics,
+        "protocol": protocol | {
+            "centre_bias": fit, "off_stimulus_fixations": "clipped at load",
+            "scored_fixations": "every fixation with a history (the start fixation is history only)"
+            + ("; DAEMONS forced fixations after the first are scored (pysaliency's default; owner, 2026-11-23)"
+               if cfg.dataset == "daemons" else ""),
+            "checkpoint": provenance},
+        "metrics": aggregate(per_fix),
         "diagnostics": diagnostics,
         "evaluated_at": datetime.now(UTC).isoformat(),
     }
 
 
 __all__ = ["ScanpathConfig", "aggregate", "centre_bias_fit", "centre_bias_model", "density_metrics_mask",
-           "grid_diagnostics", "parallel_per_fixation_scores", "per_fixation_scores", "run", "scored_fixations",
-           "scores", "select", "split_name", "subset_scanpaths"]
+           "grid_diagnostics", "parallel_per_fixation_scores", "per_fixation_scores", "predict", "run",
+           "scored_fixations", "scores", "select", "shard_indices", "split_name", "subset_scanpaths"]
