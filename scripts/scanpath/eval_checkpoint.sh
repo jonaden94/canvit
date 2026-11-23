@@ -15,6 +15,7 @@
 #      DISPLAY_FRAME: unset = the STANDARD, the display shape of the checkpoint's training data (for the search
 #      checkpoints 1680x1050: COCO-Search18 content only ever occupied the scene rows of that box; owner decision
 #      2026-11-23); "scene" = the comparison rows (stimulus fills the scene), written as <stem>_scene.*
+#      PART=test: COCO-Search18's official test split instead of data.eval_part (a second evaluation).
 #      RETINA: a multi-retina backbone's retina other than the trained one (--cfg.retina; head and policy were
 #      trained through one retina, so others are out of distribution for them); give it its own <name>.
 # On SLURM: slurm/runs/scanpath/eval_checkpoint.sbatch (same arguments).
@@ -29,9 +30,9 @@ PY=.venv-cu126/bin/python
 N=${TRAIN_SCANPATHS:-2000}
 for s in "${SETS[@]}"; do
   ds=${s%%:*}; cond=both; [ "$ds" != "$s" ] && cond=${s#*:}
-  split=$($PY -c "from canvit.scanpath.data import eval_part; print(eval_part('$ds'))")
+  split=${PART:-$($PY -c "from canvit.scanpath.data import eval_part; print(eval_part('$ds'))")}
   has_train=$($PY -c "from canvit.scanpath.data import DATASETS; print(int('train' in DATASETS['$ds']))")
-  [ "$cond" != both ] && split="${cond}_$split"
+  split_part=$split; [ "$cond" != both ] && split="${cond}_$split"
   stem="${ds}_${split}"
   frame=()
   if [ -n "${DISPLAY_FRAME:-}" ]; then
@@ -40,7 +41,7 @@ for s in "${SETS[@]}"; do
   retina=(); [ -n "${RETINA:-}" ] && retina=(--cfg.retina "$RETINA")
   train=(--cfg.train-scanpaths "$N")
   [ "$has_train" = 1 ] && train+=(--cfg.save-train-predictions "$OUT/${stem}_train$N.npz")
-  common=(--cfg.dataset "$ds" --cfg.condition "$cond" --cfg.model canvit_policy --cfg.ckpt "$CKPT" "${frame[@]}" "${retina[@]}"
+  common=(--cfg.dataset "$ds" --cfg.condition "$cond" --cfg.part "$split_part" --cfg.model canvit_policy --cfg.ckpt "$CKPT" "${frame[@]}" "${retina[@]}"
           --cfg.num-workers "${NUM_WORKERS:-2}" --cfg.batch-size "${BATCH_SIZE:-16}" "${train[@]}")
   if [ -n "${SHARD:-}" ]; then  # GPU stage of one block
     read -r i n <<< "$SHARD"; tag="$stem.shard${i}of$n"

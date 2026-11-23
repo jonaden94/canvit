@@ -118,11 +118,69 @@ def coco_search18(location: Path, files: dict[str, Path]):
         cs18._modify_image = original
 
 
+CS18_TEST_JSON = "scandiff_data/cocosearch18/coco_search18_fixations_{cond}_test.json"
+"""The official COCO-Search18 test fixations (withheld from the release; redistributed by Gazeformer/ScanDiff, 612
+(image, task) keys per condition), relative to the data location."""
+CS18_TEST_TP_FRAME = (512, 320)
+"""(W, H) of the TP test JSON's X/Y (the TA one is in display pixels, 1680x1050; driver docs, checked 2026-11-23)."""
+
+
+def coco_search18_test(location: Path, release_dirs: tuple[Path, ...]):
+    """``(stimuli, fixations)`` of the official COCO-Search18 test split, target present and absent, built as
+    pysaliency builds split1 (``merge_tasks=False, unique_images=True``): one stimulus per (image, task), the image
+    from the release zips with pysaliency's one-pixel change (so stimulus ids stay unique per task; seeded per
+    key, so the cache does not depend on build order), saved once under ``location/COCO-Search18_test_...``; the
+    fixations by pysaliency's own ``_get_COCO_Search18_fixations``. TP X/Y are rescaled from 512x320 to the
+    1680x1050 display pixels of the images (one factor, 3.28125, on both axes). The TP scanpaths END AT THE FIRST
+    FIXATION ON THE TARGET (as redistributed: no earlier fixation in the box, mean length 2.90 vs 3.72 on split1
+    validation, whose scanpaths are complete); their durations are cut to match. TA scanpaths are complete."""
+    import json
+    import zipfile
+    import zlib
+
+    import pysaliency
+    from pysaliency.external_datasets import coco_search18 as cs18
+    items = []
+    for cond in ("TP", "TA"):
+        data = json.loads((location / CS18_TEST_JSON.format(cond=cond)).read_text())
+        if cond == "TP":  # X/Y end at the first fixation on the target (Gazeformer's truncation); T was not cut
+            sx, sy = 1680 / CS18_TEST_TP_FRAME[0], 1050 / CS18_TEST_TP_FRAME[1]
+            data = [s | {"X": [x * sx for x in s["X"]], "Y": [y * sy for y in s["Y"]], "T": s["T"][:len(s["X"])]}
+                    for s in data]
+        items += data
+    keys = sorted({(s["task"], s["name"], s["condition"]) for s in items})
+    zips = {"present": ("COCOSearch18-images-TP.zip", "images"), "absent": ("COCOSearch18-images-TA.zip",
+                                                                            "coco_search18_images_TA")}
+    target = location / "COCO-Search18_test_no-task-merge_unique-images" / "stimuli"
+    files, orig, opened = [], [], {}
+    for task, name, condition in keys:
+        sub = task.replace(" ", "_")
+        dst = target / sub / (Path(name).stem + ".png")
+        if not dst.exists():
+            zname, root = zips[condition]
+            if zname not in opened:
+                path = next((d / zname for d in release_dirs if (d / zname).exists()), None)
+                if path is None:
+                    raise FileNotFoundError(f"{zname} is in none of the release dirs {release_dirs}")
+                opened[zname] = zipfile.ZipFile(path)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dst.with_name(dst.stem + ".tmp.png")
+            with opened[zname].open(f"{root}/{task}/{name}") as src:
+                _modify_image_numpy2(src, tmp, np.random.RandomState(zlib.crc32(f"{sub}/{name}".encode())))
+            tmp.rename(dst)
+        files.append(str(dst))
+        orig.append(f"{sub}/{name}")
+    stimuli = pysaliency.FileStimuli(files, attributes={"task": [cs18.TASKS.index(t) for t, _, _ in keys]})
+    fixations = cs18._get_COCO_Search18_fixations(items, orig, task_in_filename=True)
+    del fixations.scanpaths.scanpath_attributes["split"]
+    return stimuli, fixations
+
+
 RELEASE_FILES = ("COCOSearch18-images-TP.zip", "COCOSearch18-images-TA.zip", "COCOSearch18-fixations-TP.zip",
                  "coco_search18_fixations_TA_trainval.json")
 
 DATASETS: dict[str, tuple[str, ...]] = {
-    "coco_search18": ("train", "validation"),  # split1; target present AND absent (evaluate.select by condition)
+    "coco_search18": ("train", "validation", "test"),  # split1 + the official test; present AND absent (select)
     "coco_freeview": ("train", "validation"),
     "daemons": ("train", "validation"),
     "mit1003": ("all",),  # with the initial central fixation (as DeepGaze III), so it is history
@@ -153,8 +211,11 @@ def load_dataset(dataset: str, part: str, *, location: Path, release_dirs: tuple
     loc = str(location)
     if dataset == "coco_search18":
         files = {name: d / name for d in release_dirs for name in RELEASE_FILES if (d / name).exists()}
-        st, ft, sv, fv = coco_search18(location, files)
-        stimuli, fixations = (st, ft) if part == "train" else (sv, fv)
+        if part == "test":
+            stimuli, fixations = coco_search18_test(location, release_dirs)
+        else:
+            st, ft, sv, fv = coco_search18(location, files)
+            stimuli, fixations = (st, ft) if part == "train" else (sv, fv)
     elif dataset == "coco_freeview":
         stimuli, fixations = getattr(ed, f"get_COCO_Freeview_{part}")(location=loc)
     elif dataset == "daemons":
@@ -323,6 +384,7 @@ def make_scanpath_loader(stimuli, fixations, *, scene_size: int, batch_size: int
                       collate_fn=collate_scanpath, pin_memory=True)
 
 
-__all__ = ["DATASETS", "ScanpathDataset", "clamp_to_content", "clip_to_stimuli", "coco_search18", "collate_scanpath",
+__all__ = ["DATASETS", "ScanpathDataset", "clamp_to_content", "clip_to_stimuli", "coco_search18", "coco_search18_test",
+           "collate_scanpath",
            "eval_part", "fit_part", "letterbox_geometry", "load_dataset", "local_mirror", "make_scanpath_loader",
            "parse_display_frame", "pixel_to_scene"]

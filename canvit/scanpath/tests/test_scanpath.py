@@ -174,7 +174,7 @@ def test_cli_parses_the_scanpath_subcommand():
 
 def test_dataset_parts():
     from canvit.scanpath.data import DATASETS, eval_part, fit_part, load_dataset
-    assert [eval_part(d) for d in DATASETS] == ["validation"] * 3 + ["all"] * 3
+    assert [eval_part(d) for d in DATASETS] == ["validation"] * 3 + ["all"] * 3  # test: opt-in (--cfg.part test)
     assert [fit_part(d) for d in DATASETS] == ["train"] * 3 + ["all"] * 3
     with pytest.raises(ValueError, match="parts"):
         load_dataset("mit1003", "validation", location=Path("/nonexistent"))
@@ -360,3 +360,69 @@ def test_the_display_frame_comes_from_the_checkpoints_training_data(fake_search,
     p = tmp_path / "sq.jpg"
     write_jpeg(torch.zeros(3, 50, 50, dtype=torch.uint8), str(p))
     assert not frame_is_identity(pysaliency.FileStimuli([str(p)]), FRAME, 512)
+
+
+# --- COCO-Search18's official test split (data.coco_search18_test) ---------------------------------------------------
+
+def test_cs18_test_split_rescales_tp_and_keeps_one_stimulus_per_image_and_task(tmp_path):
+    import json
+    import zipfile
+
+    from PIL import Image
+
+    from canvit.scanpath.data import CS18_TEST_JSON, coco_search18_test
+    rel = tmp_path / "release"
+    rel.mkdir()
+    img = Image.fromarray(np.full((1050, 1680, 3), 128, np.uint8))
+    for zname, root, entries in (("COCOSearch18-images-TP.zip", "images", [("bottle", "a.jpg"), ("cup", "a.jpg")]),
+                                 ("COCOSearch18-images-TA.zip", "coco_search18_images_TA", [("bottle", "b.jpg")])):
+        with zipfile.ZipFile(rel / zname, "w") as z:
+            for task, name in entries:
+                p = tmp_path / name
+                img.save(p)
+                z.write(p, f"{root}/{task}/{name}")
+    tp = [{"name": "a.jpg", "subject": 1, "task": t, "condition": "present", "bbox": [0, 0, 10, 10], "X": [256, 512],
+           "Y": [160, 0], "T": [100, 200, 300], "length": 2, "correct": 1, "split": "test"} for t in ("bottle", "cup")]
+    ta = [{"name": "b.jpg", "subject": 2, "task": "bottle", "condition": "absent", "X": [840, 100], "Y": [525, 50],
+           "T": [100, 200], "length": 2, "correct": 1, "split": "test"}]
+    for cond, data in (("TP", tp), ("TA", ta)):
+        path = tmp_path / CS18_TEST_JSON.format(cond=cond)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data))
+    stimuli, fix = coco_search18_test(tmp_path, (rel,))
+    assert len(stimuli) == 3 and len(set(stimuli.stimulus_ids)) == 3  # same image, two tasks: two distinct stimuli
+    assert [tuple(s) for s in stimuli.sizes] == [(1050, 1680)] * 3
+    present = np.asarray(fix.scanpaths.scanpath_attributes["target_present"]).astype(bool)
+    assert present.tolist() == [True, True, False]
+    np.testing.assert_allclose(fix.scanpaths.xs[0], [840, 1680])  # TP: 512x320 -> 1680x1050
+    np.testing.assert_allclose(fix.scanpaths.ys[0], [525, 0])
+    np.testing.assert_allclose(fix.scanpaths.fixation_attributes["durations"][0], [0.1, 0.2])  # T cut to the X/Y
+    np.testing.assert_allclose(fix.scanpaths.xs[2], [840, 100])  # TA: already display pixels
+    assert "split" not in fix.scanpaths.scanpath_attributes
+    again, _ = coco_search18_test(tmp_path, (tmp_path / "no-zips",))  # cached: the zips are not read again
+    assert again.stimulus_ids[:] == stimuli.stimulus_ids[:]
+
+
+@pytest.mark.skipif(not (Path(__import__("os").environ.get("SCANPATH_DATA_DIR", "/nonexistent"))
+                         / "COCO-Search18_test_no-task-merge_unique-images").exists(),
+                    reason="the real COCO-Search18 test cache is not built here")
+def test_cs18_test_keys_are_disjoint_from_split1_and_fixations_land_in_the_image():
+    import os
+
+    from canvit.scanpath.data import coco_search18_test, load_dataset
+    loc = Path(os.environ["SCANPATH_DATA_DIR"])
+    rel = tuple(Path(p) for p in os.environ.get("COCO_SEARCH18_RELEASE_DIRS", "").split(":") if p)
+    keys = {}
+    for part in ("train", "validation", "test"):
+        st, fx = load_dataset("coco_search18", part, location=loc, release_dirs=rel)
+        keys[part] = {Path(f).parent.name + "/" + Path(f).stem for f in st.filenames}
+        if part == "test":
+            raw = coco_search18_test(loc, rel)[1]  # before clip_to_stimuli: the rescaled JSON coordinates themselves
+            h, w = (np.array([st.sizes[int(n)] for n in raw.n])).T
+            assert len(st) == 1224 and len(fx.scanpaths) == 6118 + 6120
+            off = ~((raw.x >= 0) & (raw.x < w) & (raw.y >= 0) & (raw.y < h))
+            assert off.sum() <= 10  # 6 of 53553 (tracker glitches above the image; val has 6 too), clipped like val's
+            assert np.all((fx.x >= 0) & (fx.x < w) & (fx.y >= 0) & (fx.y < h))
+            for cond in ("tp", "ta"):
+                assert len(set(select(fx, condition=cond, limit=None).scanpaths.n)) == 612
+    assert not keys["test"] & keys["train"] and not keys["test"] & keys["validation"]

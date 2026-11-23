@@ -57,8 +57,9 @@ class ScanpathConfig:
     (``canvit_models.py``). Both need ``ckpt``. A search model on free-viewing data is read as the uniform
     mixture over its cues (``..._cuemix``, owner decision 2026-11-23)."""
     dataset: Literal["coco_search18", "coco_freeview", "daemons", "mit1003", "cat2000", "figrim"] = "coco_search18"
-    part: Literal["train", "validation", "all"] | None = None
-    """None = ``data.eval_part(dataset)``: validation where the dataset has a split, else all."""
+    part: Literal["train", "validation", "test", "all"] | None = None
+    """None = ``data.eval_part(dataset)``: validation where the dataset has a split, else all. ``test``: COCO-Search18's
+    official test split (``data.coco_search18_test``), a second evaluation next to validation."""
     data_location: Path = field(default_factory=lambda: _env_path("SCANPATH_DATA_DIR"))
     """pysaliency's dataset location (``$SCANPATH_DATA_DIR``); every dataset is cached under it."""
     release_dirs: tuple[Path, ...] = field(default_factory=lambda: tuple(
