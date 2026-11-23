@@ -46,6 +46,12 @@ matplotlib.use("Agg")
 import torch._functorch.config
 
 torch._functorch.config.backward_pass_autocast = "off"  # type: ignore[attr-defined]
+# The task/policy gradient split (loop: grad_split/*, log steps with policy_grad_to_backbone) runs
+# autograd.grad(..., retain_graph=True) before the chunk's backward. A compiled backward with
+# donated buffers refuses retain_graph (exp40 T3-full, job 17483087, 2026-11-23: "compiled with
+# non-empty donated buffers which requires ... retain_graph=False"). Donation is only a memory
+# optimisation; turning it off changes no numbers.
+torch._functorch.config.donated_buffer = False  # type: ignore[attr-defined]
 
 import logging
 import time
