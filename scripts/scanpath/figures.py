@@ -1176,7 +1176,7 @@ def load_retinas(results: Path) -> list[dict]:
     return out
 
 
-def retina_figure(results: Path, out: Path) -> bool:
+def retina_figure(results: Path, out: Path) -> dict[str, str]:
     """H1 (search vs human alignment) across retinas: x = targets found within 3 fixations (policy, Jonathan's
     search harness, COCO-Search18 validation), y = IG over the centre bias (top: at the tau fitted on training
     scanpaths, bottom: at tau = 1), columns TP | TA. Marker = retina resolution, fill = cortical magnification;
@@ -1184,7 +1184,7 @@ def retina_figure(results: Path, out: Path) -> bool:
     rets = [r for r in load_retinas(results) if any(c in r for c in CONDITIONS)]
     if len(rets) < 2:
         print(f"retina_figure: {len(rets)} retinas with scanpath records, need 2")
-        return False
+        return {}
     fig, axes = plt.subplots(2, 2, figsize=(TEXTWIDTH_IN, 3.8), sharex=True, sharey="row", layout="constrained")
     for j, cond in enumerate(CONDITIONS):
         for i, at in enumerate(("fitted", "one")):
@@ -1209,7 +1209,7 @@ def retina_figure(results: Path, out: Path) -> bool:
             despine(ax)
     axes[0, 0].set_ylabel("IG over centre bias\n" + r"at fitted $\tau$ (bits/fix)")
     axes[1, 0].set_ylabel("IG over centre bias\n" + r"at $\tau$ = 1 (bits/fix)")
-    handles = [plt.Line2D([], [], marker=m, ms=5, ls="none", mec=OKABE_ITO["blue"], mfc="white")
+    handles = [plt.Line2D([], [], marker=m, ms=5, ls="none", mec="0.25", mfc="0.85")  # shape only, no fill code
                for m in RES_MARKER.values()]
     labels = [f"resolution {k}" for k in RES_MARKER]
     handles += [plt.Line2D([], [], marker="o", ms=5, ls="none", mec=OKABE_ITO["blue"], mfc=c) for c in
@@ -1218,7 +1218,19 @@ def retina_figure(results: Path, out: Path) -> bool:
     fig.legend(handles, labels, loc="outside upper center", ncol=3,
                title=f"CanViT search policy {CKPT}, evaluated through {len(rets)} retinas (trained through one)")
     save(fig, out / "retina.pdf")
-    return True
+    # macros: means over the resolutions of each cortical magnification, tags A/B/C = cmf 0.75/2.2/7.7 (manager)
+    macros = {}
+    for tag, cmf in zip("ABC", sorted(CMF_FILL)):
+        g = [r for r in rets if r["cmf"] == cmf and all(c in r for c in CONDITIONS)]
+        if not g:
+            continue
+        tg = [r["tp"]["diagnostics"]["tempered_global"] for r in g]
+        macros[f"retFound{tag}"] = f"{np.mean([r['search']['found_t3_policy'] for r in g]):.2f}"
+        macros[f"retIGtauTP{tag}"] = _num(np.mean([t["ig_image"] for t in tg]))
+        macros[f"retIGtauTA{tag}"] = _num(np.mean([r["ta"]["diagnostics"]["tempered_global"]["ig_image"] for r in g]))
+        macros[f"retAUCTP{tag}"] = f"{np.mean([r['tp']['metrics']['auc_image'] for r in g]):.3f}"
+        macros[f"retTauTP{tag}"] = f"{np.mean([t['temperature'] for t in tg]):.1f}"
+    return macros
 
 
 # --------------------------------------------------------------------------------------- temperature sweep
@@ -1608,7 +1620,7 @@ def main() -> None:
     res_macros |= priors_figure(recs, a.results, figs, tabs)
     priors_index_figure(recs, a.results, figs)
     res_macros |= temperature_figure(recs, figs)
-    retina_figure(a.results, figs)
+    res_macros |= retina_figure(a.results, figs)
 
     sacc = {}
     for slug, cond, title in PANELS:
