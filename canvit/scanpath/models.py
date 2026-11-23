@@ -144,13 +144,28 @@ def fit_temperature(model: GridScanpathModel, stimuli, fixations, *, per_index: 
     return {int(i): fit(t == i) for i in np.unique(t) if (t == i).sum() >= min_fixations}
 
 
+def cell_scores(model: GridScanpathModel, stimuli, fixations, *, chunk: int = 20000
+                ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per scored fixation, at the model's temperature: log p(the cell it landed in) and the entropy (nats) of
+    p(cell) over the image's cells (``p(cell)`` as in :func:`grid_log_density`), and the history length t.
+    pysaliency's LL is log p(cell) - log(pixels in cell), so a temperature changes it by exactly the change in
+    log p(cell). Chunked: [N, G*G] float64 for every fixation of a big dataset would not fit in memory."""
+    fx = without_start_fixations(fixations)
+    lp, H = [], []
+    for i in range(0, len(fx), chunk):
+        logits, cells, logcount, t = _scored_cells(model, stimuli, fx[i:i + chunk])
+        taus = np.array([model.tau(int(j)) for j in t])[:, None]
+        logp = _cell_log_probs(logits, logcount, taus)
+        lp.append(logp[np.arange(len(cells)), cells])
+        H.append(-(np.exp(logp) * np.where(np.isfinite(logp), logp, 0.0)).sum(1))
+    return np.concatenate(lp), np.concatenate(H), np.asarray(fx.scanpath_history_length)
+
+
 def policy_entropy(model: GridScanpathModel, stimuli, fixations) -> tuple[np.ndarray, np.ndarray]:
-    """Entropy (nats) of the predicted next-fixation distribution over the image's cells (``p(cell)`` as in
-    :func:`grid_log_density`), at the model's temperature, per scored fixation; and the history length t."""
-    logits, _, logcount, t = _scored_cells(model, stimuli, fixations)
-    taus = np.array([model.tau(int(i)) for i in t])[:, None]
-    logp = _cell_log_probs(logits, logcount, taus)
-    return -(np.exp(logp) * np.where(np.isfinite(logp), logp, 0.0)).sum(1), t
+    """Entropy (nats) of the predicted next-fixation distribution over the image's cells, at the model's
+    temperature, per scored fixation; and the history length t (:func:`cell_scores`)."""
+    _, H, t = cell_scores(model, stimuli, fixations)
+    return H, t
 
 
 class DensitySaliencyMap(pysaliency.ScanpathSaliencyMapModel):
@@ -204,5 +219,6 @@ def fit_centre_bias(stimuli, fixations, *, n_images: int = 200, seed: int = 0,
     return best
 
 
-__all__ = ["DensitySaliencyMap", "GridScanpathModel", "fit_centre_bias", "fit_temperature", "grid_log_density",
+__all__ = ["DensitySaliencyMap", "GridScanpathModel", "cell_scores", "fit_centre_bias", "fit_temperature",
+           "grid_log_density",
            "policy_entropy", "without_start_fixations"]

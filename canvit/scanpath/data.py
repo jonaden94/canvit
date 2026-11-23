@@ -279,7 +279,8 @@ def collate_scanpath(batch: list[dict]) -> dict:
     fix = torch.full((len(batch), L, 2), math.nan)
     for i, s in enumerate(batch):
         fix[i, : s["fix"].shape[0]] = s["fix"]
-    out = {k: torch.stack([s[k] for s in batch]) for k in ("image", "cue", "n_fix", "boxes", "content", "hw", "scanpath")}
+    keys = ("image", "cue", "n_fix", "boxes", "content", "hw", "scanpath")
+    out = {k: torch.stack([s[k] for s in batch]) for k in keys}
     return out | {"fix": fix}
 
 

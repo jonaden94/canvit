@@ -38,9 +38,9 @@ from .data import DATASETS, _task_names, eval_part, fit_part, load_dataset, make
 from .models import (
     DensitySaliencyMap,
     GridScanpathModel,
+    cell_scores,
     fit_centre_bias,
     fit_temperature,
-    policy_entropy,
     without_start_fixations,
 )
 
@@ -73,6 +73,12 @@ class ScanpathConfig:
     centre_bias_fit: Path | None = None
     """A JSON ``{bandwidth, eps, ll}`` of the centre bias: read if it exists, else fitted on ``fit_part`` and
     written there (so every model of a dataset shares one fit). None: fitted, not written (~minutes)."""
+    density_metrics_fixations: int | None = 20000
+    """NSS and AUC (~55 ms per fixation at 1080x1920 in pysaliency, LL ~2 ms) on a seeded random subset of at most
+    this many scored fixations; LL and IG always on all (owner decision, 2026-11-23). None = all."""
+    density_metrics_seed: int = 0
+    processes: int = 1
+    """CPU processes for pysaliency's per-fixation scoring (:func:`parallel_per_fixation_scores`)."""
     batch_size: int = 16
     num_workers: int = 4
     limit_scanpaths: int | None = None
@@ -82,11 +88,21 @@ class ScanpathConfig:
     """A self-contained harness checkpoint (run config, architecture and policy inside; canvit main b029fd3+)."""
     save_predictions: Path | None = None
     """CanViT models: write the predicted maps here (``.npz``, ``GridScanpathModel.save``), e.g. for figures."""
-    fit_temperature_scanpaths: int = 0
-    """CanViT models, DIAGNOSTIC: > 0 runs the model on this many scanpaths of ``fit_part`` (same condition),
-    fits one global softmax temperature and one per fixation index by log-likelihood there, and reports the
-    tempered likelihoods on the evaluated split under ``diagnostics``. Never fed back into training (owner,
-    2026-11-20). On a dataset without a split the fit is in-sample (one parameter)."""
+    save_samples: Path | None = None
+    """CanViT policy models: also sample the model's OWN scanpaths, one per evaluated human scanpath and as long
+    as it (``canvit_models.sample_scanpaths``), and write them here (``.npz``, stimulus pixels)."""
+    sample_temperature: float = 1.0
+    """Softmax temperature of the sampled scanpaths (1 = the policy's own distribution; 0 = its argmax)."""
+    sample_seed: int = 0
+    train_scanpaths: int = 0
+    """CanViT models: > 0 also runs the model on a seeded random subset of this many TRAINING scanpaths (``fit_part``,
+    same condition; :func:`subset_scanpaths`), for what is FITTED on train: the temperature DIAGNOSTIC (one global
+    softmax temperature + one per fixation index, by log-likelihood; tempered likelihoods on the evaluated split
+    under ``diagnostics``; never fed back into training, owner 2026-11-20) and, with ``save_train_predictions``,
+    later fits (biases, design §12). A dataset without a split reuses the evaluated predictions (in-sample)."""
+    train_seed: int = 0
+    save_train_predictions: Path | None = None
+    """Write the training-subset predictions here (``.npz``; keys index the SUBSET's scanpaths)."""
 
 
 def split_name(cfg: ScanpathConfig) -> str:
@@ -110,6 +126,13 @@ def select(fixations, *, condition: str, limit: int | None):
     return fixations.filter_scanpaths(np.flatnonzero(keep))
 
 
+def subset_scanpaths(fixations, n: int, *, seed: int):
+    """A seeded random subset of ``n`` scanpaths (all if fewer), in their original order."""
+    m = len(fixations.scanpaths)
+    keep = np.arange(m) if m <= n else np.sort(np.random.default_rng(seed).choice(m, size=n, replace=False))
+    return fixations.filter_scanpaths(keep)
+
+
 def scored_fixations(fixations):
     """The fixations that are scored -- every fixation with a history -- sorted by stimulus (stable), so a model
     with a small map cache (the centre bias) computes each map once; no average depends on the order."""
@@ -117,31 +140,81 @@ def scored_fixations(fixations):
     return fx[np.argsort(fx.n, kind="stable")]
 
 
-def per_fixation_scores(model, stimuli, fx, centre_bias) -> dict[str, np.ndarray]:
+def density_metrics_mask(fx, max_n: int | None, seed: int) -> np.ndarray:
+    """[len(fx)] which scored fixations get NSS / AUC: all, or a seeded random subset of ``max_n``. Draw it on the
+    WHOLE :func:`scored_fixations` and slice it with the shards, so every model scores the same subset."""
+    mask = np.ones(len(fx), dtype=bool)
+    if max_n is not None and len(fx) > max_n:
+        mask[:] = False
+        mask[np.random.default_rng(seed).choice(len(fx), size=max_n, replace=False)] = True
+    return mask
+
+
+def per_fixation_scores(model, stimuli, fx, centre_bias, *, density_mask: np.ndarray | None = None
+                        ) -> dict[str, np.ndarray]:
     """pysaliency's per-fixation scores of ``model`` on ``fx`` (:func:`scored_fixations`, or a shard of it):
     ``ll`` / ``ig`` in bits over the uniform model / the centre bias, ``nss`` / ``auc`` of the conditional
-    density, and ``n`` (stimulus), ``t`` (history length), ``scanpath`` (index) for :func:`aggregate`. Shards
-    concatenate (key by key)."""
+    density (only where ``density_mask``, NaN elsewhere; :func:`density_metrics_mask`), and ``n`` (stimulus),
+    ``t`` (history length), ``scanpath`` (index) for :func:`aggregate`. Shards concatenate (key by key)."""
     ll_model = model.log_likelihoods(stimuli, fx) / np.log(2)
+    mask = np.ones(len(fx), dtype=bool) if density_mask is None else density_mask
+    nss, auc = np.full(len(fx), np.nan), np.full(len(fx), np.nan)
+    if mask.any():
+        nss[mask] = DensitySaliencyMap(model).NSSs(stimuli, fx[mask])
+        auc[mask] = DensitySaliencyMap(model).AUCs(stimuli, fx[mask])
     return {
         "ll": ll_model - pysaliency.UniformModel().log_likelihoods(stimuli, fx) / np.log(2),
         "ig": ll_model - centre_bias.log_likelihoods(stimuli, fx) / np.log(2),
-        "nss": DensitySaliencyMap(model).NSSs(stimuli, fx),
-        "auc": DensitySaliencyMap(model).AUCs(stimuli, fx),
+        "nss": nss, "auc": auc,
         "n": np.asarray(fx.n), "t": np.asarray(fx.scanpath_history_length), "scanpath": np.asarray(fx.scanpath_index),
     }
+
+
+_POOL_ARGS: tuple = ()
+
+
+def _score_shard(sl: slice) -> dict[str, np.ndarray]:
+    model, stimuli, fx, centre_bias, mask = _POOL_ARGS
+    return per_fixation_scores(model, stimuli, fx[sl], centre_bias, density_mask=mask[sl])
+
+
+def parallel_per_fixation_scores(model, stimuli, fx, centre_bias, *, processes: int,
+                                 density_mask: np.ndarray | None = None) -> dict[str, np.ndarray]:
+    """:func:`per_fixation_scores` in ``processes`` forked workers, on contiguous shards cut at stimulus
+    boundaries (``fx`` sorted by stimulus), concatenated in order: the same arrays as one call."""
+    global _POOL_ARGS
+    mask = np.ones(len(fx), dtype=bool) if density_mask is None else density_mask
+    if processes <= 1:
+        return per_fixation_scores(model, stimuli, fx, centre_bias, density_mask=mask)
+    import multiprocessing as mp
+    n = np.asarray(fx.n)
+    starts = np.flatnonzero(np.r_[True, n[1:] != n[:-1]])  # first fixation of each stimulus
+    idx = np.searchsorted(starts, np.linspace(0, len(fx), 8 * processes + 1)[1:-1])  # ~8 shards per worker
+    cuts = np.unique(np.r_[0, starts[idx[idx < len(starts)]], len(fx)]).tolist()
+    shards = [slice(a, b) for a, b in zip(cuts[:-1], cuts[1:])]
+    _POOL_ARGS = (model, stimuli, fx, centre_bias, mask)
+    try:
+        with mp.get_context("fork").Pool(processes) as pool:  # the workers inherit the models (no pickling)
+            parts = pool.map(_score_shard, shards, chunksize=1)
+    finally:
+        _POOL_ARGS = ()
+    return {k: np.concatenate([p[k] for p in parts]) for k in parts[0]}
 
 
 def aggregate(per_fix: dict[str, np.ndarray]) -> dict[str, float]:
     """The averages of :func:`per_fixation_scores`: over images (``*_image``: per-image means, then over images
     -- the papers' headline) and over fixations (``*_fix``: pysaliency's default), overall and per fixation
-    index t (``*_t<t>``, fixation-averaged, for indices with >= 20 fixations)."""
-    n, t = per_fix["n"], per_fix["t"]
-    by_image = SimpleNamespace(n=n)  # all pysaliency's average_values reads
-    out: dict[str, float] = {"n_fixations": float(len(n)), "n_scanpaths": float(len(np.unique(per_fix["scanpath"])))}
+    index t (``*_t<t>``, fixation-averaged, for indices with >= 20 fixations). NaN entries (NSS / AUC outside
+    the subset) are left out of every average."""
+    out: dict[str, float] = {"n_fixations": float(len(per_fix["n"])),
+                             "n_scanpaths": float(len(np.unique(per_fix["scanpath"]))),
+                             "n_fixations_nss_auc": float(np.isfinite(per_fix["nss"]).sum())}
     for k, v in per_fix.items():
         if k in ("n", "t", "scanpath"):
             continue
+        ok = np.isfinite(v)
+        v, t = v[ok], per_fix["t"][ok]
+        by_image = SimpleNamespace(n=per_fix["n"][ok])  # all pysaliency's average_values reads
         out[f"{k}_image"] = float(average_values(v, by_image, average="image"))
         out[f"{k}_fix"] = float(average_values(v, by_image, average="fixation"))
         for i in range(1, int(t.max()) + 1):
@@ -150,10 +223,12 @@ def aggregate(per_fix: dict[str, np.ndarray]) -> dict[str, float]:
     return out
 
 
-def scores(model, stimuli, fixations, centre_bias) -> dict[str, float]:
+def scores(model, stimuli, fixations, centre_bias, *, density_metrics_fixations: int | None = None,
+           density_metrics_seed: int = 0) -> dict[str, float]:
     """pysaliency's per-fixation scores of ``model`` on the fixations with a history, averaged."""
     fx = scored_fixations(fixations)
-    return aggregate(per_fixation_scores(model, stimuli, fx, centre_bias))
+    mask = density_metrics_mask(fx, density_metrics_fixations, density_metrics_seed)
+    return aggregate(per_fixation_scores(model, stimuli, fx, centre_bias, density_mask=mask))
 
 
 def centre_bias_model(stimuli, fixations, fit: dict[str, float]) -> CrossvalidatedBaselineModel:
@@ -165,8 +240,8 @@ def centre_bias_model(stimuli, fixations, fit: dict[str, float]) -> Crossvalidat
 
 def build_model(cfg: ScanpathConfig, stimuli, fixations, centre_bias, device: torch.device):
     """-> (the model scored on ``fixations``, and for CanViT models a ``predict(stimuli, fixations)`` that runs
-    the same model on other scanpaths -- the temperature diagnostic needs the training split -- else None,
-    and for CanViT models the checkpoint's provenance, else None)."""
+    the same model on other scanpaths -- the temperature diagnostic needs the training split -- and the
+    ``CanViTModel``; for the baselines None, None)."""
     if cfg.model == "uniform":
         return pysaliency.UniformModel(), None, None
     if cfg.model == "centre_bias":
@@ -189,7 +264,7 @@ def build_model(cfg: ScanpathConfig, stimuli, fixations, centre_bias, device: to
                                       num_workers=cfg.num_workers)
         return precompute(model, loader, grid=cfg.grid, scene_size=cfg.scene_size)
 
-    return predict(stimuli, fixations), predict, ep.provenance
+    return predict(stimuli, fixations), predict, model
 
 
 def centre_bias_fit(cfg: ScanpathConfig) -> dict[str, float]:
@@ -206,28 +281,26 @@ def centre_bias_fit(cfg: ScanpathConfig) -> dict[str, float]:
     return fit
 
 
-def grid_diagnostics(model, stimuli, fixations, centre_bias, *, train=None) -> dict[str, Any]:
-    """For a grid model: the policy's entropy per fixation index (nats), and with ``train = (stimuli,
-    fixations, model on them)`` the fitted temperatures and the tempered likelihoods (DIAGNOSTIC)."""
-    H, t = policy_entropy(model, stimuli, fixations)
+def grid_diagnostics(model, stimuli, fx, per_fix, *, train=None) -> dict[str, Any]:
+    """For a grid model on the scored fixations ``fx`` (:func:`scored_fixations`; ``per_fix`` its
+    :func:`per_fixation_scores`): the policy's entropy per fixation index (nats), and with ``train = (stimuli,
+    fixations, model on them)`` the fitted temperatures and the tempered likelihoods (DIAGNOSTIC). A temperature
+    changes pysaliency's LL (and IG) by exactly the change in log p(cell) (``models.cell_scores``)."""
+    lp, H, t = cell_scores(model, stimuli, fx)
     out: dict[str, Any] = {"entropy_fix": float(H.mean())} | {
         f"entropy_t{i}": float(H[t == i].mean()) for i in np.unique(t) if (t == i).sum() >= 20}
     if train is None:
         return out
     tau = fit_temperature(train[2], train[0], train[1])
     tau_t = fit_temperature(train[2], train[0], train[1], per_index=True)
-    fx = without_start_fixations(fixations)
-    uniform_ll = pysaliency.UniformModel().log_likelihoods(stimuli, fx)
-    cb_ll = centre_bias.log_likelihoods(stimuli, fx)
+    by_image = SimpleNamespace(n=per_fix["n"])
     for name, temp in (("global", tau), ("per_index", tau_t)):
-        ll = model.with_temperature(temp).log_likelihoods(stimuli, fx)
-
-        def bits(ref):
-            return float(average_values((ll - ref) / np.log(2), fx, average="image"))
-
-        out[f"tempered_{name}"] = {"temperature": temp, "ll_image": bits(uniform_ll), "ig_image": bits(cb_ll)}
-    H_tau, _ = policy_entropy(model.with_temperature(tau), stimuli, fixations)
-    out["tempered_global"]["entropy_fix"] = float(H_tau.mean())
+        lp_tau, H_tau, _ = cell_scores(model.with_temperature(temp), stimuli, fx)
+        delta = (lp_tau - lp) / np.log(2)
+        out[f"tempered_{name}"] = {
+            "temperature": temp, "entropy_fix": float(H_tau.mean()),
+            "ll_image": float(average_values(per_fix["ll"] + delta, by_image, average="image")),
+            "ig_image": float(average_values(per_fix["ig"] + delta, by_image, average="image"))}
     return out
 
 
@@ -242,20 +315,42 @@ def run(cfg: ScanpathConfig) -> dict[str, Any]:
     fixations = select(fixations, condition=cfg.condition, limit=cfg.limit_scanpaths)
     fit = centre_bias_fit(cfg)
     centre_bias = centre_bias_model(stimuli, fixations, fit)
-    model, predict, provenance = build_model(cfg, stimuli, fixations, centre_bias, device)
-    metrics = scores(model, stimuli, fixations, centre_bias)
+    model, predict, canvit = build_model(cfg, stimuli, fixations, centre_bias, device)
+    fx = scored_fixations(fixations)
+    per_fix = parallel_per_fixation_scores(model, stimuli, fx, centre_bias, processes=cfg.processes,
+                                           density_mask=density_metrics_mask(fx, cfg.density_metrics_fixations,
+                                                                             cfg.density_metrics_seed))
+    metrics = aggregate(per_fix)
     diagnostics: dict[str, Any] = {}
     if isinstance(model, GridScanpathModel):
         if cfg.save_predictions is not None:
             model.save(cfg.save_predictions)
         train = None
-        if cfg.fit_temperature_scanpaths > 0:
+        if cfg.train_scanpaths > 0:
             assert predict is not None
-            st, ft = (stimuli, fixations) if fit_part(cfg.dataset) == part else load(cfg, fit_part(cfg.dataset))
-            ft_sub = select(ft, condition=cfg.condition, limit=cfg.fit_temperature_scanpaths)
-            train = (st, ft_sub, predict(st, ft_sub))
-        diagnostics = grid_diagnostics(model, stimuli, fixations, centre_bias, train=train)
-        diagnostics["temperature_fit_part"] = fit_part(cfg.dataset) if train is not None else None
+            if fit_part(cfg.dataset) == part:  # no split: the evaluated predictions themselves (in-sample)
+                train = (stimuli, fixations, model)
+            else:
+                st, ft = load(cfg, fit_part(cfg.dataset))
+                ft = subset_scanpaths(select(ft, condition=cfg.condition, limit=None), cfg.train_scanpaths,
+                                      seed=cfg.train_seed)
+                train = (st, ft, predict(st, ft))
+                if cfg.save_train_predictions is not None:
+                    train[2].save(cfg.save_train_predictions)
+        diagnostics = grid_diagnostics(model, stimuli, fx, per_fix, train=train)
+        diagnostics["temperature_fit_part"] = None if train is None else (
+            f"{fit_part(cfg.dataset)} (in-sample)" if train[2] is model else fit_part(cfg.dataset))
+    if cfg.save_samples is not None:
+        if canvit is None or canvit.readout != "policy":
+            raise ValueError("--cfg.save-samples needs a CanViT policy model (--cfg.model canvit_policy)")
+        from .canvit_models import sample_scanpaths
+        loader = make_scanpath_loader(stimuli, fixations, scene_size=cfg.scene_size, batch_size=cfg.batch_size,
+                                      num_workers=cfg.num_workers)
+        smp = sample_scanpaths(canvit.episode, loader, temperature=cfg.sample_temperature, seed=cfg.sample_seed,
+                               cue_mixture=canvit.cue_mixture)
+        smp["n"] = np.asarray(fixations.scanpaths.n)[smp["scanpath"]]  # the stimulus index of each sample
+        cfg.save_samples.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(cfg.save_samples, **smp)
     return {
         "task": "scanpath",
         "model": getattr(model, "name", cfg.model) if isinstance(model, GridScanpathModel) else cfg.model,
@@ -263,13 +358,17 @@ def run(cfg: ScanpathConfig) -> dict[str, Any]:
         "split": split_name(cfg),
         "protocol": {k: (str(v) if isinstance(v, Path) else v) for k, v in asdict(replace(cfg)).items()}
         | {"part": part, "centre_bias": fit, "off_stimulus_fixations": "clipped at load",
-           "scored_fixations": "every fixation with a history (the start fixation is history only)",
-           "checkpoint": provenance, "pysaliency": getattr(pysaliency, "__version__", "?")},
+           "scored_fixations": "every fixation with a history (the start fixation is history only)"
+           + ("; DAEMONS forced fixations after the first are scored (pysaliency's default; owner, 2026-11-23)"
+              if cfg.dataset == "daemons" else ""),
+           "checkpoint": None if canvit is None else canvit.episode.provenance,
+           "pysaliency": getattr(pysaliency, "__version__", "?")},
         "metrics": metrics,
         "diagnostics": diagnostics,
         "evaluated_at": datetime.now(UTC).isoformat(),
     }
 
 
-__all__ = ["ScanpathConfig", "aggregate", "centre_bias_fit", "centre_bias_model", "grid_diagnostics", "per_fixation_scores",
-           "run", "scored_fixations", "scores", "select", "split_name"]
+__all__ = ["ScanpathConfig", "aggregate", "centre_bias_fit", "centre_bias_model", "density_metrics_mask",
+           "grid_diagnostics", "parallel_per_fixation_scores", "per_fixation_scores", "run", "scored_fixations",
+           "scores", "select", "split_name", "subset_scanpaths"]

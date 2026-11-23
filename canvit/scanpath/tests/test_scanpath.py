@@ -239,17 +239,34 @@ def test_saved_predictions_load_back(fake_search, tmp_path):
 
 
 def test_grid_diagnostics_report_entropy_and_tempered_likelihoods(fake_search):
-    from canvit.scanpath.evaluate import grid_diagnostics
+    from canvit.scanpath.evaluate import grid_diagnostics, per_fixation_scores, scored_fixations
     st, ft, sv, fv = fake_search
     cb = CrossvalidatedBaselineModel(sv, fv, bandwidth=0.1, eps=1e-3)
-    d = grid_diagnostics(_random_grid_model(fv), sv, fv, cb,
-                         train=(st, ft, _random_grid_model(ft, seed=1, sharp_at_fixation=3.0)))
+    m = _random_grid_model(fv)
+    fx = scored_fixations(fv)
+    per_fix = per_fixation_scores(m, sv, fx, cb)
+    d = grid_diagnostics(m, sv, fx, per_fix, train=(st, ft, _random_grid_model(ft, seed=1, sharp_at_fixation=3.0)))
     # per-index entries need >= 20 fixations (entropy) / >= 50 (tau); this tiny split has fewer, so none appear
     assert np.isfinite(d["entropy_fix"]) and not any(k.startswith("entropy_t") for k in d)
     assert d["tempered_per_index"]["temperature"] == {}
-    for k in ("tempered_global", "tempered_per_index"):
-        assert {"temperature", "ll_image", "ig_image"} <= set(d[k])
-    assert d["tempered_global"]["temperature"] > 0 and np.isfinite(d["tempered_global"]["entropy_fix"])
+    g = d["tempered_global"]
+    assert {"temperature", "ll_image", "ig_image", "entropy_fix"} <= set(g) and g["temperature"] > 0
+    # the exact identity agrees with pysaliency run on the tempered model
+    tempered = per_fixation_scores(m.with_temperature(g["temperature"]), sv, fx, cb)
+    from pysaliency.utils import average_values
+    for k in ("ll", "ig"):
+        assert math.isclose(g[f"{k}_image"], average_values(tempered[k], fx, average="image"), rel_tol=1e-9)
+
+
+def test_parallel_scoring_equals_one_process(fake_search):
+    from canvit.scanpath.evaluate import parallel_per_fixation_scores, per_fixation_scores, scored_fixations
+    _, _, sv, fv = fake_search
+    cb = CrossvalidatedBaselineModel(sv, fv, bandwidth=0.1, eps=1e-3)
+    m = _random_grid_model(fv)
+    fx = scored_fixations(fv)
+    one = per_fixation_scores(m, sv, fx, cb)
+    par = parallel_per_fixation_scores(m, sv, fx, cb, processes=2)
+    assert one.keys() == par.keys() and all(np.array_equal(one[k], par[k]) for k in one)
 
 
 def test_sharded_per_fixation_scores_aggregate_to_the_same_numbers(fake_search):
@@ -262,3 +279,22 @@ def test_sharded_per_fixation_scores_aggregate_to_the_same_numbers(fake_search):
     whole = scores(cb, sv, fv, cb)
     assert aggregate(merged) == pytest.approx(whole, rel=1e-12, abs=1e-12)
     assert whole["n_scanpaths"] == len(np.unique(fv[fv.scanpath_history_length > 0].scanpath_index))
+
+
+def test_nss_auc_on_a_seeded_subset_ll_on_all(fake_search):
+    from canvit.scanpath.evaluate import aggregate, density_metrics_mask, per_fixation_scores, scored_fixations
+    _, _, sv, fv = fake_search
+    cb = CrossvalidatedBaselineModel(sv, fv, bandwidth=0.1, eps=1e-3)
+    fx = scored_fixations(fv)
+    mask = density_metrics_mask(fx, 10, seed=3)
+    assert mask.sum() == 10 and np.array_equal(mask, density_metrics_mask(fx, 10, seed=3))
+    assert density_metrics_mask(fx, None, 0).all()
+    sub = scores(cb, sv, fv, cb, density_metrics_fixations=10, density_metrics_seed=3)
+    full = scores(cb, sv, fv, cb)
+    assert sub["ll_fix"] == full["ll_fix"] and sub["n_fixations_nss_auc"] == 10
+    pf = per_fixation_scores(cb, sv, fx, cb)
+    assert math.isclose(sub["nss_fix"], pf["nss"][mask].mean()) and math.isclose(sub["auc_fix"], pf["auc"][mask].mean())
+    # shards with the sliced mask give the same numbers
+    shards = [per_fixation_scores(cb, sv, fx[i:i + 7], cb, density_mask=mask[i:i + 7]) for i in range(0, len(fx), 7)]
+    merged = {k: np.concatenate([sh[k] for sh in shards]) for k in shards[0]}
+    assert aggregate(merged) == pytest.approx(sub, rel=1e-12, abs=1e-12)
