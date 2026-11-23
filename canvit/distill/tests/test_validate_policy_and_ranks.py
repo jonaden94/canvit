@@ -1,4 +1,5 @@
-"""Distill validation: the policy pass (entropy series, policy-map figure) and the split of
+"""Distill validation: the policy pass (entropy series, policy maps in the PCA figure), the
+curves figure over passes, and the split of
 the fixed val subset over DDP ranks (2 CPU processes, gloo).
 
 The rank split is only worth having if it reports what one GPU would: each rank evaluates
@@ -67,7 +68,7 @@ def _targets(images, _sz, *, fail: bool = False):
 
 
 def _run(eval_policy: str, *, rank: int = 0, world_size: int = 1, fail: bool = False,
-         run_dir=None, log_policy_maps: bool = False, log_pca: bool = False) -> dict[str, float]:
+         run_dir=None, log_pca: bool = False, pca_subdir: str = "pca_val") -> dict[str, float]:
     from canvit.distill.validate import validate
 
     # One CPU thread in EVERY process: CPU matmul rounding depends on the thread count, and
@@ -83,7 +84,7 @@ def _run(eval_policy: str, *, rank: int = 0, world_size: int = 1, fail: bool = F
             scene_normalizer=pnorm, cls_normalizer=cnorm, val_batches=_batches(), device=_DEV,
             canvas_grid_size=_G, scene_size_px=_G * 16, glimpse_size_px=128,
             run_dir=run_dir, n_eval_viewpoints=_T, eval_policy=eval_policy, joint=joint,
-            log_policy_maps=log_policy_maps, log_pca=log_pca, rank=rank, world_size=world_size,
+            log_pca=log_pca, pca_subdir=pca_subdir, rank=rank, world_size=world_size,
             # validate asserts a teacher when log_pca; it is only used for the IN1k teacher
             # accuracy (needs a probe, none here), so a placeholder satisfies it.
             teacher=(object() if log_pca else None),  # type: ignore[arg-type]
@@ -92,14 +93,31 @@ def _run(eval_policy: str, *, rank: int = 0, world_size: int = 1, fail: bool = F
         torch.set_num_threads(n_threads)
 
 
-def test_policy_pass_reports_entropy_and_saves_maps(tmp_path):
-    # log_pca too: the step-0 viz draws the policy trajectory's boxes (smoke 17481820 failed there)
-    out = _run("policy", run_dir=tmp_path, log_policy_maps=True, log_pca=True)
+def test_policy_pass_reports_entropy_and_saves_maps(tmp_path, monkeypatch):
+    # The PCA figure draws the policy trajectory (smoke 17481820 failed there) and gets the
+    # action distribution behind every policy glimpse.
+    import sys
+
+    import canvit.distill.validate  # noqa: F401  (the package re-exports the function under this name)
+    val_mod = sys.modules["canvit.distill.validate"]
+    assert val_mod.__file__.startswith(__file__.rsplit("/canvit/distill/", 1)[0])  # this checkout
+    seen = {}
+    orig = val_mod.plot_multistep_pca
+
+    def spy(**kw):
+        seen["policy_maps"] = kw.get("policy_maps")
+        return orig(**kw)
+
+    monkeypatch.setattr(val_mod, "plot_multistep_pca", spy)
+    out = _run("policy", run_dir=tmp_path, log_pca=True, pca_subdir="r0/pca_val_policy")
     n_actions = _build()[1].policy_selector.vp_flat.shape[0]  # uniform patcher: scales x 16^2
     ents = [out[f"policy_entropy_t{t}"] for t in range(1, _T)]
     assert len(ents) == _T - 1 and "policy_entropy_t0" not in out
     assert all(0.0 <= e <= math.log(n_actions) + 1e-4 for e in ents), ents
-    assert list((tmp_path / "visualization" / "policy_maps_val").glob("step-0.png"))
+    assert list((tmp_path / "visualization" / "r0" / "pca_val_policy").glob("step-0.png"))
+    maps = seen["policy_maps"]
+    assert maps is not None and len(maps) == _T - 1  # one per policy glimpse (t >= 1)
+    assert all(abs(float(m.sum()) - 1.0) < 1e-4 for m in maps)
     # the open-loop pass has no policy series
     assert not any(k.startswith("policy_entropy") for k in _run("fixation_grid"))
 
@@ -145,3 +163,27 @@ def test_rank_split_matches_single_process(tmp_path, eval_policy):
 def test_failure_on_one_rank_raises_on_all(tmp_path):
     res = _spawn(tmp_path, "fixation_grid", fail_rank=1)
     assert all(isinstance(v, str) and v.startswith("raised") for v in res.values()), res
+
+
+def test_curves_figure_overlays_passes_with_fitted_axes():
+    """Both passes in each panel (legend), y axis fitted to the data: the IN1k accuracy is in
+    percent and used to fall outside a fixed (0, 1) axis, leaving its panel empty."""
+    from canvit.harness.viz.disk import plot_combined_curves
+
+    grid = {**{f"scene_cos_raw_t{t}": 0.90 + 0.003 * t for t in range(4)},
+            **{f"in1k_tts_top1_t{t}": 76.0 + t for t in range(4)}, "in1k_teacher_top1": 82.0}
+    pol = {**{f"scene_cos_raw_t{t}": 0.89 + 0.004 * t for t in range(4)},
+           **{f"in1k_tts_top1_t{t}": 75.0 + t for t in range(4)},
+           **{f"policy_entropy_t{t}": 2.9 for t in range(1, 4)}}
+    fig = plot_combined_curves({"fixation_grid": grid, "policy": pol})
+    ax = {a.get_title(): a for a in fig.axes}
+    scene, in1k = ax["scene_cos_raw vs timestep"], ax["in1k_tts_top1 vs timestep"]
+    ent = ax["policy_entropy vs timestep"]
+    assert [ln.get_label() for ln in scene.get_lines()] == ["fixation_grid", "policy"]
+    lo, hi = scene.get_ylim()
+    assert 0.85 < lo and hi < 0.95  # fitted, not (-1, 1)
+    lo, hi = in1k.get_ylim()
+    assert lo < 75.0 and hi > 82.0  # percent values + the teacher line are inside the axis
+    assert "teacher" in [ln.get_label() for ln in in1k.get_lines()]
+    assert [ln.get_label() for ln in ent.get_lines()] == ["policy"]  # only the policy pass has it
+    assert ax["cls_cos_raw vs timestep"].texts[0].get_text() == "N/A"

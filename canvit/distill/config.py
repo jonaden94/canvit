@@ -180,8 +180,8 @@ class Config:
     val_seed: int = 0
     """Seed selecting the fixed validation subset. Same seed -> same images across
     runs and across world sizes."""
-    viz_every_n_vals: int = 5  # Log viz every N validation runs
-    curve_every_n_vals: int = 5  # Log curves every N validation runs
+    viz_every_n_vals: int = 2  # Log viz every N validation runs (5 until 2026-11-23)
+    curve_every_n_vals: int = 2  # Log curves every N validation runs (5 until 2026-11-23)
     log_spatial_stats: bool = True
     log_patcher_grad_detail: bool = True
     """Break the patcher's per-validation grad-norm logs into sub-components:

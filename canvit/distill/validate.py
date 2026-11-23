@@ -30,7 +30,7 @@ from canvit.harness.infra.utils import assert_shape
 
 from ..harness.infra.tracker import Tracker
 from ..harness.rollout.eval_viewpoints import open_loop_viewpoints, resolve
-from ..harness.viz.disk import plot_combined_curves, save_figure
+from ..harness.viz.disk import save_figure
 from .probe import (
     compute_in1k_top1,
     get_imagenet_class_names,
@@ -80,8 +80,10 @@ def _log_pca(
     glimpse_grid_size: int,
     log_spatial_stats: bool,
     run_dir: Path,
+    pca_subdir: str,
+    policy_maps: list[np.ndarray] | None = None,
 ) -> None:
-    """Save PCA visualization to disk from accumulator data.
+    """Save PCA visualization to ``run_dir/visualization/<pca_subdir>/`` from accumulator data.
 
     The local-stream column (uniform g x g grid vs foveated patch-Voronoi)
     is selected inside `plot_multistep_pca` based on whether the
@@ -127,8 +129,9 @@ def _log_pca(
         timestep_predictions=acc.pca_predictions if acc.pca_predictions else None,
         foveated_samples=foveated_samples,
         square_samples=square_samples,
+        policy_maps=policy_maps,
     )
-    save_figure(fig_pca, run_dir, f"pca_{prefix}", step)
+    save_figure(fig_pca, run_dir, pca_subdir, step)
 
     if log_spatial_stats and acc.viz_samples:
         target_stats = {"mean": float(np.mean(teacher_np)), "std": float(np.std(teacher_np))}
@@ -174,33 +177,6 @@ def _deploy_viewpoints(*, model, images, joint, n, canvas_grid_size, prob_maps=N
             for t, v in enumerate(vps)]
 
 
-def _plot_policy_maps(*, image: np.ndarray, maps: list[np.ndarray], viewpoints: list):
-    """Sample 0's policy action distribution before each policy glimpse (t >= 1), over the
-    image, with the cell it took (argmax) marked. ``maps[k]`` is the distribution that chose
-    the glimpse at t = k + 1; it is a ``c x c`` grid over the full field, row = y."""
-    import matplotlib.pyplot as plt
-
-    n = len(maps)
-    fig, axes = plt.subplots(1, n, figsize=(2.6 * n, 2.8), squeeze=False)
-    for k, (ax, m) in enumerate(zip(axes[0], maps)):
-        # Foveated action space: c x c fixation cells. Uniform: n_scale x c x c (centre AND
-        # scale); shown summed over scales, an approximate picture since each scale's
-        # centres span a different safe box.
-        n_scale = next(s for s in range(1, 17) if m.size % s == 0
-                       and round((m.size // s) ** 0.5) ** 2 == m.size // s)
-        c = round((m.size // n_scale) ** 0.5)
-        ax.imshow(image, extent=(-1, 1, 1, -1))
-        ax.imshow(m.reshape(n_scale, c, c).sum(0), extent=(-1, 1, 1, -1), cmap="magma",
-                  alpha=0.6, interpolation="nearest")
-        cy, cx = (float(v) for v in viewpoints[k + 1].centers[0])
-        ax.plot([cx], [cy], marker="x", color="cyan", markersize=9, mew=2)
-        ent = float(-(m * np.log(np.clip(m, 1e-12, None))).sum())
-        ax.set_title(f"t{k + 1}  H={ent:.2f}  max={m.max():.2f}", fontsize=8)
-        ax.set_axis_off()
-    fig.tight_layout()
-    return fig
-
-
 def validate(
     *,
     exp: Tracker,
@@ -224,13 +200,12 @@ def validate(
     joint: Any = None,
     prefix: str = "val",
     probe: DINOv3LinearClassificationHead | None = None,
-    log_curves: bool = False,
     log_pca: bool = False,
+    pca_subdir: str = "pca_val",
     teacher: DINOv3Teacher | None = None,
     log_spatial_stats: bool = False,
     teacher_name: str | None = None,
     non_blocking: bool = False,
-    log_policy_maps: bool = False,
     rank: int = 0,
     world_size: int = 1,
 ) -> dict[str, float]:
@@ -249,12 +224,14 @@ def validate(
     any rank is reported to all of them through the same all-reduce, so no rank is left
     waiting; it then raises everywhere (the caller treats validation as best-effort).
 
-    ``log_policy_maps`` (policy pass only): save sample 0's action distribution per policy
-    glimpse as ``policy_maps_<prefix>``.
+    ``log_pca``: save sample 0's PCA figure to ``run_dir/visualization/<pca_subdir>/``; in the
+    policy pass it also shows the action distribution behind each policy glimpse. The curves
+    over timesteps are drawn by the caller from the returned series (``plot_combined_curves``),
+    so one figure can hold several passes.
     """
     assert not log_pca or teacher is not None
     if rank != 0:  # figures and spatial stats come from chunk 0, which rank 0 owns
-        log_curves = log_pca = log_policy_maps = False
+        log_pca = False
 
     if probe is not None and teacher_name is not None:
         probe_res = get_probe_resolution(teacher_name)
@@ -395,7 +372,7 @@ def validate(
                         continue
                     images = images_cpu.to(device, non_blocking=non_blocking)
                     labels = labels_cpu.to(device, non_blocking=non_blocking) if probe is not None else None
-                    want_viz = (log_pca or log_policy_maps) and ci == 0
+                    want_viz = log_pca and ci == 0
                     acc, B, t_acc, tgt0, viewpoints, _gt_idx, _gt_name, maps0 = _run_chunk(
                         images, labels, want_viz=want_viz
                     )
@@ -487,24 +464,6 @@ def validate(
             for t, ent in enumerate(policy_entropy, start=1):  # policy pass only
                 series[f"policy_entropy_t{t}"] = ent
 
-            if log_policy_maps and first is not None and first.get("maps0"):
-                fig = _plot_policy_maps(image=imagenet_denormalize_to_numpy(first["images"][0]),
-                                        maps=first["maps0"], viewpoints=first["viewpoints"])
-                save_figure(fig, run_dir, f"policy_maps_{prefix}", step)
-
-            # Combined 5-subplot graphs figure saved to disk at log_curves cadence.
-            # Replaces the per-curve wandb log_curve calls (scene_cos_*, cls_cos_*,
-            # in1k_tts_top1_*). Per-timestep scalars above keep going to wandb.
-            if log_curves:
-                fig_graphs = plot_combined_curves(
-                    scene_cos_raw=scene_cos_raw,
-                    scene_cos_norm=scene_cos_norm,
-                    cls_cos_raw=cls_cos_raw if has_cls else None,
-                    cls_cos_norm=cls_cos_norm if has_cls else None,
-                    in1k_accs=in1k_accs if have_in1k else None,
-                )
-                save_figure(fig_graphs, run_dir, "graphs", step)
-
             if log_pca:
                 assert first is not None and first["target_sample0"] is not None
                 images0 = first["images"]
@@ -542,6 +501,8 @@ def validate(
                     glimpse_grid_size=glimpse_grid_size,
                     log_spatial_stats=log_spatial_stats,
                     run_dir=run_dir,
+                    pca_subdir=pca_subdir,
+                    policy_maps=first.get("maps0"),
                 )
 
             return series
