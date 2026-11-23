@@ -974,7 +974,9 @@ def temperature_figure(recs: list[dict], out: Path) -> dict[str, str]:
             if sw["fitted_ig_record"] is not None and abs(ig[k] - sw["fitted_ig_record"]) > 0.01:
                 print(f"temperature_figure: {title}: sweep IG at fitted tau {ig[k]:.3f} != record "
                       f"{sw['fitted_ig_record']:.3f}")
-        ax.set(title=title + (f"\nfitted $\\tau$ = {fit:.1f}" if fit else ""), xscale="log")
+        at_bound = fit is not None and fit >= 0.999 * np.exp(4.0)  # evaluate.py fits log tau in [-4, 4]
+        note = (f"\nfitted $\\tau$ at the fit's bound ({fit:.0f})" if at_bound else f"\nfitted $\\tau$ = {fit:.1f}")
+        ax.set(title=title + (note if fit else ""), xscale="log")
         axh.set(xlabel=r"temperature $\tau$")
         despine(ax), despine(axh)
     axes[0, 0].set(ylabel="IG over centre bias\n(bits/fix)", ylim=(-12, 1.5))  # tau < ~0.5 runs off the bottom
