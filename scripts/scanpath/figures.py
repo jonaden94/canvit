@@ -809,6 +809,48 @@ def priors_figure(recs: list[dict], results: Path, out: Path, tabs: Path) -> dic
     return macros
 
 
+def priors_index_figure(recs: list[dict], results: Path, out: Path, t_max: int = 8) -> bool:
+    """IG over the centre bias per fixation index (validation) of CanViT at tau, CanViT (policy and heatmap) + all
+    four post-hoc priors, and the priors without any image, next to DeepGaze III; COCO-Search18 TP | TA."""
+    pri = load_priors(results)
+    conds = [c for c in CONDITIONS if ("policy", c) in pri]
+    if not conds:
+        print("priors_index_figure: no annotated priors results yet")
+        return False
+    lines_ = [("policy", "canvit_tau", STYLE["canvit"][0], "s", ":", "CanViT@tau"),
+              ("policy", "canvit_tau+all", STYLE["canvit"][0], "s", "-", "CanViT@tau + all four priors"),
+              ("heatmap", "canvit_tau+all", STYLE["canvit_heatmap"][0], "o", "--", "heatmap@tau + all four priors"),
+              ("policy", "priors_only", BASELINE_COLOR, "D", "-", "no image: all four priors")]
+    fig, axes = plt.subplots(1, len(conds), figsize=(TEXTWIDTH_IN, 2.1), sharey=True, squeeze=False,
+                             layout="constrained")
+    seen = {}
+    for ax, cond in zip(axes[0], conds):
+        ax.axhline(0, color=STYLE["centre_bias"][0], lw=0.5)
+        for src, key, color, marker, ls, label in lines_:
+            v = pri.get((src, cond), {}).get("variants", {}).get(key)
+            if v is None:
+                continue
+            t = np.array(sorted(int(i) for i in v["ig_t"] if int(i) <= t_max))
+            y = [v["ig_t"][str(i)] for i in t]
+            lab = _tex_label(label)
+            seen[lab] = ax.plot(t, y, ls=ls, marker=marker, ms=3, color=color, lw=0.8)[0]
+        dg = next((r for r in recs if r["kind"] == "deepgaze3" and r["dataset"] == "coco_search18"
+                   and r["split"] == f"{cond}_validation"), None)
+        if dg is not None:
+            t, y = per_index(dg["metrics"], "ig")
+            keep = t <= t_max
+            color, marker, label = STYLE["deepgaze3"]
+            seen[label] = ax.plot(t[keep], y[keep], marker=marker, ms=3, color=color, lw=0.8)[0]
+        ax.set(title=f"{CONDITIONS[cond]} (CanViT {CKPT})", xlabel="fixation index t", xticks=range(1, t_max + 1),
+               xlim=(0.6, t_max + 0.4))
+        despine(ax)
+    axes[0, 0].set_ylabel("IG over centre bias (bits/fix)")
+    seen["centre bias"] = plt.Line2D([], [], color=STYLE["centre_bias"][0], lw=0.5)
+    fig.legend(handles=list(seen.values()), labels=list(seen), loc="outside upper center", ncol=3)
+    save(fig, out / "priors_by_index.pdf")
+    return True
+
+
 # The evaluated (dataset, split) pairs in the order of the cross-dataset figure and table.
 EVALS = [("coco_search18", "tp_validation", "COCO-Search18 TP"), ("coco_search18", "ta_validation", "COCO-Search18 TA"),
          ("coco_freeview", "validation", "COCO-FreeView"), ("mit1003", "all", "MIT1003"), ("cat2000", "all", "CAT2000"),
@@ -1082,6 +1124,7 @@ def main() -> None:
     res_macros = results_table(recs, tabs)
     res_macros |= policy_vs_human(recs, tabs)
     res_macros |= priors_figure(recs, a.results, figs, tabs)
+    priors_index_figure(recs, a.results, figs)
 
     sacc = {}
     for slug, cond, title in PANELS:
