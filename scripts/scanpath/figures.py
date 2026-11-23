@@ -256,18 +256,21 @@ def saccades(xs: list[np.ndarray], ys: list[np.ndarray], n: np.ndarray, sizes) -
     """Every saccade between consecutive fixations of each scanpath (pixel coordinates; fixation 0 is the start
     fixation, which every dataset here has at the image centre). ``length``: fraction of the stimulus' longer
     side, which is the side of CanViT's square scene, so humans and model share the unit; ``angle``: radians,
-    0 = rightwards, pi/2 = upwards (image y points down); ``first``: the scanpath's first saccade.
+    0 = rightwards, pi/2 = upwards (image y points down); ``first``: the scanpath's first saccade; ``length_px``:
+    the length in pixels.
     (pysaliency 0.2.23 has no saccade statistics, only scanpath plotting; checked 2026-11-23.)"""
-    length, angle, first = [], [], []
+    length, length_px, angle, first = [], [], [], []
     for x, y, i in zip(xs, ys, n):
         ok = np.isfinite(x) & np.isfinite(y)
         dx, dy = np.diff(np.asarray(x)[ok]), np.diff(np.asarray(y)[ok])
         if not len(dx):
             continue
-        length.append(np.hypot(dx, dy) / max(sizes[int(i)]))
+        length_px.append(np.hypot(dx, dy))
+        length.append(length_px[-1] / max(sizes[int(i)]))
         angle.append(np.mod(np.arctan2(-dy, dx), 2 * np.pi))
         first.append(np.arange(len(dx)) == 0)
-    return {k: np.concatenate(v) for k, v in (("length", length), ("angle", angle), ("first", first))}
+    return {k: np.concatenate(v) for k, v in (("length", length), ("length_px", length_px), ("angle", angle),
+                                              ("first", first))}
 
 
 def human_saccades(fixations, stimuli) -> dict[str, np.ndarray]:
@@ -286,6 +289,7 @@ def saccade_summary(s: dict[str, np.ndarray]) -> dict[str, float]:
     off_v = np.minimum(off_v, np.pi - off_v)
     left = (a[f] > np.pi / 2) & (a[f] < 3 * np.pi / 2)
     return {"n": int(len(a)), "median_length": float(np.median(s["length"])),
+            "median_length_px": float(np.median(s["length_px"])),
             "horizontal": float((off_h < np.pi / 8).mean()), "vertical": float((off_v < np.pi / 8).mean()),
             "first_left": float(left.mean()), "first_median_length": float(np.median(s["length"][f]))}
 
@@ -346,12 +350,16 @@ def saccade_figure(sacc: dict[str, dict], out: Path, model: dict[str, dict] | No
     save(fig, out / "saccades.pdf")
 
 
-def saccade_table(summ: dict[str, dict], out: Path) -> dict[str, str]:
-    lines = [r"\begin{tabular}{lrrrrrr}", r"\toprule",
-             r"dataset & saccades & median length & horizontal & vertical & 1st: median length & 1st: left \\",
-             r"\midrule"]
+def saccade_table(summ: dict[str, dict], out: Path, ppd: dict[str, float] | None = None) -> dict[str, str]:
+    """``ppd``: pixels per degree of visual angle per panel title, where the viewing geometry is known (helper_2's
+    DeepGaze III records, protocol.ppd); the degrees column shows a dash elsewhere."""
+    ppd = ppd or {}
+    lines = [r"\begin{tabular}{lrrrrrrr}", r"\toprule",
+             r"dataset & saccades & median length & median length (deg) & horizontal & vertical & "
+             r"1st: median length & 1st: left \\", r"\midrule"]
     for key, s in summ.items():
-        lines.append(f"{key.replace(chr(10), ' ')} & {s['n']:,} & {s['median_length']:.2f} & "
+        deg = f"{s['median_length_px'] / ppd[key]:.1f}" if key in ppd else "--"
+        lines.append(f"{key.replace(chr(10), ' ')} & {s['n']:,} & {s['median_length']:.2f} & {deg} & "
                      f"{100 * s['horizontal']:.0f}\\% & {100 * s['vertical']:.0f}\\% & "
                      f"{s['first_median_length']:.2f} & {100 * s['first_left']:.0f}\\% \\\\".replace(",", "{,}"))
     lines += [r"\bottomrule", r"\end{tabular}"]
@@ -815,7 +823,9 @@ def main() -> None:
         sacc[title] = human_saccades(select(fx, condition=cond, limit=None), st)
     saccade_figure(sacc, figs, model=canvit_saccades(recs) or None)
     summ = {k: saccade_summary(s) for k, s in sacc.items()}
-    sacc_macros = saccade_table(summ, tabs)
+    ppd = {title: float(r["protocol"]["ppd"]) for slug, cond, title in PANELS for r in recs
+           if r["kind"] == "deepgaze3" and r["dataset"] == slug and r["protocol"].get("ppd")}
+    sacc_macros = saccade_table(summ, tabs, ppd)
 
     tp = present_mask(fv)
     stats = {"validation_stimuli": len(sv), "scanpaths_tp": int(tp.sum()), "scanpaths_ta": int((~tp).sum()),
