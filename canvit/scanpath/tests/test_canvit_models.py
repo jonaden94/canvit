@@ -198,6 +198,9 @@ def test_load_builds_the_runs_task_and_policy_from_the_checkpoint_alone(trained)
     forced = ep.run(batch, n=2)["policy"]
     for t in range(2):
         assert torch.equal(forced[:, t], deploy_scores[t])
+    # an override reaches the harness and wins over the run config (a single-retina backbone refuses a retina)
+    with pytest.raises(ValueError, match="needs a multi-retina backbone"):
+        PolicyEpisode.load(ckpt, device=torch.device("cpu"), need_policy=True, overrides=("--cfg.retina", "x"))
 
 
 def test_a_checkpoint_without_run_config_is_refused(tmp_path):

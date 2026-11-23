@@ -94,6 +94,10 @@ class ScanpathConfig:
     device: str = "cuda"
     ckpt: Path | None = None
     """A self-contained harness checkpoint (run config, architecture and policy inside; canvit main b029fd3+)."""
+    retina: str | None = None
+    """A multi-retina backbone's retina to evaluate through, overriding the run config's ``--cfg.retina`` (None: the
+    trained one). The task head and policy were trained through the run's retina only: any other is out of
+    distribution for them."""
     shard: tuple[int, int] | None = None
     """``i N``: GPU stage only -- run the CanViT model on the i-th of N contiguous blocks of the evaluated scanpaths
     and write its predictions to ``save_predictions`` (no scoring). Shard 0 also writes the training-subset
@@ -293,7 +297,8 @@ def build_model(cfg: ScanpathConfig, stimuli, centre_bias, device: torch.device)
     if cfg.ckpt is None:
         raise ValueError(f"--cfg.model {cfg.model} needs --cfg.ckpt (a run's .pt)")
     readout = "policy" if cfg.model == "canvit_policy" else "heatmap"
-    ep = PolicyEpisode.load(cfg.ckpt, device=device, need_policy=readout == "policy")
+    ep = PolicyEpisode.load(cfg.ckpt, device=device, need_policy=readout == "policy",
+                            overrides=("--cfg.retina", cfg.retina) if cfg.retina else ())
     c = ep.task.cfg
     task_scene = getattr(c, "scene_size", None) or getattr(c, "scene_resolution", None)
     if task_scene is not None and task_scene != cfg.scene_size:

@@ -15,6 +15,8 @@
 #      DISPLAY_FRAME: unset = the STANDARD, the display shape of the checkpoint's training data (for the search
 #      checkpoints 1680x1050: COCO-Search18 content only ever occupied the scene rows of that box; owner decision
 #      2026-11-23); "scene" = the comparison rows (stimulus fills the scene), written as <stem>_scene.*
+#      RETINA: a multi-retina backbone's retina other than the trained one (--cfg.retina; head and policy were
+#      trained through one retina, so others are out of distribution for them); give it its own <name>.
 # On SLURM: slurm/runs/scanpath/eval_checkpoint.sbatch (same arguments).
 # Written by Claude (AI, Claude Opus 5.5), 2026-11-23.
 set -euo pipefail
@@ -35,9 +37,10 @@ for s in "${SETS[@]}"; do
   if [ -n "${DISPLAY_FRAME:-}" ]; then
     frame=(--cfg.display-frame "$DISPLAY_FRAME"); [ "$DISPLAY_FRAME" = scene ] && stem="${stem}_scene"
   fi
+  retina=(); [ -n "${RETINA:-}" ] && retina=(--cfg.retina "$RETINA")
   train=(--cfg.train-scanpaths "$N")
   [ "$has_train" = 1 ] && train+=(--cfg.save-train-predictions "$OUT/${stem}_train$N.npz")
-  common=(--cfg.dataset "$ds" --cfg.condition "$cond" --cfg.model canvit_policy --cfg.ckpt "$CKPT" "${frame[@]}"
+  common=(--cfg.dataset "$ds" --cfg.condition "$cond" --cfg.model canvit_policy --cfg.ckpt "$CKPT" "${frame[@]}" "${retina[@]}"
           --cfg.num-workers "${NUM_WORKERS:-2}" --cfg.batch-size "${BATCH_SIZE:-16}" "${train[@]}")
   if [ -n "${SHARD:-}" ]; then  # GPU stage of one block
     read -r i n <<< "$SHARD"; tag="$stem.shard${i}of$n"

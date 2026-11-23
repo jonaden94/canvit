@@ -72,8 +72,10 @@ class PolicyEpisode:
         return getattr(self.task, "name", None) == "search"
 
     @classmethod
-    def load(cls, ckpt: Path, *, device: torch.device, need_policy: bool) -> PolicyEpisode:
-        """The task, model and policy of a self-contained checkpoint, as ``harness.evaluate`` builds them."""
+    def load(cls, ckpt: Path, *, device: torch.device, need_policy: bool,
+             overrides: tuple[str, ...] = ()) -> PolicyEpisode:
+        """The task, model and policy of a self-contained checkpoint, as ``harness.evaluate`` builds them.
+        ``overrides``: extra ``harness.evaluate`` flags that win over the run config (e.g. ``--cfg.retina <name>``)."""
         from canvit.harness.evaluate import adopt_checkpoint_provenance, parse
         from canvit.harness.infra.checkpoint import policy_state_of
         payload = torch.load(ckpt, map_location=device, weights_only=False)
@@ -82,7 +84,7 @@ class PolicyEpisode:
             raise ValueError(f"{ckpt} carries no run config (metadata['run_config'], written by canvit main since "
                              "2026-11-22). Scanpath evaluation reads the task, the policy and the foveation geometry "
                              "from it; an older checkpoint has none of them on record, so it is refused.")
-        cmd, source = parse([run_config["argv"][0], "--opts.ckpt", str(ckpt)])
+        cmd, source = parse([run_config["argv"][0], "--opts.ckpt", str(ckpt), *overrides])
         task, _ = cmd.build()
         adopted = adopt_checkpoint_provenance(task.cfg, payload, source=ckpt)
         model, _ = task.build_model(device, prior_model_config=payload.get("model_config"))
@@ -104,6 +106,7 @@ class PolicyEpisode:
             joint.scorer.eval()
         provenance = {"ckpt": str(ckpt), "step": payload.get("step"), "run_config_argv": run_config["argv"],
                       "run_config_drift": source["drift"] if source else None, "adopted_from_checkpoint": adopted,
+                      "overrides": list(overrides), "retina": getattr(task.cfg, "retina", None),
                       "foveation": "canvit.core.foveation (fovi 27b1bde port; implied by the run config)"}
         log.info("loaded %s %s (step %s)%s", getattr(task, "name", "?"), ckpt, payload.get("step"),
                  " + policy" if joint else "")
