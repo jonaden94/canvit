@@ -1153,6 +1153,9 @@ def saccade_compare(rec: dict, ppd: float | None, out: Path, nsac: int = TRAINED
 
 
 # ------------------------------------------------------------------------------------------- retina sweep
+RET_COLS = {"tp": ("coco_search18_tp_validation", "target present"), "ta": ("coco_search18_ta_validation",
+                                                                            "target absent"),
+            "fv": ("coco_freeview_validation", "COCO-FreeView (cue mixture)")}
 TRAINED_RETINA = "cmf0.75_res65_cps6"  # the retina exp39 s0 was trained with (helper_1, 2026-11-23)
 SEARCH_VAL_TRIALS = 326  # target-present val pairs behind found_t3 (helper_1, 2026-11-23; not in the record)
 RES_MARKER = {65: "o", 80: "s", 92: "^"}  # retina resolution -> marker; cmf -> fill lightness
@@ -1170,8 +1173,8 @@ def load_retinas(results: Path) -> list[dict]:
             continue
         r = {"name": d.name, "cmf": float(m[1]), "res": int(m[2]), "cps": int(m[3]),
              "search": json.loads((d / "search_validation.json").read_text())["metrics"]}
-        for c in CONDITIONS:
-            p = d / f"coco_search18_{c}_validation.json"
+        for c, stem in RET_COLS.items():
+            p = d / f"{stem[0]}.json"
             if p.exists():
                 r[c] = json.loads(p.read_text())
         out.append(r)
@@ -1184,11 +1187,13 @@ def retina_figure(results: Path, out: Path) -> dict[str, str]:
     scanpaths, bottom: at tau = 1), columns TP | TA. Marker = retina resolution, fill = cortical magnification;
     the trained retina ringed. Only the trained retina is in distribution: head and policy saw no other."""
     rets = [r for r in load_retinas(results) if any(c in r for c in CONDITIONS)]
+    cols = [c for c in RET_COLS if any(c in r for r in rets)]
     if len(rets) < 2:
         print(f"retina_figure: {len(rets)} retinas with scanpath records, need 2")
         return {}
-    fig, axes = plt.subplots(2, 2, figsize=(TEXTWIDTH_IN, 3.8), sharex=True, sharey="row", layout="constrained")
-    for j, cond in enumerate(CONDITIONS):
+    fig, axes = plt.subplots(2, len(cols), figsize=(TEXTWIDTH_IN, 3.8), sharex=True, sharey="row", squeeze=False,
+                             layout="constrained")
+    for j, cond in enumerate(cols):
         for i, at in enumerate(("fitted", "one")):
             ax = axes[i, j]
             ax.axhline(0, color=STYLE["centre_bias"][0], lw=0.5)
@@ -1205,7 +1210,7 @@ def retina_figure(results: Path, out: Path) -> dict[str, str]:
                 if r["name"] == TRAINED_RETINA:
                     ax.plot(x, y, marker="o", ms=11, mfc="none", mec="k", mew=0.6, ls="none")
                     ax.annotate("trained", (x, y), xytext=(7, 4), textcoords="offset points", fontsize=FS - 1)
-            ax.set(title=CONDITIONS[cond] if i == 0 else None)
+            ax.set(title=RET_COLS[cond][1] if i == 0 else None)
             if i == 1:
                 ax.set_xlabel("targets found within 3 fixations (policy)")
             despine(ax)
@@ -1232,6 +1237,9 @@ def retina_figure(results: Path, out: Path) -> dict[str, str]:
         macros[f"retIGtauTA{tag}"] = _num(np.mean([r["ta"]["diagnostics"]["tempered_global"]["ig_image"] for r in g]))
         macros[f"retAUCTP{tag}"] = f"{np.mean([r['tp']['metrics']['auc_image'] for r in g]):.3f}"
         macros[f"retTauTP{tag}"] = f"{np.mean([t['temperature'] for t in tg]):.1f}"
+        if all("fv" in r for r in g):
+            macros[f"retIGtauFV{tag}"] = _num(np.mean([r["fv"]["diagnostics"]["tempered_global"]["ig_image"]
+                                                      for r in g]))
     return macros
 
 
@@ -1352,7 +1360,12 @@ EVALS = [("coco_search18", "tp_validation", "COCO-Search18 TP"), ("coco_search18
          ("daemons", "validation", "DAEMONS"), ("figrim", "all", "FIGRIM (memorisation)")]
 # Valentin, 2026-11-23: new analyses and the main results table on these only; the others in cross_dataset and
 # the appendix table (results_other.tex).
-FOCUS = [("coco_search18", "tp_validation"), ("coco_search18", "ta_validation"), ("coco_freeview", "validation")]
+FOCUS = [("coco_search18", "tp_validation"), ("coco_search18", "ta_validation"), ("coco_freeview", "validation"),
+         ("coco_search18", "tp_test"), ("coco_search18", "ta_test")]
+# the results tables also show the official COCO-Search18 test split (a second evaluation, helper_1; TP test
+# scanpaths end at the first target fixation, as redistributed by Gazeformer/ScanDiff); cross_dataset does not
+RESULT_EVALS = EVALS[:3] + [("coco_search18", "tp_test", "COCO-Search18 TP (test)"),
+                            ("coco_search18", "ta_test", "COCO-Search18 TA (test)")] + EVALS[3:]
 METRICS = [("ig_image", "IG over centre bias\n(bits/fix)"), ("ll_image", "LL over uniform\n(bits/fix)"),
            ("auc_image", "AUC"), ("nss_image", "NSS")]
 
@@ -1440,7 +1453,7 @@ def results_table(recs: list[dict], out: Path) -> dict[str, str]:
     head = [r"\begin{tabular}{llrrrrr}", r"\toprule", r"data & model & fixations & IG & LL & AUC & NSS \\"]
     tables = {"results.tex": list(head), "results_other.tex": list(head)}  # focus datasets | the appendix
     macros = {}
-    for ds, split, title in EVALS:
+    for ds, split, title in RESULT_EVALS:
         lines = tables["results.tex" if (ds, split) in FOCUS else "results_other.tex"]
         rows = []
         for kind in kinds:
@@ -1455,7 +1468,8 @@ def results_table(recs: list[dict], out: Path) -> dict[str, str]:
             if r["model"].endswith("cuemix"):  # 18 cues
                 name = "CanViT policy, cue mixture"
             rows.append(f" & {name} & {int(m['n_fixations'])} & {vals} \\\\")
-            tag = {"tp_validation": "TP", "ta_validation": "TA"}.get(split) if ds == "coco_search18" else \
+            tag = {"tp_validation": "TP", "ta_validation": "TA", "tp_test": "TPtest", "ta_test": "TAtest"}.get(
+                split) if ds == "coco_search18" else \
                 {"coco_freeview": "FV"}.get(ds)
             if kind in ("canvit", "canvit_heatmap", "deepgaze3") and tag:
                 pre = {"canvit": "cv", "canvit_heatmap": "hm", "deepgaze3": "dg"}[kind]
