@@ -1237,7 +1237,7 @@ def retina_figure(results: Path, out: Path) -> dict[str, str]:
 
 # --------------------------------------------------------------------------------------- temperature sweep
 TAU_EVALS = [("coco_search18", "tp_validation", "COCO-Search18 TP"), ("coco_search18", "ta_validation",
-             "COCO-Search18 TA"), ("coco_freeview", "validation", "COCO-FreeView"), ("mit1003", "all", "MIT1003")]
+             "COCO-Search18 TA"), ("coco_freeview", "validation", "COCO-FreeView")]  # FOCUS only (MIT1003 dropped)
 TAUS = np.geomspace(0.25, 128.0, 37)
 
 
@@ -1350,6 +1350,9 @@ def temperature_figure(recs: list[dict], out: Path) -> dict[str, str]:
 EVALS = [("coco_search18", "tp_validation", "COCO-Search18 TP"), ("coco_search18", "ta_validation", "COCO-Search18 TA"),
          ("coco_freeview", "validation", "COCO-FreeView"), ("mit1003", "all", "MIT1003"), ("cat2000", "all", "CAT2000"),
          ("daemons", "validation", "DAEMONS"), ("figrim", "all", "FIGRIM (memorisation)")]
+# Valentin, 2026-11-23: new analyses and the main results table on these only; the others in cross_dataset and
+# the appendix table (results_other.tex).
+FOCUS = [("coco_search18", "tp_validation"), ("coco_search18", "ta_validation"), ("coco_freeview", "validation")]
 METRICS = [("ig_image", "IG over centre bias\n(bits/fix)"), ("ll_image", "LL over uniform\n(bits/fix)"),
            ("auc_image", "AUC"), ("nss_image", "NSS")]
 
@@ -1430,13 +1433,15 @@ def cross_dataset_figure(recs: list[dict], out: Path, refs: list[dict] = ()) -> 
 
 
 def results_table(recs: list[dict], out: Path) -> dict[str, str]:
-    """tables/results.tex: per evaluated (dataset, split), IG / LL / AUC / NSS (per-image means) of every model
-    with a record; returns macros for the headline numbers (CanViT IG on COCO-Search18)."""
+    """tables/results.tex (FOCUS datasets) and tables/results_other.tex (the rest): per evaluated (dataset, split),
+    IG / LL / AUC / NSS (per-image means) of every model with a record; returns macros for the headline numbers."""
     kinds = [k for k in ("canvit", "canvit_heatmap", "deepgaze3", "centre_bias", "uniform")
              if any(r["kind"] == k for r in recs)]
-    lines = [r"\begin{tabular}{llrrrrr}", r"\toprule", r"data & model & fixations & IG & LL & AUC & NSS \\"]
+    head = [r"\begin{tabular}{llrrrrr}", r"\toprule", r"data & model & fixations & IG & LL & AUC & NSS \\"]
+    tables = {"results.tex": list(head), "results_other.tex": list(head)}  # focus datasets | the appendix
     macros = {}
     for ds, split, title in EVALS:
+        lines = tables["results.tex" if (ds, split) in FOCUS else "results_other.tex"]
         rows = []
         for kind in kinds:
             r = next((r for r in recs if r["kind"] == kind and r["dataset"] == ds and r["split"] == split), None)
@@ -1467,8 +1472,8 @@ def results_table(recs: list[dict], out: Path) -> dict[str, str]:
         if rows:
             rows[0] = title + rows[0]
             lines += [r"\midrule", *rows]
-    lines += [r"\bottomrule", r"\end{tabular}"]
-    (out / "results.tex").write_text("\n".join(lines) + "\n")
+    for name, lines in tables.items():
+        (out / name).write_text("\n".join(lines + [r"\bottomrule", r"\end{tabular}"]) + "\n")
     return macros
 
 
