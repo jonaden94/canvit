@@ -211,12 +211,13 @@ def without_start_fixations(fixations):
 
 
 def fit_centre_bias(stimuli, fixations, *, n_images: int = 200, seed: int = 0,
-                    bandwidths=(0.01, 0.016, 0.025, 0.04, 0.063),
+                    bandwidths=(0.004, 0.0063, 0.01, 0.016, 0.025, 0.04, 0.063),
                     epss=(1e-7, 1e-4)) -> dict[str, float]:
     """Grid search of ``CrossvalidatedBaselineModel(bandwidth, eps)``: mean log-likelihood (bits/fix)
     of the fixations on ``n_images`` random training stimuli, each scored by the KDE of all OTHER
     training stimuli; start fixations excluded throughout (:func:`without_start_fixations`). Returns the
-    best ``{"bandwidth", "eps", "ll"}``; warns at a grid edge. Grouping the leave-out by photo instead of
+    best ``{"bandwidth", "eps", "ll"}``; warns at a grid edge. (Grid widened down to 0.004 on 2026-11-23: CAT2000's
+    best was the old lower edge 0.01 with the likelihood still rising.) Grouping the leave-out by photo instead of
     stimulus (a photo can be a stimulus under several cues) changed the held-out score by <= 0.01 bits."""
     fixations = without_start_fixations(fixations)
     rng = np.random.default_rng(seed)
