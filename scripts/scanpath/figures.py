@@ -47,6 +47,7 @@ FS = 8
 STYLE = {
     "human": (OKABE_ITO["black"], "o", "humans"),
     "canvit": (OKABE_ITO["blue"], "s", "CanViT search policy"),
+    "canvit_heatmap": (OKABE_ITO["skyblue"], "o", "CanViT search heatmap"),  # the task head as a distribution
     "deepgaze3": (OKABE_ITO["orange"], "^", "DeepGaze III"),
     "centre_bias": (BASELINE_COLOR, "D", "centre bias"),
     "uniform": (BASELINE_COLOR, "v", "uniform"),
@@ -350,18 +351,23 @@ def saccade_figure(sacc: dict[str, dict], out: Path, model: dict[str, dict] | No
     save(fig, out / "saccades.pdf")
 
 
-def saccade_table(summ: dict[str, dict], out: Path, ppd: dict[str, float] | None = None) -> dict[str, str]:
-    """``ppd``: pixels per degree of visual angle per panel title, where the viewing geometry is known (helper_2's
-    DeepGaze III records, protocol.deepgaze.ppd); the degrees column shows a dash elsewhere."""
+def saccade_table(summ: dict[str, dict], out: Path, ppd: dict[str, float] | None = None,
+                  model: dict[str, dict] | None = None) -> dict[str, str]:
+    """Humans per dataset, then (``model``) CanViT's samples on the datasets it has them for. ``ppd``: pixels per
+    degree of visual angle per panel title, where the viewing geometry is known (helper_2's DeepGaze III records,
+    protocol.deepgaze.ppd); the degrees column shows a dash elsewhere. The macros describe the humans only."""
     ppd = ppd or {}
-    lines = [r"\begin{tabular}{lrrrrrrr}", r"\toprule",
-             r"dataset & saccades & median length & median length (deg) & horizontal & vertical & "
-             r"1st: median length & 1st: left \\", r"\midrule"]
-    for key, s in summ.items():
-        deg = f"{s['median_length_px'] / ppd[key]:.1f}" if key in ppd else "--"
-        lines.append(f"{key.replace(chr(10), ' ')} & {s['n']:,} & {s['median_length']:.2f} & {deg} & "
-                     f"{100 * s['horizontal']:.0f}\\% & {100 * s['vertical']:.0f}\\% & "
-                     f"{s['first_median_length']:.2f} & {100 * s['first_left']:.0f}\\% \\\\".replace(",", "{,}"))
+    lines = [r"\begin{tabular}{llrrrrrrr}", r"\toprule",
+             r"dataset & from & saccades & median length & median length (deg) & horizontal & vertical & "
+             r"1st: median length & 1st: left \\"]
+    for who, rows in (("humans", summ), ("CanViT samples", model or {})):
+        if rows:
+            lines.append(r"\midrule")
+        for key, s in rows.items():
+            deg = f"{s['median_length_px'] / ppd[key]:.1f}" if key in ppd else "--"
+            lines.append(f"{key.replace(chr(10), ' ')} & {who} & {s['n']:,} & {s['median_length']:.2f} & {deg} & "
+                         f"{100 * s['horizontal']:.0f}\\% & {100 * s['vertical']:.0f}\\% & "
+                         f"{s['first_median_length']:.2f} & {100 * s['first_left']:.0f}\\% \\\\".replace(",", "{,}"))
     lines += [r"\bottomrule", r"\end{tabular}"]
     (out / "saccades.tex").write_text("\n".join(lines) + "\n")
     m = list(summ.values())
@@ -397,10 +403,18 @@ def load_records(results: Path) -> list[dict]:
         r.setdefault("dataset", "coco_search18")
         r.setdefault("split", f"{pr['condition']}_{pr['part']}")
         r["source"] = "baselines" if top else p.parent.name
-        r["kind"] = r["model"] if r["source"] == "baselines" else ("deepgaze3" if r["source"] == "deepgaze3"
-                                                                    else "canvit")
+        if r["source"] in ("baselines", "deepgaze3"):
+            r["kind"] = r["model"] if r["source"] == "baselines" else "deepgaze3"
+        else:
+            r["kind"] = "canvit_heatmap" if r["model"] == "canvit_heatmap" else "canvit"
         r["path"] = p
         recs.append(r)
+    for ds in {r["dataset"] for r in recs}:  # every IG and every reference row against ONE centre bias per dataset
+        fits = {(r["protocol"]["centre_bias"]["bandwidth"], r["protocol"]["centre_bias"]["eps"])
+                for r in recs if r["dataset"] == ds and isinstance(r["protocol"].get("centre_bias"), dict)}
+        if len(fits) > 1:
+            raise SystemExit(f"{ds}: records measured against different centre-bias fits {sorted(fits)}; "
+                             "re-run the stale ones or move them out of the results directory")
     return recs
 
 
@@ -428,7 +442,7 @@ def ig_figure(recs: list[dict], out: Path, t_max: int = 8) -> bool:
             color, marker, label = STYLE[r["kind"]]
             if r["kind"] == "canvit" and len({x["source"] for x in recs if x["kind"] == "canvit"}) > 1:
                 label = f"{label} ({r['source']})"
-            ls = ":" if r["kind"] == "uniform" else "-"
+            ls = {"uniform": ":", "canvit_heatmap": "--"}.get(r["kind"], "-")
             seen[label] = ax.plot(t[keep], v[keep], ls=ls, marker=marker, ms=3, color=color, lw=0.8, label=label)[0]
         ax.set(title=CONDITIONS[cond], xlabel="fixation index t", xticks=range(1, t_max + 1), xlim=(0.6, t_max + 0.4))
         despine(ax)
@@ -463,9 +477,11 @@ def predictions(rec: dict):
 
 
 def samples(rec: dict):
-    """(stimuli, the sampled scanpaths' npz) of a CanViT record, from ``samples_<dataset>_<split>.npz`` beside it."""
-    p = rec["path"].parent / f"samples_{rec['path'].stem}.npz"
-    if not p.exists():
+    """(stimuli, the sampled scanpaths' npz) of a CanViT record, from ``samples_<dataset>_<split>.npz`` beside it
+    (free viewing with a search policy: ``samples_<dataset>_<split>_cuemix.npz``, the 18-cue mixture per step)."""
+    p = next((q for q in (rec["path"].parent / f"samples_{rec['path'].stem}{x}.npz" for x in ("", "_cuemix"))
+              if q.exists()), None)
+    if p is None:
         return None
     pr = rec["protocol"]
     return dataset(rec["dataset"], pr.get("part", eval_part(rec["dataset"])))[0], np.load(p)
@@ -513,7 +529,7 @@ def policy_entropy_figure(recs: list[dict], human: dict, kde: tuple[float, float
             else:
                 st, fx, m = p
                 for temp, ls, name in ((1.0, "-", r"$\tau$ = 1"),
-                                       (glob, "--", rf"global $\tau$ = {glob:.2f}" if glob else "")):
+                                       (glob, "--", r"global $\tau$ (fitted)")):
                     if temp is None:
                         continue
                     H, ti = policy_entropy(m.with_temperature(float(temp)), st, fx)
@@ -532,7 +548,10 @@ def policy_entropy_figure(recs: list[dict], human: dict, kde: tuple[float, float
             if glob:
                 axt.axhline(glob, color=color, ls="--")
             axt.axhline(1, color=BASELINE_COLOR, lw=0.5)
-        ax.set(title=CONDITIONS[cond], ylim=(0, 7.4))
+        glob_t = [r.get("diagnostics", {}).get("tempered_global", {}).get("temperature")
+                  for r in canvit_records(recs, "coco_search18", f"{cond}_validation")[:1]]
+        ax.set(title=CONDITIONS[cond] + (rf" (global $\tau$ = {glob_t[0]:.2f})" if glob_t and glob_t[0] else ""),
+               ylim=(0, 7.4))
         axt.set(xlabel="fixation index t", xticks=range(1, t_max + 1), xlim=(0.6, t_max + 0.4))
         for a in (ax, axt):
             despine(a)
@@ -648,7 +667,7 @@ def cross_dataset_figure(recs: list[dict], out: Path, refs: list[dict] = ()) -> 
     """Rows = evaluated (dataset, split), columns = metrics (per-image means, pysaliency); one marker per model.
     Published numbers (``read_references``) are hollow markers: DeepGaze III in its colour, DeepGaze3.5-VL purple.
     None of them is on exactly our split (comparable = metric_only), so they place our numbers, not rank them."""
-    models = [k for k in ("canvit", "deepgaze3") if any(r["kind"] == k for r in recs)]
+    models = [k for k in ("canvit", "canvit_heatmap", "deepgaze3") if any(r["kind"] == k for r in recs)]
     if not models:
         print("cross_dataset_figure: no CanViT / DeepGaze III records yet")
         return False
@@ -687,7 +706,8 @@ def cross_dataset_figure(recs: list[dict], out: Path, refs: list[dict] = ()) -> 
 def results_table(recs: list[dict], out: Path) -> dict[str, str]:
     """tables/results.tex: per evaluated (dataset, split), IG / LL / AUC / NSS (per-image means) of every model
     with a record; returns macros for the headline numbers (CanViT IG on COCO-Search18)."""
-    kinds = [k for k in ("canvit", "deepgaze3", "centre_bias", "uniform") if any(r["kind"] == k for r in recs)]
+    kinds = [k for k in ("canvit", "canvit_heatmap", "deepgaze3", "centre_bias", "uniform")
+             if any(r["kind"] == k for r in recs)]
     lines = [r"\begin{tabular}{llrrrrr}", r"\toprule", r"data & model & fixations & IG & LL & AUC & NSS \\"]
     macros = {}
     for ds, split, title in EVALS:
@@ -702,9 +722,15 @@ def results_table(recs: list[dict], out: Path) -> dict[str, str]:
             rows.append(f" & {STYLE[kind][2]} & {int(m['n_fixations'])} & {vals} \\\\")
             if kind == "canvit" and ds == "coco_search18":
                 tag = split[:2].upper()
-                macros |= {f"cvIG{tag}": f"{m['ig_image']:.2f}", f"cvLL{tag}": f"{m['ll_image']:.2f}"}
-                macros |= {f"cvIG{tag}t{i}": f"{m[f'ig_t{i}']:.2f}".replace("-", "$-$") for i in range(1, 4)
-                           if f"ig_t{i}" in m}
+                d = r.get("diagnostics", {}).get("tempered_global", {})
+                vals = {f"cvIG{tag}": m["ig_image"], f"cvLL{tag}": m["ll_image"], f"cvAUC{tag}": m["auc_image"],
+                        f"cvNSS{tag}": m["nss_image"]} | {f"cvIG{tag}t{w}": m[f"ig_t{i}"]  # no digits in a macro name
+                                                          for i, w in ((1, "One"), (2, "Two"), (3, "Three"))
+                                                          if f"ig_t{i}" in m}
+                if d:  # the temperature diagnostic: global tau and the IG at that tau
+                    vals |= {f"cvTau{tag}": d["temperature"], f"cvIGtau{tag}": d["ig_image"]}
+                fmt = {k: (".3f" if "AUC" in k else ".2f") for k in vals}
+                macros |= {k: f"{v:{fmt[k]}}".replace("-", r"\ensuremath{-}") for k, v in vals.items()}
         if rows:
             rows[0] = title + rows[0]
             lines += [r"\midrule", *rows]
@@ -824,11 +850,12 @@ def main() -> None:
     for slug, cond, title in PANELS:
         st, fx = dataset(slug, eval_part(slug))
         sacc[title] = human_saccades(select(fx, condition=cond, limit=None), st)
-    saccade_figure(sacc, figs, model=canvit_saccades(recs) or None)
+    cv_sacc = canvit_saccades(recs)
+    saccade_figure(sacc, figs, model=cv_sacc or None)
     summ = {k: saccade_summary(s) for k, s in sacc.items()}
     ppd = {title: float(r["protocol"]["deepgaze"]["ppd"]) for slug, cond, title in PANELS for r in recs
            if r["kind"] == "deepgaze3" and r["dataset"] == slug and r["protocol"].get("deepgaze", {}).get("ppd")}
-    sacc_macros = saccade_table(summ, tabs, ppd)
+    sacc_macros = saccade_table(summ, tabs, ppd, {k: saccade_summary(s) for k, s in cv_sacc.items()})
 
     tp = present_mask(fv)
     stats = {"validation_stimuli": len(sv), "scanpaths_tp": int(tp.sum()), "scanpaths_ta": int((~tp).sum()),
