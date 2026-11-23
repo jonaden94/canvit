@@ -38,8 +38,12 @@ from canvit.scanpath.models import GridScanpathModel, grid_log_density, policy_e
 
 # ---------------------------------------------------------------------------------------------------- style
 # From FoAViS notebooks/paper_common.py (OKABE_ITO, BASELINE_COLOR, set_paper_style, despine, mark_fixation).
-# one preliminary checkpoint: exp39 s0, best validation step 15000 of a finished 20000-step run; every CanViT label names it
+# one preliminary checkpoint: exp39 s0, best validation step 15000 of a finished 20000-step run;
+# every CanViT label names it
 CKPT = "exp39 s0"
+# The search task head's map read as a fixation distribution: off in every figure and table since 2026-11-23
+# (Valentin: conceptually the wrong measurement); records stay on disk; --heatmap turns it back on.
+SHOW_HEATMAP = False
 OKABE_ITO = {"black": "#000000", "orange": "#E69F00", "skyblue": "#56B4E9", "green": "#009E73",
              "yellow": "#F0E442", "blue": "#0072B2", "vermillion": "#D55E00", "purple": "#CC79A7"}
 BASELINE_COLOR = "0.35"  # every baseline / reference line
@@ -415,6 +419,8 @@ def load_records(results: Path) -> list[dict]:
             r["kind"] = r["model"] if r["source"] == "baselines" else "deepgaze3"
         else:
             r["kind"] = "canvit_heatmap" if "heatmap" in r["model"] else "canvit"  # canvit_search_heatmap
+            if r["kind"] == "canvit_heatmap" and not SHOW_HEATMAP:
+                continue
         r["path"] = p
         recs.append(r)
     for ds in {r["dataset"] for r in recs}:  # every IG and every reference row against ONE centre bias per dataset
@@ -727,7 +733,10 @@ PRIOR_CONDS = {"tp": ("coco_search18", "tp_validation", "COCO-Search18 TP"),
 def load_priors(results: Path) -> dict[tuple[str, str], dict]:
     """{(source, cond): priors JSON} for PRIOR_CONDS (canvit.scanpath.priors, annotated), source policy | heatmap."""
     out = {}
-    for src, pattern in (("policy", "*/priors/*_validation.json"), ("heatmap", "*/heatmap/priors/*_validation.json")):
+    sources = [("policy", "*/priors/*_validation.json")]
+    if SHOW_HEATMAP:
+        sources.append(("heatmap", "*/heatmap/priors/*_validation.json"))
+    for src, pattern in sources:
         for p in sorted(results.glob(pattern)):
             r = json.loads(p.read_text())
             cond = next((c for c, (ds, sp, _) in PRIOR_CONDS.items() if ds == r["dataset"] and sp == r["split"]),
@@ -784,18 +793,20 @@ def priors_figure(recs: list[dict], results: Path, out: Path, tabs: Path) -> dic
                         v["gain_over_priors_only"])
                 color, marker = (STYLE["canvit" if src == "policy" else "canvit_heatmap"][:2] if v["with_canvit"]
                                  else (BASELINE_COLOR, "D"))
-                dy = {"policy": -0.14, "heatmap": 0.14}[src] if v["with_canvit"] else 0.0
+                dy = ({"policy": -0.14, "heatmap": 0.14}[src] if v["with_canvit"] and SHOW_HEATMAP else 0.0)
                 ax.plot(ig, row + dy, marker=marker, ms=4, color=color, ls="none")
         ax.set(title=PRIOR_CONDS[cond][2], xlabel="IG over centre bias (bits/fix)")
         despine(ax)
     axes[0, 0].set(yticks=range(len(PRIOR_ROWS)), yticklabels=[r[2] for r in PRIOR_ROWS],
                    ylim=(len(PRIOR_ROWS) - 0.5, -0.9))
-    handles = [plt.Line2D([], [], color=STYLE["canvit"][0], marker="s", ls="none", ms=4),
-               plt.Line2D([], [], color=STYLE["canvit_heatmap"][0], marker="o", ls="none", ms=4),
-               plt.Line2D([], [], color=BASELINE_COLOR, marker="D", ls="none", ms=4),
-               plt.Line2D([], [], color=STYLE["deepgaze3"][0], ls="--", lw=0.8)]
-    fig.legend(handles, [STYLE["canvit"][2] + "; free viewing: cue mixture", STYLE["canvit_heatmap"][2],
-                         "priors without image", "DeepGaze III"], loc="outside upper center", ncol=2)
+    legend = {STYLE["canvit"][2] + "; free viewing: cue mixture":
+              plt.Line2D([], [], color=STYLE["canvit"][0], marker="s", ls="none", ms=4)}
+    if any(k[0] == "heatmap" for k in pri):
+        legend[STYLE["canvit_heatmap"][2]] = plt.Line2D([], [], color=STYLE["canvit_heatmap"][0], marker="o",
+                                                        ls="none", ms=4)
+    legend["priors without image"] = plt.Line2D([], [], color=BASELINE_COLOR, marker="D", ls="none", ms=4)
+    legend["DeepGaze III"] = plt.Line2D([], [], color=STYLE["deepgaze3"][0], ls="--", lw=0.8)
+    fig.legend(list(legend.values()), list(legend), loc="outside upper center", ncol=2)
     save(fig, out / "priors.pdf")
 
     # one block per source; gain = over the block's first row (that row: over tau = 1), caption says so
@@ -1112,9 +1123,10 @@ def main() -> None:
     ap.add_argument("--references", type=Path, default=None,
                     help="published numbers (reference_numbers.csv); default $SCANPATH_REFERENCES")
     ap.add_argument("--png", action="store_true", help="also write .png previews beside the .pdf figures")
+    ap.add_argument("--heatmap", action="store_true", help="also show the search heatmap (off since 2026-11-23)")
     a = ap.parse_args()
-    global PNG_PREVIEW
-    PNG_PREVIEW = a.png
+    global PNG_PREVIEW, SHOW_HEATMAP
+    PNG_PREVIEW, SHOW_HEATMAP = a.png, a.heatmap
     a.fonts = env_dir(a.fonts, "SCANPATH_FONTS_DIR")
     a.scandiff_runs = env_dir(a.scandiff_runs, "SCANDIFF_RUNS_DIR")
     a.results = env_dir(a.results, "SCANPATH_RESULTS_DIR", "LOGS_DIR", sub="scanpath_eval")
