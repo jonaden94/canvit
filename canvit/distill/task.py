@@ -368,8 +368,12 @@ class DistillRunTask:
 
     def trainable_param_groups(self, *, model, head, joint, spec):
         groups: dict[str, list] = {}
+        # With policy tokens the scorer IS a submodule of the model (its readout); it belongs to
+        # the policy group only (a param in two optimizer groups is an error). Without them the
+        # scorer is a separate module and this excludes nothing.
+        scorer_ids = {id(p) for p in joint.scorer.parameters()} if joint is not None else set()
         if spec.train_backbone:  # distill's in-forward heads ride the backbone group
-            groups["backbone"] = list(model.parameters())
+            groups["backbone"] = [p for p in model.parameters() if id(p) not in scorer_ids]
         if spec.train_policy:
             assert joint is not None
             groups["policy"] = list(joint.scorer.parameters())

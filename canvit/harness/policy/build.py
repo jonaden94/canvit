@@ -37,7 +37,7 @@ from canvit.core.policy import (
 from canvit.harness.config import FoveatedScaleConfig, JointPolicyConfig
 from canvit.harness.policy.joint import JointPolicy
 from canvit.harness.policy.rl import PG, VPG, Objective, QReg, resolve_reward
-from canvit.harness.rollout.selector import PolicySelector, RandomSelector
+from canvit.harness.rollout.selector import PolicySelector, RandomSelector, TokenPolicySelector
 
 log = logging.getLogger(__name__)
 
@@ -115,6 +115,36 @@ def build_policy(
 
     # Reward kind + centring + scaling; refuses what the objective cannot honour.
     reward = resolve_reward(objective=obj, reward=rl.reward, center=rl.reward_center, scale=rl.reward_scale)
+
+    # POLICY TOKENS: the model carries its own policy (CanViTConfig.n_policy_tokens > 0). The
+    # distribution is the model's readout of its policy tokens over the policy_grid^2 canvas
+    # cells; the readout module takes the scorer's place (policy param group, sidecar, sync,
+    # clip). Design: canvit_claude/canvit/active_pretraining/02-policy-tokens-design.md.
+    n_tok = getattr(getattr(canvit, "cfg", None), "n_policy_tokens", 0)
+    if n_tok:
+        if not isinstance(obj, PG):
+            raise ValueError(f"policy tokens are trained by PG only, got objective={rl.objective!r}")
+        # No detaching possible: the tokens are processed by the backbone. run() refuses a
+        # spec with policy_grad_to_backbone=False for a token model (rl.feats_detached is
+        # ignored here; the spec is the one switch).
+        grid = canvit.cfg.policy_grid
+        tok_random = RandomSelector(
+            is_foveated=is_foveated, foveated_scale=foveated_scale, min_viewpoint_scale=min_viewpoint_scale)
+        tok_sel = TokenPolicySelector(
+            model=canvit, vp_flat=fixation_candidates(grid).reshape(-1, 3).to(device),
+            fallback=tok_random, mode="sample", generator=generator)
+        jp = JointPolicy(
+            policy_selector=tok_sel, random_selector=tok_random, scorer=canvit.policy_readout,  # type: ignore[arg-type]
+            objective=obj, rl_weight=rl.rl_weight, keep_random_branch=rl.keep_random_branch,
+            target_momentum=rl.target_momentum, device=device, prime_target=1.0, prime_warmup=0,
+            reward=reward,
+        )
+        if obj.entropy_target is not None:
+            alpha0 = obj.entropy_bonus if obj.alpha_init is None else obj.alpha_init
+            jp.log_alpha = torch.tensor(math.log(alpha0), device=device)
+        log.info("policy: %d policy tokens (%s), %d^2 cells, PG", n_tok,
+                 canvit.cfg.policy_token_mode, grid)
+        return jp
 
     # VPG is defined for the FOVEATED action space (autoreg_tryout only ever ran a foveated
     # model). It runs on uniform and is internally consistent there, but it is not the same

@@ -286,6 +286,23 @@ def run(*, task: RunTask, spec: TrainSpec, settings: RunSettings) -> dict:
     if spec.train_policy or spec.policy_loss_active:
         gen = torch.Generator(device=device).manual_seed(settings.seed + rank)
         joint = task.build_policy(model, device=device, canvas_grid=canvas_grid, generator=gen)
+        # ONE switch for "does the policy gradient reach the backbone": the spec's
+        # policy_grad_to_backbone. The selector's feats_detached (from rl.feats_detached,
+        # default True) used to be a second, independent switch, so
+        # `--spec.policy-grad-to-backbone True` alone still detached the policy features and no
+        # policy gradient reached the backbone, silently (found 2026-11-22; no launcher had
+        # set either). The spec wins; a policy-token model cannot detach at all.
+        sel = joint.policy_selector
+        if getattr(getattr(getattr(model, "module", model), "cfg", None), "n_policy_tokens", 0):
+            if not spec.policy_grad_to_backbone:
+                raise ValueError(
+                    "policy tokens are processed by the backbone, so the policy gradient reaches "
+                    "it by construction: use --spec.policy-grad-to-backbone True")
+        elif hasattr(sel, "feats_detached") and sel.feats_detached != spec.feats_detached:
+            log.warning("policy selector feats_detached=%s overridden to %s to match "
+                        "spec.policy_grad_to_backbone=%s", sel.feats_detached, spec.feats_detached,
+                        spec.policy_grad_to_backbone)
+            sel.feats_detached = spec.feats_detached
         # A terminal-reward objective cannot honor every spec cell; fail before training.
         from canvit.harness.policy import check_credit_regime
         check_credit_regime(joint=joint, spec=spec)
@@ -312,7 +329,11 @@ def run(*, task: RunTask, spec: TrainSpec, settings: RunSettings) -> dict:
         log.info("SEED mode: loading weights from %s (fresh opt/sched, step 0)", settings.seed_ckpt)
         seed_payload = load_checkpoint(settings.seed_ckpt, device)
         # weights only: no optimizer/scheduler => the run starts a fresh schedule.
-        restore_into(seed_payload, model=model, joint=joint, path=settings.seed_ckpt, device=device)
+        # A model with policy tokens seeded from one without: only those params start fresh.
+        new_params = (("policy_token_init", "policy_readout.")
+                      if getattr(getattr(getattr(model, "module", model), "cfg", None), "n_policy_tokens", 0) else ())
+        restore_into(seed_payload, model=model, joint=joint, path=settings.seed_ckpt, device=device,
+                     new_param_prefixes=new_params)
         start_step = 0
     else:
         log.info("FRESH mode: no checkpoint, starting from scratch")

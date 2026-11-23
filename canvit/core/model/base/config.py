@@ -46,6 +46,21 @@ class CanViTConfig:
     # (no MLP) for that block, e.g. [2, 0] = a 2×-MLP block then an attention-only block.
     n_canvas_self_attn_blocks: int = 0
     canvas_self_attn_mlp_ratios: list[float] = field(default_factory=list)
+    # Policy tokens (viewpoint policy inside the transformer; design note
+    # canvit_claude/canvit/active_pretraining/02-policy-tokens-design.md). 0 = disabled:
+    # no new params, forward unchanged. K tokens join the local stream; after each glimpse a
+    # readout turns them + the canvas into a distribution over the policy_grid^2 canvas cells
+    # (policy_heads maps per token, averaged as probabilities with learned weights).
+    #   policy_token_mode "readonly": the tokens attend to all local tokens and read the
+    #     canvas, nothing attends to them and they do not write (pretrained path unchanged);
+    #   "full": ordinary local tokens (everything attends to them, they write).
+    #   policy_token_reinit: start every glimpse from the learned init (like the registers)
+    #     instead of carrying them over (like recurrent_cls).
+    n_policy_tokens: int = 0
+    policy_token_mode: Literal["readonly", "full"] = "readonly"
+    policy_token_reinit: bool = False
+    policy_heads: int = 8
+    policy_grid: int = 32
 
     def __post_init__(self) -> None:
         is_convex = self.canvas_update_mode == "convex"
@@ -58,6 +73,12 @@ class CanViTConfig:
             f"canvas_self_attn_mlp_ratios must have length n_canvas_self_attn_blocks="
             f"{self.n_canvas_self_attn_blocks}, got {self.canvas_self_attn_mlp_ratios}"
         )
+        assert self.n_policy_tokens >= 0
+        if self.n_policy_tokens > 0:
+            assert self.canvas_dim % self.policy_heads == 0, (self.canvas_dim, self.policy_heads)
+            assert not self.vit_modulation.enabled, (
+                "policy tokens with vit_modulation are not implemented (modulation is per "
+                "token position and would need entries for the policy tokens)")
 
     @property
     def canvas_dim(self) -> int:

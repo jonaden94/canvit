@@ -338,3 +338,59 @@ class RandomSelector:
                 scales=torch.full((batch_size,), float(self.foveated_scale.fixed_scale), device=device),
             )
         return NamedViewpoint.full_scene(batch_size=batch_size, device=device)
+
+
+@dataclass
+class TokenPolicySelector:
+    """Selection from the model's own POLICY TOKENS (``CanViTConfig.n_policy_tokens > 0``;
+    design note canvit_claude/canvit/active_pretraining/02-policy-tokens-design.md).
+
+    The distribution comes from ``model.policy_log_probs(state)`` — the tokens and canvas
+    after the previous glimpse — over the policy_grid^2 canvas cells, i.e. the candidate
+    table ``fixation_candidates(policy_grid)``. Same interface as ``PolicySelector``
+    (``mode``, ``prime_on_policy``, ``last_aux``), so ``JointPolicy``, ``deploy_selector`` and
+    the PG loss work unchanged: ``last_aux["scores"]`` are log-probabilities, and
+    ``log_softmax`` of a log-probability vector is the vector itself.
+    No detaching: the tokens are processed by the backbone, so the policy gradient reaches it
+    by construction (``build_policy`` requires ``feats_detached=False`` for this selector)."""
+
+    model: object  # the core CanViT (has policy_log_probs)
+    vp_flat: Tensor  # [A, 3] (cy, cx, 1.0), A = policy_grid^2
+    fallback: "RandomSelector"
+    mode: str = "sample"  # "sample" (PG on-policy) | "argmax" (deploy)
+    prime_on_policy: float = 1.0  # argmax mode only; 1.0 = pure argmax, no RNG
+    generator: torch.Generator | None = None
+    last_aux: dict | None = None
+
+    def start_rollout(
+        self, *, t0_type: ViewpointType, batch_size: int, device: torch.device
+    ) -> RolloutCtx:
+        self.last_aux = None
+        return self.fallback.start_rollout(t0_type=t0_type, batch_size=batch_size, device=device)
+
+    def select(
+        self, *, vp_type: ViewpointType, ctx: RolloutCtx, t: int, batch_size: int,
+        device: torch.device, state: RecurrentState,
+    ) -> NamedViewpoint:
+        if vp_type == ViewpointType.FULL:
+            return self.fallback.select(
+                vp_type=vp_type, ctx=ctx, t=t, batch_size=batch_size, device=device, state=state)
+        logp = self.model.policy_log_probs(state)  # type: ignore[attr-defined]  # [B, A] fp32
+        if self.mode == "sample":
+            idx = torch.multinomial(logp.detach().exp(), 1, generator=self.generator).squeeze(1)
+        else:
+            idx = logp.detach().argmax(dim=1)
+            if self.prime_on_policy < 1.0:
+                a = logp.shape[1]
+                rand_idx = torch.randint(a, (batch_size,), device=device, generator=self.generator)
+                on_pol = torch.rand(batch_size, device=device, generator=self.generator) < self.prime_on_policy
+                idx = torch.where(on_pol, idx, rand_idx)
+        self.last_aux = {"feats": None, "flat_idx": idx, "scores": logp}
+        acts = self.vp_flat[idx]
+        # the policy chooses WHERE; on a foveated model the view scale comes from the foveated
+        # scale law, exactly as for PolicySelector (uniform: the table's scale column, 1.0)
+        scales = acts[:, 2].contiguous()
+        if self.fallback.is_foveated:
+            scales, _ = self.fallback.view_scales(
+                rollout_scales=ctx.rollout_scales, batch_size=batch_size, device=device)
+        return NamedViewpoint(name="policy", centers=acts[:, :2].contiguous(), scales=scales)

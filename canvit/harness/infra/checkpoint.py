@@ -72,12 +72,24 @@ def load_checkpoint(path: Path, device: torch.device | str) -> dict:
 def restore_into(
     payload: dict, *, model: Any, optimizer: Any = None, scheduler: Any = None,
     joint: Any | None = None, path: Path | None = None, device: torch.device | str = "cpu",
+    new_param_prefixes: tuple[str, ...] = (),
 ) -> int:
     """Apply a loaded payload to live modules; return the saved step. Optimizer/scheduler
     are restored only when provided (resume mode); the policy when ``joint`` is given and
-    the checkpoint has one (see :func:`policy_state_of`)."""
+    the checkpoint has one (see :func:`policy_state_of`).
+
+    ``new_param_prefixes`` (seed mode only): model params under these name prefixes may be
+    ABSENT from the payload and keep their fresh init (e.g. policy tokens added to a
+    pretrained model). Every other key must match exactly, as in the strict load."""
     core = getattr(model, "module", model)
-    core.load_state_dict(payload["model_state"])
+    if not new_param_prefixes:
+        core.load_state_dict(payload["model_state"])
+    else:
+        res = core.load_state_dict(payload["model_state"], strict=False)
+        bad_missing = [k for k in res.missing_keys if not k.startswith(new_param_prefixes)]
+        if res.unexpected_keys or bad_missing:
+            raise RuntimeError(f"seed load: unexpected keys {res.unexpected_keys}, missing keys "
+                               f"outside {new_param_prefixes}: {bad_missing}")
     if optimizer is not None and payload.get("optimizer_state") is not None:
         optimizer.load_state_dict(payload["optimizer_state"])
     if scheduler is not None and payload.get("scheduler_state") is not None:

@@ -312,7 +312,8 @@ class SearchRunTask:
         distribution the policy draws the NEXT fixation from. The scorer is deterministic
         (no BatchNorm, no dropout), so this equals the selector's own forward. The encoder's
         rolling reference is restored, so a mid-rollout call cannot shift later features."""
-        st = RecurrentState(canvas=state.canvas[idx], recurrent_cls=state.recurrent_cls[idx])
+        st = RecurrentState(canvas=state.canvas[idx], recurrent_cls=state.recurrent_cls[idx],
+                            policy_tokens=None if state.policy_tokens is None else state.policy_tokens[idx])
         enc = joint.policy_selector.encoder
         prev = enc.prev
         # the encoder's rolling reference holds the whole batch (or the batch-1 init

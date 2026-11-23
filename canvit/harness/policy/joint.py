@@ -73,6 +73,7 @@ class JointPolicy:
     """The resolved reward (``rl.resolve_reward``). The default is the historical QReg/PG one."""
     ema_abs: dict[int, Tensor] = field(default_factory=dict)  # per-depth state of reward_scale='ema_abs'
     _rollout_entropies: list = field(default_factory=list)  # entropy_update='per_rollout' accumulator
+    _logged_entropies: list = field(default_factory=list)  # inline PG: this rollout's entropies, for logging
 
     def branch_selector(self, t0_type: ViewpointType) -> tuple[object, bool]:
         """(selector, is_policy_branch) for a branch with this t0 type. Policy
@@ -188,12 +189,17 @@ class JointPolicy:
 
     def end_rollout(self) -> None:
         """Called by ``run_rollout`` after each policy branch. Takes the ``per_rollout``
-        entropy dual step on the inline path; a no-op otherwise."""
+        entropy dual step on the inline path; a no-op otherwise. Inline PG: also logs the
+        policy branch's mean entropy and the entropy weight alpha (after the dual step)."""
         if self._rollout_entropies:
             obj = self.objective
             assert isinstance(obj, PG)
             self._entropy_step(obj, torch.stack(self._rollout_entropies).mean())
             self._rollout_entropies = []
+        if self._logged_entropies:
+            self.last_step = {"policy_entropy": torch.stack(self._logged_entropies).mean().float(),
+                              "alpha": torch.as_tensor(self._alpha(self.objective)).detach().float()}
+            self._logged_entropies = []
 
     def state_value(self, feats: Tensor) -> Tensor:
         """``V(s)`` [B] for the VPG baseline, read from the scorer's dueling value head.
@@ -272,6 +278,7 @@ class JointPolicy:
             else:
                 loss, entropy, _ = pg_loss(scores, flat_idx, target, alpha=self._alpha(obj), crit_all=None,
                                            mask=mask)
+            self._logged_entropies.append(entropy.detach())
             if self.log_alpha is not None:
                 if obj.entropy_update == "per_glimpse":
                     self._entropy_step(obj, entropy)

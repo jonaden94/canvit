@@ -341,8 +341,7 @@ def run_rollout(
         if eff_chunk == 1:
             (chunk_loss / n_glimpses / n_branches).backward()
             if n_glimpses > 1:
-                state = RecurrentState(canvas=gout.state.canvas.detach(),
-                                       recurrent_cls=gout.state.recurrent_cls.detach())
+                state = gout.state.detached()
                 chunk_loss = torch.zeros((), device=device)
 
         for t in range(1, n_glimpses):
@@ -438,8 +437,7 @@ def run_rollout(
                 (chunk_loss / n_glimpses / n_branches).backward()  # no retain_graph
                 chunk_pol = None
                 if not is_last:
-                    state = RecurrentState(canvas=gout.state.canvas.detach(),
-                                           recurrent_cls=gout.state.recurrent_cls.detach())
+                    state = gout.state.detached()
                     chunk_loss = torch.zeros((), device=device)
                 else:
                     state = gout.state
@@ -480,7 +478,7 @@ def run_rollout(
             "prime_on_policy": joint.policy_selector.prime_on_policy,
         }
         # The objective's own detached diagnostics (VPG: entropy / value / adv_std / the
-        # two loss terms). Empty for QReg/PG, which do not populate `last_step`.
+        # two loss terms; inline PG: the policy branch's entropy and alpha, set in end_rollout).
         # NB `reward_frac` is a genuine FRACTION only for the inline objectives; under VPG
         # the reward is the raw terminal `-per_image_loss`, so the series is on a different
         # scale (~-0.7 for the ade20k probe, not ~+0.03).
