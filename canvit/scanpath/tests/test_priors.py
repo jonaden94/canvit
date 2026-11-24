@@ -8,6 +8,7 @@ import torch
 from canvit.scanpath.priors import (
     CellBatch,
     cell_centres,
+    cell_log_mean,
     cell_log_probs,
     features,
     fit,
@@ -80,3 +81,18 @@ def test_fitting_never_lowers_the_training_likelihood():
 def test_image_average_is_mean_of_per_image_means():
     v, n = np.array([1.0, 3.0, 10.0]), np.array([0, 0, 1])
     assert image_average(v, n) == pytest.approx((2.0 + 10.0) / 2)
+
+
+def test_cell_log_mean_matches_the_per_cell_logsumexp():
+    """The bincount version equals the per-cell masks it replaced (also with a large dynamic range)."""
+    from scipy.special import logsumexp
+
+    from canvit.scanpath.models import _pixel_cells
+    rng = np.random.default_rng(0)
+    for h, w, frame in ((48, 80, None), (60, 45, None), (30, 50, (1050, 1680))):
+        cell, count = _pixel_cells(h, w, 64, 8, frame)
+        ld = rng.normal(0.0, 30.0, (h, w))
+        ref = np.zeros(len(count))
+        for c in np.unique(cell):
+            ref[c] = logsumexp(ld[cell == c]) - np.log(count[c])
+        assert np.allclose(cell_log_mean(ld, cell, count), ref, rtol=0, atol=1e-10)

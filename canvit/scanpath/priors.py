@@ -38,7 +38,6 @@ from pathlib import Path
 import numpy as np
 import torch
 from scipy.optimize import minimize
-from scipy.special import logsumexp
 
 log = logging.getLogger(__name__)
 
@@ -153,6 +152,19 @@ def image_average(v: np.ndarray, n: np.ndarray) -> float:
 
 
 # --------------------------------------------------------------------------------------- real data
+def cell_log_mean(log_density: np.ndarray, cell: np.ndarray, count: np.ndarray) -> np.ndarray:
+    """[G*G] log of the mean of exp(``log_density``) over each cell's pixels (``cell``: the pixels' cell index, as
+    models._pixel_cells; ``count``: pixels per cell). One bincount (helper_2's fast_cell_batch, 2026-11-24; the
+    per-cell masks it replaces were O(cells x pixels), 74 min on COCO-FreeView). Cells without pixels: 0, they are
+    masked by logcount = -inf (0 * -inf = nan)."""
+    ld = np.asarray(log_density, dtype=np.float64).ravel()
+    mx = ld.max()
+    s = np.bincount(np.asarray(cell).ravel(), weights=np.exp(ld - mx), minlength=len(count))
+    out, on = np.zeros(len(count)), np.asarray(count) > 0
+    out[on] = np.log(s[on]) + mx - np.log(np.asarray(count, dtype=np.float64)[on])
+    return out
+
+
 def cell_batch(model, stimuli, fixations, centre_bias) -> CellBatch:
     """A ``CellBatch`` from a ``GridScanpathModel``'s predictions on ``fixations`` (the scored ones: every
     fixation with a history, in ``models._scored_cells`` order) and the centre bias (a pysaliency model) the
@@ -168,14 +180,11 @@ def cell_batch(model, stimuli, fixations, centre_bias) -> CellBatch:
         hw = tuple(int(v) for v in stimuli.sizes[n])
         k = int(t[i])
         xy = torch.tensor(np.stack([fx.x_hist[i][:k], fx.y_hist[i][:k]], -1), dtype=torch.float64)
-        hist.append(pixel_to_scene(xy, hw=hw, scene=model.scene).numpy())
+        # the display frame as the predictions (None: the plain letterbox; framed predictions were misplaced before)
+        hist.append(pixel_to_scene(xy, hw=hw, scene=model.scene, frame=model.frame).numpy())
         if n not in cache:  # log of the mean centre-bias density over each cell's pixels
-            ld = centre_bias.log_density(stimuli.stimuli[n])
-            cell, count = _pixel_cells(hw[0], hw[1], model.scene, grid)
-            m = np.zeros(grid * grid)  # cells off the image: 0, they are masked by logcount = -inf (0 * -inf = nan)
-            for c in np.unique(cell):
-                m[c] = logsumexp(ld[cell == c]) - np.log(count[c])
-            cache[n] = m
+            cache[n] = cell_log_mean(centre_bias.log_density(stimuli.stimuli[n]),
+                                     *_pixel_cells(hw[0], hw[1], model.scene, grid, model.frame))
         log_cb.append(cache[n])
     return CellBatch(logits=logits, logcount=logcount, cell=cells, t=np.asarray(t), n=np.asarray(fx.n), hist=hist,
                      log_cb=np.stack(log_cb))
