@@ -359,6 +359,35 @@ def vpg_loss(
     }
 
 
+def sac_actor_loss(scores: Tensor, qmin: Tensor, *, alpha: Tensor | float) -> tuple[Tensor, Tensor]:
+    """SAC-Discrete actor objective at ONE state, eq. (12): pi^T [alpha log pi - min_i Q_i],
+    meaned over the batch. scores [B, A] (grad), qmin [B, A] the critics' min (no grad).
+    Returns (loss, entropy). Needs only the critics at s_t, so it is built per glimpse and
+    leaves with that glimpse's TBPTT chunk."""
+    logp = F.log_softmax(scores, dim=1)
+    p = logp.exp()
+    return (p * (alpha * logp - qmin)).sum(dim=1).mean(), -(p * logp).sum(dim=1).mean()
+
+
+def sac_critic_loss(
+    logp: Tensor, q1: Tensor, q2: Tensor, q1_tgt_next: Tensor, q2_tgt_next: Tensor,
+    flat_idx: Tensor, r: Tensor, *, alpha: Tensor | float, gamma: float,
+) -> tuple[Tensor, Tensor]:
+    """Twin-critic loss over a WHOLE episode, eq. (10): 1/2 sum_i (Q_i(s_t, a_t) - y_t)^2,
+    y_t = r_t + gamma pi(s_{t+1})^T [min_i Qbar_i(s_{t+1}) - alpha log pi(s_{t+1})] (the last
+    glimpse ends the episode: y = r), meaned over (b, t). logp [B, T, A] the policy's
+    log-probabilities (no grad), q1/q2 [B, T, A] (grad), q*_tgt_next [B, T-1, A] the TARGET
+    critics at s_1..s_{T-1}, flat_idx [B, T], r [B, T]. Returns (loss, y)."""
+    with torch.no_grad():
+        p = logp.exp()
+        v_next = (p[:, 1:] * (torch.min(q1_tgt_next, q2_tgt_next) - alpha * logp[:, 1:])).sum(dim=2)
+        y = r.clone()
+        y[:, :-1] += gamma * v_next
+    qa1 = q1.gather(2, flat_idx[..., None]).squeeze(2)
+    qa2 = q2.gather(2, flat_idx[..., None]).squeeze(2)
+    return 0.5 * (F.mse_loss(qa1, y) + F.mse_loss(qa2, y)), y
+
+
 def sac_loss(
     scores: Tensor,
     q1: Tensor,
@@ -371,23 +400,19 @@ def sac_loss(
     alpha: Tensor | float,
     gamma: float,
 ) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
-    """SAC-Discrete actor + twin-critic loss over a WHOLE episode, meaned over (b, t).
+    """SAC-Discrete actor + twin-critic loss over a WHOLE episode, meaned over (b, t): the sum
+    of :func:`sac_actor_loss` (meaned over t) and :func:`sac_critic_loss` -- the training path
+    builds the two parts separately (actor per glimpse, critics at the episode end).
 
     scores [B, T, A] (grad -> actor), q1/q2 [B, T, A] (grad -> critics), q*_tgt_next
     [B, T-1, A] the TARGET critics at s_1..s_{T-1} (no grad), flat_idx [B, T] the taken
     cells, r [B, T] the (scaled) rewards. The episode ends after the last glimpse."""
-    logp = F.log_softmax(scores, dim=2)
-    p = logp.exp()
-    with torch.no_grad():  # soft Bellman target, eq. (10): exact expectation over pi(.|s_{t+1})
-        v_next = (p[:, 1:] * (torch.min(q1_tgt_next, q2_tgt_next) - alpha * logp[:, 1:])).sum(dim=2)
-        y = r.clone()
-        y[:, :-1] += gamma * v_next
-    qa1 = q1.gather(2, flat_idx[..., None]).squeeze(2)
-    qa2 = q2.gather(2, flat_idx[..., None]).squeeze(2)
-    critic_loss = 0.5 * (F.mse_loss(qa1, y) + F.mse_loss(qa2, y))
-    actor_loss = (p * (alpha * logp - torch.min(q1, q2).detach())).sum(dim=2).mean()  # eq. (12)
-    entropy = -(p * logp).sum(dim=2).mean()
-    return actor_loss + critic_loss, entropy, {
-        "policy_entropy": entropy.detach(), "critic_loss": critic_loss.detach(),
-        "actor_loss": actor_loss.detach(), "q_sel": qa1.detach().mean(), "td_target": y.mean(),
+    B, T, A = scores.shape
+    qmin = torch.min(q1, q2).detach()
+    actor, entropy = sac_actor_loss(scores.reshape(B * T, A), qmin.reshape(B * T, A), alpha=alpha)
+    critic, y = sac_critic_loss(F.log_softmax(scores.detach(), dim=2), q1, q2, q1_tgt_next, q2_tgt_next,
+                                flat_idx, r, alpha=alpha, gamma=gamma)
+    return actor + critic, entropy, {
+        "policy_entropy": entropy.detach(), "critic_loss": critic.detach(),
+        "actor_loss": actor.detach(), "td_target": y.mean(),
     }

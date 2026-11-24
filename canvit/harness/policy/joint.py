@@ -44,7 +44,8 @@ from canvit.harness.policy.rl import (
     entropy_floor_step,
     pg_loss,
     qreg_loss,
-    sac_loss,
+    sac_actor_loss,
+    sac_critic_loss,
     standardize_reward,
     vpg_loss,
 )
@@ -93,6 +94,7 @@ class JointPolicy:
     critic: TwinCritic | None = None  # SAC only: twin soft-Q critics (canvas U-Nets)
     target_net: TwinCritic | None = None  # SAC only: their Polyak-averaged copy (no grad)
     critic_encoder: object | None = None  # SAC only: StateEncoder the critics read the canvas through
+    _sac_actor: list = field(default_factory=list)  # SAC: this rollout's per-glimpse actor losses (logging)
 
     def policy_parameters(self) -> list[nn.Parameter]:
         """Every parameter the policy optimizer group trains: the actor (scorer or policy
@@ -143,14 +145,29 @@ class JointPolicy:
         for bt, b in zip(self.target_net.buffers(), self.critic.buffers()):
             bt.copy_(b)
 
-    def episode_loss(self, *, scores: Tensor, flat_idx: Tensor, feats: list[Tensor], rewards: Tensor) -> Tensor:
-        """SAC's weighted loss for a WHOLE episode, meaned over (B, T). ``scores`` [B, T, A]
-        (grad), ``flat_idx`` [B, T], ``feats`` the T detached critic inputs (state t, before
-        action t), ``rewards`` [B, T] the raw fractional rewards."""
+    def sac_actor_step(self, *, scores: Tensor, feats: Tensor) -> Tensor:
+        """SAC's weighted actor loss at ONE policy state (eq. 12), meaned over the batch, with
+        the critics at that state (no grad) and the temperature fixed for the rollout. Built per
+        glimpse so it leaves with the glimpse's TBPTT chunk; the entropy is kept for the
+        temperature step in :meth:`sac_critic_step`."""
+        assert isinstance(self.objective, SAC) and self.critic is not None and self.log_alpha is not None
+        with torch.no_grad():
+            q1, q2 = self.critic(feats)
+            qmin = torch.min(q1, q2)
+        loss, entropy = sac_actor_loss(scores, qmin, alpha=self.log_alpha.exp())
+        self._rollout_entropies.append(entropy.detach())
+        self._sac_actor.append(loss.detach())
+        return self.rl_weight * loss
+
+    def sac_critic_step(self, *, logp: Tensor, flat_idx: Tensor, feats: list[Tensor], rewards: Tensor) -> Tensor:
+        """SAC's weighted twin-critic loss for the WHOLE episode (eq. 10), meaned over (B, T):
+        ``logp`` [B, T, A] the actor's detached log-probabilities, ``feats`` the T detached critic
+        inputs (state t, before action t), ``rewards`` [B, T] the raw fractional rewards. Then
+        the temperature's dual step on the episode's mean entropy (eq. 11)."""
         obj = self.objective
         assert isinstance(obj, SAC) and self.critic is not None and self.target_net is not None
         assert self.log_alpha is not None
-        B, T, A = scores.shape
+        B, T, A = logp.shape
         r = self._norm(-1).rescale(rewards.reshape(-1)).reshape(B, T)  # global scale, no shift
 
         def bta(q: Tensor, t: int) -> Tensor:  # [t*B, A] glimpse-major -> [B, t, A]
@@ -162,13 +179,16 @@ class JointPolicy:
                 t1, t2 = self.target_net(torch.cat(feats[1:], dim=0))
                 t1, t2 = bta(t1, T - 1), bta(t2, T - 1)
             else:
-                t1 = t2 = scores.new_zeros(B, 0, A)
+                t1 = t2 = logp.new_zeros(B, 0, A)
         alpha = self.log_alpha.exp()
-        loss, entropy, metrics = sac_loss(scores, bta(q1, T), bta(q2, T), t1, t2, flat_idx, r,
-                                          alpha=alpha, gamma=obj.gamma)
-        entropy_floor_step(log_alpha=self.log_alpha, entropy=entropy.detach(), target=obj.target_entropy,
+        loss, y = sac_critic_loss(logp, bta(q1, T), bta(q2, T), t1, t2, flat_idx, r, alpha=alpha, gamma=obj.gamma)
+        entropy = torch.stack(self._rollout_entropies).mean()
+        actor = torch.stack(self._sac_actor).mean()
+        self._rollout_entropies, self._sac_actor = [], []
+        entropy_floor_step(log_alpha=self.log_alpha, entropy=entropy, target=obj.target_entropy,
                            alpha_lr=obj.alpha_lr, alpha_min=SAC_ALPHA_MIN)
-        self.last_step = metrics | {"alpha": alpha.detach().float()}
+        self.last_step = {"policy_entropy": entropy.float(), "critic_loss": loss.detach(),
+                          "actor_loss": actor, "td_target": y.mean(), "alpha": alpha.detach().float()}
         return self.rl_weight * loss
 
     def branches(self, task_branches: list[ViewpointType]) -> list[ViewpointType]:
@@ -309,7 +329,7 @@ class JointPolicy:
         """Called by ``run_rollout`` after each policy branch. Takes the ``per_rollout``
         entropy dual step on the inline path; a no-op otherwise. Inline PG: also logs the
         policy branch's mean entropy and the entropy weight alpha (after the dual step)."""
-        if self._rollout_entropies:
+        if self._rollout_entropies and not isinstance(self.objective, SAC):
             obj = self.objective
             assert isinstance(obj, PG)
             self._entropy_step(obj, torch.stack(self._rollout_entropies).mean())

@@ -262,3 +262,42 @@ def test_distill_policy_group_holds_actor_and_critics():
     groups = DistillRunTask.trainable_param_groups(None, model=m, head=None, joint=joint, spec=spec)
     assert {id(p) for p in groups["policy"]} == {id(p) for p in joint.policy_parameters()}
     assert len(groups["policy"]) == len(list(joint.scorer.parameters())) + len(list(joint.critic.parameters()))
+
+
+# --- distill's own trajectory lengths (chunked TBPTT, stochastic length) --------------------------
+
+def test_policy_only_on_distill_keeps_the_tasks_sampled_lengths_and_chunking():
+    from canvit.distill.config import Config as DistillConfig
+    from canvit.distill.task import DistillRunTask
+    from canvit.harness.cli import resolve_spec
+    task = DistillRunTask(DistillConfig())
+    spec = resolve_spec(task, "policy_only", lr=4e-4, wd=1e-4)
+    tb = task.default_spec().bptt
+    assert spec.bptt == tb and spec.bptt.mode == "chunked" and spec.bptt.stochastic
+    assert not spec.train_backbone and spec.task_weight == 0.0 and spec.train_policy
+
+
+@pytest.mark.parametrize("tokens", [False, True])
+@pytest.mark.parametrize("rl_kw", [{"objective": "pg", "entropy_target": 4.0}, {"objective": "qreg"},
+                                   {"objective": "qreg", "qreg_extra_candidates": 2},
+                                   {"objective": "sac", "sac_target_entropy": 4.0}])
+def test_every_objective_under_distills_chunked_tbptt(tokens, rl_kw):
+    import random
+    m = _frozen(tokens)
+    joint = _build(m, **rl_kw)
+    joint.set_trainable(True)
+    r = run_rollout(
+        model=m, images=torch.randn(_B, 3, _IMG, _IMG), task=_task(),
+        selector=RandomSelector(is_foveated=False, foveated_scale=FoveatedScaleConfig(), min_viewpoint_scale=0.05),
+        bptt=BpttSpec(mode="chunked", chunk_size=2, continue_prob=0.9), branches=[ViewpointType.FULL],
+        canvas_grid_size=_G, amp_ctx=torch.enable_grad(), joint=joint, rng=random.Random(3))
+    assert r.n_glimpses >= 4  # several chunks
+    assert torch.isfinite(r.policy_metrics["policy_loss"])
+    assert _has_grad(joint.scorer.parameters())
+    if tokens:  # the stream learns from the decisions inside a chunk
+        assert _has_grad(m.policy_stream.parameters())
+    if joint.critic is not None:
+        assert _has_grad(joint.critic.parameters())
+        assert all(p.grad is None for p in joint.target_net.parameters())
+    trunk = [p for n, p in m.named_parameters() if not n.startswith(("policy_",))]
+    assert _no_grad(trunk)

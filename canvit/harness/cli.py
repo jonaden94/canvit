@@ -365,7 +365,14 @@ def resolve_spec(task: Any, preset: str, lr: float, wd: float,
     elif preset == "finetune":
         spec = TrainSpec.finetune(bptt=bptt_full)
     elif preset == "policy_only":
-        spec = TrainSpec.policy_only(bptt=bptt_none)
+        # A task that SAMPLES its trajectory length (distill: chunked TBPTT, chunk_size glimpses,
+        # extended while rand() < continue_prob) keeps its own lengths and chunking: the policy
+        # then sees the trajectories the model was trained on, and only one chunk of policy graph
+        # is alive at a time (a fixed 10-glimpse 'full' graph of the isolated policy stream did
+        # not fit a 32 GB GPU at batch 64; exp41, 2026-11-25). The frozen trunk records no graph.
+        # Fixed-horizon tasks (ade20k/in1k) keep 'none' as before.
+        task_bptt = task.default_spec().bptt
+        spec = TrainSpec.policy_only(bptt=task_bptt if task_bptt.stochastic else bptt_none)
     elif preset == "joint":
         spec = TrainSpec.joint()
     else:
