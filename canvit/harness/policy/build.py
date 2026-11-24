@@ -35,8 +35,8 @@ from canvit.core.policy import (
     fixation_candidates,
 )
 from canvit.harness.config import FoveatedScaleConfig, JointPolicyConfig
-from canvit.harness.policy.joint import JointPolicy
-from canvit.harness.policy.rl import PG, VPG, Objective, QReg, resolve_reward
+from canvit.harness.policy.joint import JointPolicy, TwinCritic
+from canvit.harness.policy.rl import PG, SAC, VPG, Objective, QReg, resolve_reward
 from canvit.harness.rollout.selector import PolicySelector, RandomSelector, TokenPolicySelector
 
 log = logging.getLogger(__name__)
@@ -88,7 +88,15 @@ def build_policy(
     vp_flat = cand.reshape(-1, 3).to(device)
 
     if rl.objective == "qreg":
-        obj: Objective = QReg(prime_on_policy=rl.prime_on_policy, dueling=rl.dueling)
+        obj: Objective = QReg(prime_on_policy=rl.prime_on_policy, dueling=rl.dueling,
+                              extra_candidates=rl.qreg_extra_candidates)
+    elif rl.objective == "sac":
+        n_tok_cells = getattr(getattr(canvit, "cfg", None), "n_policy_tokens", 0) and canvit.cfg.policy_grid ** 2
+        n_act = n_tok_cells or vp_flat.shape[0]  # policy tokens act on their policy_grid^2 cells
+        obj = SAC(gamma=rl.sac_gamma, target_tau=rl.sac_target_tau, alpha_init=rl.sac_alpha_init,
+                  alpha_lr=rl.alpha_lr,
+                  target_entropy=(0.98 * math.log(n_act) if rl.sac_target_entropy is None
+                                  else rl.sac_target_entropy))
     elif rl.objective == "vpg":
         obj = VPG(
             entropy_bonus=rl.vpg_entropy_bonus, reinforce_weight=rl.vpg_reinforce_weight,
@@ -122,30 +130,45 @@ def build_policy(
     # clip). Design: canvit_claude/canvit/active_pretraining/02-policy-tokens-design.md.
     n_tok = getattr(getattr(canvit, "cfg", None), "n_policy_tokens", 0)
     if n_tok:
-        if not isinstance(obj, PG):
-            raise ValueError(f"policy tokens are trained by PG only, got objective={rl.objective!r}")
+        if isinstance(obj, VPG):
+            raise ValueError("policy tokens are trained by pg / qreg / sac, not vpg (no value head)")
         # readonly/full: no detaching possible, the tokens are processed by the backbone;
         # isolated: detached by construction. run() checks the spec against the mode
         # (rl.feats_detached is ignored here; the spec is the one switch).
         grid = canvit.cfg.policy_grid
         tok_random = RandomSelector(
             is_foveated=is_foveated, foveated_scale=foveated_scale, min_viewpoint_scale=min_viewpoint_scale)
+        is_qreg = isinstance(obj, QReg)
         tok_sel = TokenPolicySelector(
             model=canvit, vp_flat=fixation_candidates(grid).reshape(-1, 3).to(device),
-            fallback=tok_random, mode="sample", generator=generator)
+            fallback=tok_random, mode="argmax" if is_qreg else "sample", generator=generator,
+            prime_on_policy=rl.prime_on_policy if is_qreg else 1.0,
+            values=is_qreg)  # QReg regresses the readout's unbounded values, not log p
         jp = JointPolicy(
             policy_selector=tok_sel, random_selector=tok_random,
             scorer=canvit.policy_parameters_module(),  # type: ignore[arg-type]
             objective=obj, rl_weight=rl.rl_weight, keep_random_branch=rl.keep_random_branch,
             second_branch=rl.second_branch,
-            target_momentum=rl.target_momentum, device=device, prime_target=1.0, prime_warmup=0,
+            target_momentum=rl.target_momentum, device=device,
+            prime_target=rl.prime_on_policy if is_qreg else 1.0,
+            prime_warmup=rl.policy_warmup_steps if is_qreg else 0,
             reward=reward,
         )
-        if obj.entropy_target is not None:
+        if isinstance(obj, PG) and obj.entropy_target is not None:
             alpha0 = obj.entropy_bonus if obj.alpha_init is None else obj.alpha_init
             jp.log_alpha = torch.tensor(math.log(alpha0), device=device)
-        log.info("policy: %d policy tokens (%s), %d^2 cells, PG", n_tok,
-                 canvit.cfg.policy_token_mode, grid)
+        if isinstance(obj, SAC):
+            if rl.centers_per_axis != grid:
+                raise ValueError(f"sac with policy tokens: the critics' cells must be the tokens' "
+                                 f"{grid}^2 cells; pass --cfg.rl.centers-per-axis {grid}")
+            # the tokens act on fixation cells (no scale dimension) whatever the patcher
+            _attach_sac_critics(jp, obj, canvit=canvit, rl=rl, feature_groups=feature_groups,
+                                device=device, n_scale=1, scales=(1.0,), action_space="fixation",
+                                scorer_input_norm=scorer_input_norm,
+                                encoder=StateEncoder(encode_model, canvas_grid=canvas_grid,
+                                                     feature_groups=feature_groups))
+        log.info("policy: %d policy tokens (%s), %d^2 cells, %s", n_tok,
+                 canvit.cfg.policy_token_mode, grid, type(obj).__name__)
         return jp
 
     # VPG is defined for the FOVEATED action space (autoreg_tryout only ever ran a foveated
@@ -177,9 +200,9 @@ def build_policy(
     # PG samples its action too (mode='sample'), so the same off-policy bias applies to it
     # whenever the scorer has its BatchNorm. Without the BatchNorm (scorer_input_norm='none')
     # the eval- and train-mode forwards are the same computation and nothing is biased.
-    if isinstance(obj, PG) and rl.select_bn_eval and scorer_input_norm == "batch":
+    if isinstance(obj, (PG, SAC)) and rl.select_bn_eval and scorer_input_norm == "batch":
         raise ValueError(
-            "objective='pg' requires --rl.no-select-bn-eval when the scorer has its input "
+            f"objective={rl.objective!r} requires --rl.no-select-bn-eval when the scorer has its input "
             "BatchNorm. PG SAMPLES its glimpse; with select_bn_eval=True the sample comes from "
             "an eval-mode BN forward while log pi is differentiated from the TRAIN-mode scores, "
             "so the REINFORCE gradient is off-policy and biased, exactly as for VPG below.")
@@ -234,7 +257,36 @@ def build_policy(
     if isinstance(obj, PG) and obj.entropy_target is not None:
         alpha0 = obj.entropy_bonus if obj.alpha_init is None else obj.alpha_init
         jp.log_alpha = torch.tensor(math.log(alpha0), device=device)
+    if isinstance(obj, SAC):
+        _attach_sac_critics(jp, obj, canvit=canvit, rl=rl, feature_groups=feature_groups, device=device,
+                            n_scale=n_scale, scales=scales, action_space=action_space,
+                            scorer_input_norm=scorer_input_norm, encoder=encoder)
     return jp
+
+
+def _attach_sac_critics(jp: JointPolicy, obj: SAC, *, canvit: Any, rl: JointPolicyConfig,
+                        feature_groups: tuple[str, ...], device: torch.device, n_scale: int,
+                        scales: Any, action_space: str, scorer_input_norm: str,
+                        encoder: StateEncoder) -> None:
+    """SAC's twin critics: two canvas U-Nets of the P2 scorer's architecture (no dueling
+    head: the whole map is Q(s, .)), whatever the actor is (a U-Net or policy tokens), with
+    a Polyak-averaged target copy, reading the DETACHED canvas features through ``encoder``.
+    They ride the policy param group, the sidecar and DDP sync with the actor."""
+    def _q() -> ViewpointScorer:
+        return ViewpointScorer(
+            canvas_dim=canvit.cfg.canvas_dim, width=rl.width, n_scale=n_scale, scales=scales,
+            centers_per_axis=rl.centers_per_axis, block_layers=rl.block_layers, groups=feature_groups,
+            dueling=False, action_space=action_space, readout=rl.policy_readout,
+            input_norm=scorer_input_norm,  # type: ignore[arg-type]
+        ).to(device)
+
+    import copy
+    jp.critic = TwinCritic(_q(), _q()).train()
+    jp.target_net = copy.deepcopy(jp.critic).requires_grad_(False)
+    jp.critic_encoder = encoder
+    jp.log_alpha = torch.tensor(math.log(obj.alpha_init), device=device)
+    log.info("SAC: twin canvas critics (%d params each), target entropy %.3f nats, gamma %.3f",
+             sum(p.numel() for p in jp.critic.q1.parameters()), obj.target_entropy, obj.gamma)
 
 
 def check_credit_regime(*, joint: Any, spec: Any) -> None:

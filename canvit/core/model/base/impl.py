@@ -371,6 +371,16 @@ class CanViT(nn.Module):
             spatial = spatial.detach()
         return self.policy_readout(state.policy_tokens, spatial)
 
+    def policy_values(self, state: RecurrentState) -> Tensor:
+        """Unbounded per-cell values [B, G^2] (fp32) from the same tokens, canvas and readout as
+        :meth:`policy_log_probs` (``PolicyTokenReadout.values``); for QReg."""
+        assert self.policy_readout is not None and state.policy_tokens is not None, (
+            "policy_values needs a model with n_policy_tokens > 0 and a state from it")
+        spatial = self.get_spatial(state.canvas)
+        if self.policy_stream is not None:  # isolated: the policy loss must not reach the canvas
+            spatial = spatial.detach()
+        return self.policy_readout.values(state.policy_tokens, spatial)
+
     def policy_parameters_module(self) -> nn.Module:
         """The module whose parameters are the POLICY's (optimizer group, separate clip, policy
         checkpoint state): the readout for "readonly"/"full" (the tokens' init stays with the

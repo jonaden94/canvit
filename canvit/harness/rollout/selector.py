@@ -361,6 +361,9 @@ class TokenPolicySelector:
     prime_on_policy: float = 1.0  # argmax mode only; 1.0 = pure argmax, no RNG
     generator: torch.Generator | None = None
     last_aux: dict | None = None
+    values: bool = False
+    """True (QReg): the scores are the readout's unbounded per-cell values
+    (``model.policy_values``) instead of log-probabilities."""
 
     def start_rollout(
         self, *, t0_type: ViewpointType, batch_size: int, device: torch.device
@@ -375,7 +378,8 @@ class TokenPolicySelector:
         if vp_type == ViewpointType.FULL:
             return self.fallback.select(
                 vp_type=vp_type, ctx=ctx, t=t, batch_size=batch_size, device=device, state=state)
-        logp = self.model.policy_log_probs(state)  # type: ignore[attr-defined]  # [B, A] fp32
+        logp = (self.model.policy_values(state) if self.values  # type: ignore[attr-defined]
+                else self.model.policy_log_probs(state))  # type: ignore[attr-defined]  # [B, A] fp32
         if self.mode == "sample":
             idx = torch.multinomial(logp.detach().exp(), 1, generator=self.generator).squeeze(1)
         else:

@@ -95,7 +95,7 @@ class JointPolicyConfig:
     branch counts; not combinable with ``keep_random_branch``."""
 
     # Objective
-    objective: Literal["qreg", "pg", "vpg"] = "qreg"
+    objective: Literal["qreg", "pg", "vpg", "sac"] = "qreg"
     """``qreg``/``pg``: the CanViT-PyTorch-RL recipes (per-glimpse fractional reward,
     EMA-standardized). ``vpg``: vanilla policy gradient with a learned V(s) baseline and a
     TERMINAL reward — the ``autoreg_tryout`` recipe (see :class:`~canvit.train.rl.VPG`).
@@ -125,6 +125,19 @@ class JointPolicyConfig:
     rollout on the entropy averaged over its decision steps."""
     policy_warmup_steps: int = 0
     """Steps to ramp prime_on_policy 0 -> its target (0 = constant target from step 0)."""
+    qreg_extra_candidates: int = 0
+    """``qreg``: dense QReg -- K extra random cells glimpsed (no grad) from each policy state
+    and regressed on with their measured rewards, besides the taken one. 0 = the recipe;
+    costs K more glimpse forwards per policy glimpse."""
+    sac_gamma: float = 0.99
+    """``sac``: discount of the soft Bellman target over glimpses (the paper's 0.99)."""
+    sac_target_tau: float = 0.005
+    """``sac``: Polyak rate of the target critics per training step (Haarnoja et al.)."""
+    sac_target_entropy: float | None = None
+    """``sac``: entropy the temperature steers the policy to, in nats. None = the paper's
+    0.98 * log|A| (near uniform). The temperature's step size is ``alpha_lr``."""
+    sac_alpha_init: float = 1.0
+    """``sac``: initial temperature (SAC's 1.0)."""
 
     # Reward, and how it is centred and scaled before it multiplies log pi (or is regressed,
     # QReg). "default" resolves to each objective's historical behaviour (see

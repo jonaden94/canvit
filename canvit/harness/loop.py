@@ -165,7 +165,7 @@ def apply_requires_grad(*, model: Any, head: Any, joint: Any, spec: TrainSpec) -
         if not spec.train_head:
             head.eval()
     if joint is not None:
-        joint.scorer.requires_grad_(spec.train_policy)
+        joint.set_trainable(spec.train_policy)  # the actor, and SAC's critics
 
 
 def run_training_loop(
@@ -215,7 +215,7 @@ def run_training_loop(
     # Model and policy gradients are clipped SEPARATELY, each to grad_clip (train/loop.py
     # 874-878): one joint norm over the union would couple their magnitudes, so a large
     # scorer gradient would shrink the model's update (and vice versa).
-    _scorer_ids = {id(p) for p in joint.scorer.parameters()} if joint is not None else set()
+    _scorer_ids = {id(p) for p in joint.policy_parameters()} if joint is not None else set()
     trainable = [p for g in optimizer.param_groups for p in g["params"] if id(p) not in _scorer_ids]
     core = getattr(model, "module", model)
     ema = EMATracker(ema_alpha) if ema_alpha > 0 else None
@@ -319,7 +319,7 @@ def run_training_loop(
         if joint is not None:
             if is_dist:  # the scorer carries its own reward standardizers -> its own hook
                 joint.allreduce_grads()
-            torch.nn.utils.clip_grad_norm_(joint.scorer.parameters(), grad_clip)
+            joint.clip_grads(grad_clip)  # the actor; SAC's critics separately
 
         is_log = on_log is not None and step % log_every == 0
         # Read grad norms AFTER clip and BEFORE optimizer.step() (grads persist until
@@ -329,6 +329,8 @@ def run_training_loop(
 
         optimizer.step()
         scheduler.step()
+        if joint is not None:
+            joint.after_optimizer_step()  # SAC's target-critic Polyak update; no-op otherwise
         t_gpu_total += time.perf_counter() - t1
 
         # Metrics that are EMA-smoothed before logging (train/loop.py logs ONLY EMAs

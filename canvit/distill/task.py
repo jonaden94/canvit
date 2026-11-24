@@ -377,7 +377,7 @@ class DistillRunTask:
             groups["backbone"] = [p for p in model.parameters() if id(p) not in scorer_ids]
         if spec.train_policy:
             assert joint is not None
-            groups["policy"] = list(joint.scorer.parameters())
+            groups["policy"] = joint.policy_parameters()  # actor (+ SAC critics)
         return groups
 
     # --- visualization (ported from train/loop.py; saved LOCALLY, never uploaded) ---

@@ -348,6 +348,17 @@ def run(*, task: RunTask, spec: TrainSpec, settings: RunSettings) -> dict:
                 raise ValueError(
                     "policy tokens are processed by the backbone, so the policy gradient reaches "
                     "it by construction: use --spec.policy-grad-to-backbone True")
+            if isolated and spec.bptt.mode == "none":
+                # bptt 'none' (a frozen model: --preset policy_only) runs every model forward
+                # under no_grad, and the isolated policy stream lives INSIDE that forward: only
+                # the readout would train, the stream and the token init never. 'full' is the
+                # same cadence (one backward per rollout) with grad on; the frozen trunk still
+                # records no graph (no parameter or input of it requires grad). Found 2026-11-24
+                # before the first exp41 run.
+                from dataclasses import replace as _replace
+                spec = _replace(spec, bptt=_replace(spec.bptt, mode="full"))
+                log.info("isolated policy tokens on a frozen model: bptt 'none' -> 'full' so the "
+                         "policy stream trains (horizon %s)", spec.bptt.horizon)
         elif hasattr(sel, "feats_detached") and sel.feats_detached != spec.feats_detached:
             log.warning("policy selector feats_detached=%s overridden to %s to match "
                         "spec.policy_grad_to_backbone=%s", sel.feats_detached, spec.feats_detached,
@@ -409,7 +420,8 @@ def run(*, task: RunTask, spec: TrainSpec, settings: RunSettings) -> dict:
     # stats are model buffers filled there from one shard (train/loop.py 583-585), and
     # after the resume/seed restore so the loaded state is what gets broadcast.
     if is_dist:
-        ddp.broadcast_parameters(model, joint.scorer if joint is not None else None)
+        ddp.broadcast_parameters(model, joint.scorer if joint is not None else None,
+                                 *((joint.critic, joint.target_net) if joint is not None else ()))
         log.info("DDP: broadcast parameters + buffers from rank 0")
     train_batches = _infinite(train_loader)
     selector = task.build_selector(device=device, canvas_grid=canvas_grid, is_foveated=is_foveated)

@@ -35,16 +35,29 @@ class PolicyTokenReadout(nn.Module):
         nn.init.zeros_(self.weight_proj.bias)
         self.bias = nn.Parameter(torch.zeros(n_tokens, n_heads, grid * grid))
 
-    def forward(self, tokens: Tensor, canvas_spatial: Tensor) -> Tensor:
-        """tokens [B, K, local_dim], canvas_spatial [B, grid^2, canvas_dim] -> log p [B, grid^2]."""
+    def _scores(self, tokens: Tensor, canvas_spatial: Tensor) -> tuple[Tensor, Tensor]:
+        """Per-map cell scores s [B, K, H, N] and the log map weights [B, K, H, 1] (fp32)."""
         B, K, _ = tokens.shape
         N = canvas_spatial.shape[1]
         assert K == self.n_tokens and N == self.grid ** 2, (K, N, self.n_tokens, self.grid)
+        t = self.token_norm(tokens.float())
+        q = self.q_proj(t).view(B, K, self.n_heads, self.head_dim)
+        k = self.canvas_norm(canvas_spatial.float()).view(B, N, self.n_heads, self.head_dim)
+        scores = torch.einsum("bkhd,bnhd->bkhn", q, k) / math.sqrt(self.head_dim) + self.bias
+        log_w = F.log_softmax(self.weight_proj(t).reshape(B, K * self.n_heads), dim=-1)
+        return scores, log_w.view(B, K, self.n_heads, 1)
+
+    def forward(self, tokens: Tensor, canvas_spatial: Tensor) -> Tensor:
+        """tokens [B, K, local_dim], canvas_spatial [B, grid^2, canvas_dim] -> log p [B, grid^2]."""
         with torch.autocast(device_type=tokens.device.type, enabled=False):
-            t = self.token_norm(tokens.float())
-            q = self.q_proj(t).view(B, K, self.n_heads, self.head_dim)
-            k = self.canvas_norm(canvas_spatial.float()).view(B, N, self.n_heads, self.head_dim)
-            scores = torch.einsum("bkhd,bnhd->bkhn", q, k) / math.sqrt(self.head_dim) + self.bias
-            log_maps = F.log_softmax(scores, dim=-1)                       # [B, K, H, N]
-            log_w = F.log_softmax(self.weight_proj(t).reshape(B, K * self.n_heads), dim=-1)
-            return torch.logsumexp(log_maps + log_w.view(B, K, self.n_heads, 1), dim=(1, 2))
+            scores, log_w = self._scores(tokens, canvas_spatial)
+            return torch.logsumexp(F.log_softmax(scores, dim=-1) + log_w, dim=(1, 2))
+
+    def values(self, tokens: Tensor, canvas_spatial: Tensor) -> Tensor:
+        """Unbounded per-cell values [B, grid^2] for value-regression objectives (QReg): the
+        same per-map scores, combined with the same map weights BEFORE any softmax,
+        Q(a) = sum_kh w_kh s[k,h,a]. ``forward`` mixes the maps as probabilities, which bounds
+        its output (log p <= 0, normalized); a regression target needs neither."""
+        with torch.autocast(device_type=tokens.device.type, enabled=False):
+            scores, log_w = self._scores(tokens, canvas_spatial)
+            return (log_w.exp() * scores).sum(dim=(1, 2))

@@ -278,7 +278,7 @@ class Ade20kRunTask:
             groups["head"] = list(model.head.parameters())
         if spec.train_policy:
             assert joint is not None
-            groups["policy"] = list(joint.scorer.parameters())
+            groups["policy"] = joint.policy_parameters()  # actor (+ SAC critics)
         return groups
 
     def resume_start_step(self, payload, scheduler):

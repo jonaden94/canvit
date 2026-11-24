@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 
 import torch
 import torch.distributed as dist
-from torch import Tensor
+from torch import Tensor, nn
 
 from canvit.core.policy import (
     ViewpointScorer,
@@ -34,6 +34,8 @@ from canvit.core.policy import (
 from canvit.harness.policy.rl import (
     ALPHA_MAX,
     PG,
+    SAC,
+    SAC_ALPHA_MIN,
     VPG,
     Objective,
     QReg,
@@ -42,11 +44,24 @@ from canvit.harness.policy.rl import (
     entropy_floor_step,
     pg_loss,
     qreg_loss,
+    sac_loss,
     standardize_reward,
     vpg_loss,
 )
 from canvit.harness.rollout.selector import PolicySelector, RandomSelector
 from canvit.harness.rollout.viewpoint import ViewpointType
+
+
+class TwinCritic(nn.Module):
+    """SAC's two soft-Q critics as ONE module (policy param group, sidecar, DDP sync)."""
+
+    def __init__(self, q1: nn.Module, q2: nn.Module):
+        super().__init__()
+        self.q1, self.q2 = q1, q2
+
+    def forward(self, feats: Tensor) -> tuple[Tensor, Tensor]:
+        b = feats.shape[0]
+        return self.q1(feats).reshape(b, -1), self.q2(feats).reshape(b, -1)
 
 
 @dataclass
@@ -75,6 +90,86 @@ class JointPolicy:
     ema_abs: dict[int, Tensor] = field(default_factory=dict)  # per-depth state of reward_scale='ema_abs'
     _rollout_entropies: list = field(default_factory=list)  # entropy_update='per_rollout' accumulator
     _logged_entropies: list = field(default_factory=list)  # inline PG: this rollout's entropies, for logging
+    critic: TwinCritic | None = None  # SAC only: twin soft-Q critics (canvas U-Nets)
+    target_net: TwinCritic | None = None  # SAC only: their Polyak-averaged copy (no grad)
+    critic_encoder: object | None = None  # SAC only: StateEncoder the critics read the canvas through
+
+    def policy_parameters(self) -> list[nn.Parameter]:
+        """Every parameter the policy optimizer group trains: the actor (scorer or policy
+        tokens) and, for SAC, the critics. The target critics are not trained."""
+        ps = list(self.scorer.parameters())
+        if self.critic is not None:
+            ps += list(self.critic.parameters())
+        return ps
+
+    def set_trainable(self, flag: bool) -> None:
+        self.scorer.requires_grad_(flag)
+        if self.critic is not None:
+            self.critic.requires_grad_(flag)
+
+    def clip_grads(self, max_norm: float) -> None:
+        """Actor and critics clipped SEPARATELY (two losses on disjoint parameters; one
+        joint norm would let a large critic gradient shrink the actor's step)."""
+        torch.nn.utils.clip_grad_norm_(self.scorer.parameters(), max_norm)
+        if self.critic is not None:
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm)
+
+    @property
+    def extra_candidates(self) -> int:
+        """Dense QReg: random extra cells glimpsed per policy state (0 = off)."""
+        return self.objective.extra_candidates if isinstance(self.objective, QReg) else 0
+
+    @property
+    def needs_step_rewards(self) -> bool:
+        """SAC: deferred to the episode end, but with the per-glimpse reward, the state
+        features and the taken cell buffered per glimpse (``run_rollout``)."""
+        return isinstance(self.objective, SAC)
+
+    @torch.no_grad()
+    def critic_feats(self, state: object) -> Tensor:
+        """The critics' (detached) input at a policy state."""
+        assert self.critic_encoder is not None
+        return self.critic_encoder(state).float()  # type: ignore[operator]
+
+    @torch.no_grad()
+    def after_optimizer_step(self) -> None:
+        """Polyak-update SAC's target critics (the loop calls this after every optimizer
+        step). A no-op for every other objective."""
+        if self.target_net is None:
+            return
+        assert self.critic is not None and isinstance(self.objective, SAC)
+        for pt, p in zip(self.target_net.parameters(), self.critic.parameters()):
+            pt.lerp_(p, self.objective.target_tau)
+        for bt, b in zip(self.target_net.buffers(), self.critic.buffers()):
+            bt.copy_(b)
+
+    def episode_loss(self, *, scores: Tensor, flat_idx: Tensor, feats: list[Tensor], rewards: Tensor) -> Tensor:
+        """SAC's weighted loss for a WHOLE episode, meaned over (B, T). ``scores`` [B, T, A]
+        (grad), ``flat_idx`` [B, T], ``feats`` the T detached critic inputs (state t, before
+        action t), ``rewards`` [B, T] the raw fractional rewards."""
+        obj = self.objective
+        assert isinstance(obj, SAC) and self.critic is not None and self.target_net is not None
+        assert self.log_alpha is not None
+        B, T, A = scores.shape
+        r = self._norm(-1).rescale(rewards.reshape(-1)).reshape(B, T)  # global scale, no shift
+
+        def bta(q: Tensor, t: int) -> Tensor:  # [t*B, A] glimpse-major -> [B, t, A]
+            return q.reshape(t, B, A).transpose(0, 1)
+
+        q1, q2 = self.critic(torch.cat(feats, dim=0))  # ONE forward per critic over the episode
+        with torch.no_grad():
+            if T > 1:
+                t1, t2 = self.target_net(torch.cat(feats[1:], dim=0))
+                t1, t2 = bta(t1, T - 1), bta(t2, T - 1)
+            else:
+                t1 = t2 = scores.new_zeros(B, 0, A)
+        alpha = self.log_alpha.exp()
+        loss, entropy, metrics = sac_loss(scores, bta(q1, T), bta(q2, T), t1, t2, flat_idx, r,
+                                          alpha=alpha, gamma=obj.gamma)
+        entropy_floor_step(log_alpha=self.log_alpha, entropy=entropy.detach(), target=obj.target_entropy,
+                           alpha_lr=obj.alpha_lr, alpha_min=SAC_ALPHA_MIN)
+        self.last_step = metrics | {"alpha": alpha.detach().float()}
+        return self.rl_weight * loss
 
     def branches(self, task_branches: list[ViewpointType]) -> list[ViewpointType]:
         """The rollout's branch t0 types: the task's, or with ``second_branch`` set one policy
@@ -110,11 +205,12 @@ class JointPolicy:
     # grads each step (else per-rank scorers drift + see √N grad noise, the head bug
     # task.py documents). RunningNorm stays per-rank (rl.py) — standardization is local.
     def broadcast(self, src: int = 0) -> None:
-        for t in list(self.scorer.parameters()) + list(self.scorer.buffers()):
+        mods = [m for m in (self.scorer, self.critic, self.target_net) if m is not None]
+        for t in [t for m in mods for t in list(m.parameters()) + list(m.buffers())]:
             dist.broadcast(t.data, src=src)
 
     def allreduce_grads(self) -> None:
-        for p in self.scorer.parameters():
+        for p in self.policy_parameters():
             if p.grad is not None:
                 dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
 
@@ -129,6 +225,10 @@ class JointPolicy:
         }
         if self.ema_abs:  # only reward_scale='ema_abs' has this state; absent key = historical sidecar
             sd["ema_abs"] = {d: v.detach().cpu() for d, v in self.ema_abs.items()}
+        if self.critic is not None:  # SAC only; absent keys = historical sidecar
+            assert self.target_net is not None
+            sd["critic"] = self.critic.state_dict()
+            sd["target_net"] = self.target_net.state_dict()
         return sd
 
     def load_state_dict(self, sd: dict) -> None:
@@ -139,6 +239,10 @@ class JointPolicy:
         if sd.get("log_alpha") is not None and self.log_alpha is not None:
             self.log_alpha = sd["log_alpha"].to(self.device)
         self.ema_abs = {int(d): v.to(self.device) for d, v in sd.get("ema_abs", {}).items()}
+        if self.critic is not None:
+            assert self.target_net is not None and "critic" in sd, "SAC resume: sidecar has no critics"
+            self.critic.load_state_dict(sd["critic"])
+            self.target_net.load_state_dict(sd["target_net"])
 
     def _norm(self, depth: int) -> RunningNorm:
         rn = self.running.get(depth)
@@ -153,7 +257,7 @@ class JointPolicy:
         policy aux and call :meth:`trajectory_loss` once at rollout end instead of
         :meth:`glimpse_loss` inside the loop (VPG, or PG with ``reward='terminal'``).
         False => the historical inline path."""
-        return isinstance(self.objective, VPG) or self.reward.kind == "terminal"
+        return isinstance(self.objective, (VPG, SAC)) or self.reward.kind == "terminal"
 
     @property
     def needs_value(self) -> bool:
@@ -276,7 +380,8 @@ class JointPolicy:
         return self.rl_weight * torch.stack(losses).mean()
 
     def glimpse_loss(self, *, depth: int, scores: Tensor, flat_idx: Tensor, reward: Tensor,
-                     mask: Tensor | None = None) -> Tensor:
+                     mask: Tensor | None = None, extra_idx: Tensor | None = None,
+                     extra_reward: Tensor | None = None) -> Tensor:
         """The weighted policy loss for ONE glimpse. ``scores`` [B, A] carries grad
         (the train-mode scorer forward); ``flat_idx`` [B] is the taken candidate;
         ``reward`` [B] is the raw fractional distill-MSE reduction (detached). ``mask``: as
@@ -298,6 +403,14 @@ class JointPolicy:
                     self._entropy_step(obj, entropy)
                 else:  # per_rollout: one step on the rollout's mean entropy, in end_rollout()
                     self._rollout_entropies.append(entropy.detach())
+        elif extra_idx is not None:  # dense QReg: the taken cell + K random cells, one MSE
+            assert extra_reward is not None and isinstance(obj, QReg)
+            B, K = extra_idx.shape
+            target = self._standardize(depth, torch.cat([reward, extra_reward.reshape(-1)]))
+            idx = torch.cat([flat_idx, extra_idx.reshape(-1)])
+            rows = torch.cat([torch.arange(B, device=scores.device),
+                              torch.arange(B, device=scores.device).repeat_interleave(K)])
+            loss, _ = qreg_loss(scores[rows], idx, target)
         else:
             target = self._standardize(depth, reward)
             loss, _ = qreg_loss(scores, flat_idx, target)
