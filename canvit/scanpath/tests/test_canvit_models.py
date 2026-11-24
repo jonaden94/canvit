@@ -120,7 +120,7 @@ def test_heatmap_readout_needs_no_policy(fake_cs18):
 
 # --- a non-search task: the same episode for any task's policy (design §12) --------------------------
 
-def _in1k_episode():
+def _in1k_episode(n_classes: int = 10):
     """A tiny FOVEATED in1k classifier with its policy, built by the task's own constructors."""
     from dataclasses import replace
 
@@ -129,7 +129,7 @@ def _in1k_episode():
     from canvit.in1k.task import In1kRunTask
     from canvit.search.tests.test_search_task import _FOVEATED
     torch.manual_seed(0)
-    clf = CanViTForImageClassification(backbone_name="vits16", model_config=_FOVEATED, n_classes=10,
+    clf = CanViTForImageClassification(backbone_name="vits16", model_config=_FOVEATED, n_classes=n_classes,
                                        glimpse_grid_size=8).eval()
     task = In1kRunTask(replace(In1kConfig(), canvas_grid=8), total_steps=1)
     assert task.is_foveated(clf)
@@ -208,6 +208,40 @@ def test_a_checkpoint_without_run_config_is_refused(tmp_path):
     torch.save({"model_state": {}, "metadata": {}}, ckpt)
     with pytest.raises(ValueError, match="no run config"):
         PolicyEpisode.load(ckpt, device=torch.device("cpu"), need_policy=True)
+
+
+def test_a_non_search_checkpoint_loads_and_scores_human_scanpaths(fake_search, tmp_path):
+    """A checkpoint as the harness writes it for a non-search task (in1k: no cue, square training frame, the
+    policy in ``policy_state``) builds the same episode, and its predictions score in pysaliency."""
+    from canvit.harness.cli import command_from_run_config, run_config_of
+    from canvit.harness.infra.checkpoint import save_checkpoint
+    from canvit.scanpath.canvit_models import precompute
+    from canvit.scanpath.data import make_scanpath_loader, parse_display_frame
+    from canvit.scanpath.evaluate import training_display_frame
+    ep = _in1k_episode(n_classes=1000)  # in1k rebuilds its head with the config's 1000 classes
+    argv = ["in1k", "--cfg.canvas-grid", "8", "--cfg.device", "cpu", "--cfg.no-amp"]
+    cmd, _ = command_from_run_config({"argv": argv})
+    opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1)
+    ckpt = save_checkpoint(tmp_path / "best.pt", model=ep.model, optimizer=opt,
+                           scheduler=torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 1.0), step=1, task_name="in1k",
+                           spec=ep.task.default_spec(), model_config=ep.task.model_config(ep.model), joint=ep.joint,
+                           metadata={"run_config": run_config_of(cmd, argv), "pretrain_view_scale": {
+                               "mode": "fixed", "fixed_scale": ep.task.cfg.foveated_scale.fixed_scale}},
+                           update_latest=False)
+    loaded = PolicyEpisode.load(ckpt, device=torch.device("cpu"), need_policy=True)
+    assert loaded.task.name == "in1k" and not loaded.is_search and loaded.amp is False
+    batch = _batch(torch.zeros(B, 3, 2)) | {"cue": torch.full((B,), -1)}
+    assert torch.equal(loaded.run(batch, n=2)["policy"], ep.run(batch, n=2)["policy"])
+    assert training_display_frame("in1k")[0] == "scene"
+    # human search trials (with cues) through a model that takes none: the cue is ignored, no cue mixture
+    _, _, sv, fv = fake_search
+    scene = loaded.task.cfg.scene_size
+    loader = make_scanpath_loader(sv, fv, scene_size=scene, batch_size=4, num_workers=0,
+                                  frame=parse_display_frame("scene"))
+    model = precompute(CanViTModel(loaded, "policy"), loader, grid=16, scene_size=scene)  # the policy's grid, not 32
+    fx = fv[fv.scanpath_history_length > 0]
+    assert set(model.logits) == set(zip(fx.scanpath_index.tolist(), fx.scanpath_history_length.tolist()))
+    assert np.isfinite(model.log_likelihoods(sv, fx)).all()
 
 
 # --- free viewing with a search model: the uniform mixture over the cues ------------------------------
