@@ -1351,7 +1351,38 @@ def retina_figure(results: Path, recs: list[dict], out: Path) -> dict[str, str]:
     return macros
 
 
-def checkpoint_summary(e: dict, recs: list[dict], out: Path) -> bool:
+COST_SETS = {"tp": "COCO-Search18 TP", "ta": "COCO-Search18 TA", "fv": "COCO-FreeView"}
+COST_COLS = ["data", r"IG@$\tau$ ($\tau$)", "+ log cost: IG (gain)", r"$\tau$", "+ linear+log: IG (gain)", r"$\tau$",
+             r"best $\tau$ log (val)"]
+
+
+def saccade_cost_rows(results_dir: Path) -> tuple[str, list[list[str]], str] | None:
+    """helper_2's post-hoc saccade cost for one checkpoint, <records dir>/saccade_cost.json written by
+    ``python -m canvit.scanpath.saccade_cost`` (schema agreed 2026-11-24; all IG on validation, over the centre
+    bias, bits/fix): (key line, table rows per focus set, one line with the shared cost fit); None without it."""
+    f = results_dir / "saccade_cost.json"
+    if not f.exists():
+        return None
+    sc = json.loads(f.read_text())
+
+    def v(d: dict, k: str, fmt: str) -> str:
+        return format(d[k], fmt) if d.get(k) is not None else "—"
+    rows = []
+    for key, title in COST_SETS.items():
+        d = sc["per_dataset"].get(key)
+        if d is None:
+            continue
+        rows.append([title, f"{v(d, 'ig_tau', '.2f')} ({v(d, 'tau', '.1f')})",
+                     f"{v(d, 'ig_log', '.2f')} ({v(d, 'gain_log', '+.2f')})", v(d, "tau_log", ".1f"),
+                     f"{v(d, 'ig_linlog', '.2f')} ({v(d, 'gain_linlog', '+.2f')})", v(d, "tau_linlog", ".1f"),
+                     v(d, "best_tau_log_val", ".1f")])
+    lg, ll = sc["fit"].get("log", {}), sc["fit"].get("linlog", {})
+    fit = (f"shared fit: log a = {v(lg, 'a', '.3g')} ± {v(lg, 'a_se', '.2g')}; linear+log a = {v(ll, 'a', '.3g')} "
+           f"± {v(ll, 'a_se', '.2g')}, b = {v(ll, 'b_per_deg', '.3g')} ± {v(ll, 'b_se', '.2g')} per deg")
+    return sc["key_line"], rows, fit
+
+
+def checkpoint_summary(e: dict, recs: list[dict], out: Path, results: Path | None = None) -> bool:
     """One page per checkpoint entry (load_checkpoints) -> <out>/<slug>.{pdf,md}, slug = name with / -> __.
     Top: the entry (label, props, search score). Table: FOCUS sets x {CanViT (IG, IG at fitted tau, tau, LL, AUC,
     NSS), centre bias, uniform, DeepGaze III}. Middle: IG over the centre bias vs temperature (temperature_sweep)
@@ -1386,8 +1417,25 @@ def checkpoint_summary(e: dict, recs: list[dict], out: Path) -> bool:
             if r is not None]
     sacc = [(t, x) for t, x in sacc if x is not None]
     ncol = max(len(sweeps), len(sacc), 1)
-    fig = plt.figure(figsize=(TEXTWIDTH_IN, 8.6), layout="constrained")
-    sf_tab, sf_tau, sf_sac = fig.subfigures(3, 1, height_ratios=[0.17 * len(rows) + 0.75, 1.9, 3.4])
+    cost = saccade_cost_rows(results / e["name"]) if results is not None else None
+    fig = plt.figure(figsize=(TEXTWIDTH_IN, 9.0), layout="constrained")
+    sf_tab, sf_cost, sf_tau, sf_sac = fig.subfigures(
+        4, 1, height_ratios=[0.17 * len(rows) + 0.75, 0.17 * len(cost[1]) + 0.75 if cost else 0.3, 1.8, 3.2])
+    ax = sf_cost.subplots()
+    ax.axis("off")
+    if cost is None:
+        ax.text(0.01, 0.5, "saccade cost: not run", fontsize=FS - 1, va="center")
+    else:
+        sf_cost.suptitle(f"post-hoc saccade cost: {cost[0]}", x=0.01, ha="left", fontsize=FS)
+        tb = ax.table(cellText=cost[1], colLabels=COST_COLS, bbox=[0, 0.22, 1, 0.78], cellLoc="right",
+                      edges="horizontal")
+        ax.text(0.0, 0.0, cost[2], fontsize=FS - 2, transform=ax.transAxes)
+        tb.auto_set_font_size(False)
+        tb.set_fontsize(FS - 1)
+        tb.auto_set_column_width(range(len(COST_COLS)))
+        for (i, j), cell in tb.get_celld().items():
+            if j < 1:
+                cell.set_text_props(ha="left")
     props = ", ".join(f"{k} {v:.4g}" if isinstance(v, float) else f"{k} {v}" for k, v in e["props"].items())
     found = (f"\ntargets found within 3 fixations {e['search']['found_t3_policy']:.2f}"
              if e["search"] and "found_t3_policy" in e["search"] else "")
@@ -1456,7 +1504,11 @@ def checkpoint_summary(e: dict, recs: list[dict], out: Path) -> bool:
             "IG@τ: at the temperature fitted on 2000 training scanpaths (diagnostic). *: scanpaths end at the first "
             "target fixation (TP test as redistributed; TP val cut the same way, against the centre bias of the cut "
             "scanpaths).", ""]
-    (out / f"{slug}.md").write_text("\n".join(head + md) + "\n")
+    tail = (["", "## Post-hoc saccade cost", "", cost[0], "",
+             "| " + " | ".join(c.replace("$\\tau$", "τ").replace("$", "") for c in COST_COLS) + " |",
+             "|" + "---|" * len(COST_COLS), *("| " + " | ".join(r) + " |" for r in cost[1]), "", cost[2]]
+            if cost else ["", "Saccade cost: not run."])
+    (out / f"{slug}.md").write_text("\n".join(head + md + tail) + "\n")
     return True
 
 
@@ -1967,7 +2019,7 @@ def main() -> None:
         if missing:
             raise SystemExit(f"--summary: not in {a.results / 'checkpoints.json'}: {sorted(missing)}")
         for e in pick:
-            checkpoint_summary(e, recs, a.out / "summaries")
+            checkpoint_summary(e, recs, a.out / "summaries", a.results)
         return
     sv, fv = dataset("coco_search18", "validation")
     example_trials(sv, fv, figs)
