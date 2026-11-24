@@ -72,8 +72,10 @@ class ScanpathConfig:
     """COCO-Search18 TP: score each scanpath only up to its first fixation on the target
     (:func:`cut_at_first_target_fixation`), the format of the redistributed test split (HAT/Gazeformer), so that
     validation and test are comparable. The centre bias is then the KDE of the cut fixations too."""
-    grid: int = 32
-    """Cells per axis the CanViT models predict on (the search policy's 32x32)."""
+    grid: int | None = None
+    """Cells per axis of the CanViT model's predictions: None = the model's own grid (the search policy's 32x32;
+    another task's policy may use another, e.g. ``rl.centers_per_axis``). A value is a check: a model on another
+    grid is refused (``CanViTModel.forced_logits``), never resampled."""
     scene_size: int = 512
     display_frame: str | None = None
     """How a stimulus is placed in the scene: ``"scene"`` fills the scene as far as its aspect allows; ``"<W>x<H>"``

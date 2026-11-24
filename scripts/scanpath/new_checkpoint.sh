@@ -8,7 +8,7 @@
 #   3-4 GPU jobs (one A100 each, grete:shared, --qos=2h, < 2 h each; slurm/runs/scanpath/eval_checkpoint.sbatch):
 #     CS18 TP + TA validation | CS18 TP + TA test | COCO-FreeView val | the search eval (search checkpoints only)
 #   1 CPU job after all of them succeed (standard96s:test, < 1 h): CS18 TP validation cut at the first target fixation
-#     (CUT=1, comparable with the test split) and the summary -> $LOGS_DIR/scanpath_eval/<name>/summary/.
+#     (CUT=1, comparable with the test split) and the summary -> $LOGS_DIR/scanpath_eval/<name>/summaries/<slug>.*
 # Finished records are skipped, so re-running after a failure redoes only what is missing. The jobs run the clone's
 # working tree: do not edit canvit/scanpath until they are done. DRY=1: print the sbatch commands only.
 # Written by Claude (AI, Claude Opus 5.5), 2026-11-24.
@@ -40,5 +40,5 @@ j3=$(run sbatch --job-name="fv_$NAME" $S "$CKPT" "$NAME" coco_freeview)
 j4=$(run sbatch --job-name="sum_$NAME" --account=nim00018 --partition=standard96s:test --time=00:59:00 \
   --cpus-per-task=16 --mem=64G --dependency="afterok:$j1:$j2:$j3$deps" --output="logs/scanpath_eval/slurm/%x-%j.out" \
   --wrap="source ./.envrc && CUT=1 PROCESSES=16 bash scripts/scanpath/eval_checkpoint.sh $CKPT $NAME coco_search18:tp \
-&& $PY scripts/scanpath/figures.py --out $OUT/summary --summary $NAME --png")
+&& $PY scripts/scanpath/figures.py --out $OUT --summary $NAME --png")
 echo "$NAME ($task): GPU jobs ${j0:-} $j1 $j2 $j3, summary job $j4"

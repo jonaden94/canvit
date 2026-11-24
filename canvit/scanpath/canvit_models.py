@@ -286,13 +286,14 @@ class CanViTModel:
         return f"canvit_{getattr(self.episode.task, 'name', '?')}_{self.readout}" + ("_cuemix" if self.cue_mixture
                                                                                      else "")
 
-    def forced_logits(self, batch: dict, n: int, grid: int) -> Tensor:
+    def forced_logits(self, batch: dict, n: int, grid: int | None = None) -> Tensor:
+        """[B, n, G*G] logits on the model's own G x G grid; ``grid`` (if given) must be G."""
         if self.cue_mixture:
             logits = self.mixed_logits(batch, n)
         else:
             logits = self.episode.run(batch, n)[self.readout]
         g = int(round(logits.shape[-1] ** 0.5))
-        if g != grid:
+        if grid is not None and g != grid:
             raise ValueError(f"the {self.readout} predicts on a {g}x{g} grid but --cfg.grid is {grid}: "
                              f"compare all models at the model's grid (--cfg.grid {g})")
         return logits
@@ -320,10 +321,11 @@ class CanViTModel:
         return torch.where(on, mix - math.log(K), 0.0).float()
 
 
-def precompute(model: CanViTModel, loader, *, grid: int, scene_size: int, frame: tuple[int, int] | None = None):
+def precompute(model: CanViTModel, loader, *, grid: int | None = None, scene_size: int, frame: tuple[int, int] | None = None):
     """Run the teacher-forced episode over every scanpath once (batched) and hand the predictions to
     pysaliency as a :class:`~canvit.scanpath.models.GridScanpathModel`, keyed by pysaliency's
-    ``(scanpath_index, history length)``: every fixation t >= 1 of every scanpath gets one."""
+    ``(scanpath_index, history length)``: every fixation t >= 1 of every scanpath gets one. ``grid``: None = the
+    model's own grid, else a check (:meth:`CanViTModel.forced_logits`)."""
     from .models import GridScanpathModel
     table: dict[tuple[int, int], Any] = {}
     for batch in loader:

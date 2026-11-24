@@ -238,7 +238,10 @@ def test_a_non_search_checkpoint_loads_and_scores_human_scanpaths(fake_search, t
     scene = loaded.task.cfg.scene_size
     loader = make_scanpath_loader(sv, fv, scene_size=scene, batch_size=4, num_workers=0,
                                   frame=parse_display_frame("scene"))
-    model = precompute(CanViTModel(loaded, "policy"), loader, grid=16, scene_size=scene)  # the policy's grid, not 32
+    model = precompute(CanViTModel(loaded, "policy"), loader, scene_size=scene)  # the policy's own grid (16, not 32)
+    assert {v.size for v in model.logits.values()} == {16 * 16}
+    with pytest.raises(ValueError, match="predicts on a 16x16 grid but --cfg.grid is 32"):
+        precompute(CanViTModel(loaded, "policy"), loader, grid=32, scene_size=scene)  # a given grid is a check
     fx = fv[fv.scanpath_history_length > 0]
     assert set(model.logits) == set(zip(fx.scanpath_index.tolist(), fx.scanpath_history_length.tolist()))
     assert np.isfinite(model.log_likelihoods(sv, fx)).all()
