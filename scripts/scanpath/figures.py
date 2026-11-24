@@ -1243,6 +1243,119 @@ def retina_figure(results: Path, out: Path) -> dict[str, str]:
     return macros
 
 
+STRIP_RETINAS = ["cmf0.75_res65_cps6", "cmf2.2_res65_cps6", "cmf7.7_res65_cps6"]  # resolution fixed, cmf varies
+# The exp39 backbone's retina (eval log: "fov=50.0", "fixed_scale=2.0", knngridsampler = fovi's 'pooling' sampler).
+GLIMPSE_FOV, GLIMPSE_SCALE = 50.0, 2.0
+
+
+def glimpse_image(scene01: np.ndarray, xy: np.ndarray, retina: str, box, px: int = 320) -> np.ndarray:
+    """What ``retina`` samples with the fixation at scene point ``xy`` ((x, y) in [-1, 1]): the scene ([3, S, S],
+    [0, 1]) through fovi's RetinalTransform built as the backbone builds it (canvit.core.patcher.foveated), drawn
+    over ``box`` = (x0, y0, x1, y1) in scene coordinates ([~px * h / w, px, 3]; the glimpse window is GLIMPSE_SCALE
+    scenes wide); every display pixel takes its nearest retinal sample."""
+    import re
+
+    from scipy.spatial import cKDTree
+
+    from canvit.core.foveation.retina import RetinalTransform
+    m = re.fullmatch(r"cmf([\d.]+)_res(\d+)_cps\d+", retina)
+    S = scene01.shape[-1]
+    rt = RetinalTransform(resolution=int(m[2]), start_res=S, fov=GLIMPSE_FOV, cmf_a=float(m[1]), sampler="pooling",
+                          fixation_size=S, device="cpu")
+    win = GLIMPSE_SCALE * S
+    loc = torch.tensor([[(xy[1] + 1) / 2, (xy[0] + 1) / 2]], dtype=torch.float32)  # fovi: (row, col) in [0, 1]
+    # Where each sample reads: pool coordinate ramps (x, y, 1) through the same retina (sampling is linear), so no
+    # assumption about fovi's coordinate conventions or lens mapping; samples mostly off the scene are dropped.
+    ramp = torch.linspace(-1, 1, S)
+    probe = torch.stack([ramp[None].expand(S, S), ramp[:, None].expand(S, S), torch.ones(S, S)])
+    with torch.no_grad():
+        s, pos = (rt(v[None].float(), fix_loc=loc, fixation_size=torch.tensor([[win, win]]))[0].T.numpy()
+                  for v in (torch.from_numpy(scene01), probe))  # [N, 3] each
+    on = pos[:, 2] > 0.5
+    x0, y0, x1, y1 = (float(v) for v in box)
+    py = max(1, round(px * (y1 - y0) / (x1 - x0)))
+    gx, gy = x0 + (np.arange(px) + 0.5) / px * (x1 - x0), y0 + (np.arange(py) + 0.5) / py * (y1 - y0)
+    q = np.stack(np.meshgrid(gx, gy), -1).reshape(-1, 2)  # display pixels, scene coords (x, y)
+    return s[on][cKDTree(pos[on, :2] / pos[on, 2:]).query(q)[1]].clip(0, 1).reshape(py, px, 3)
+
+
+def retina_strips(results: Path, out: Path, steps=(1, 2, 3, 4), n_trials: int = 2, seed: int = 0) -> bool:
+    """Qualitative retina sweep on COCO-Search18 TP validation, FoAViS appendix style: per trial (seed) a block with
+    rows = retinas (STRIP_RETINAS, the trained one first); column 0 = what the retina samples at the start fixation;
+    columns t = the policy's teacher-forced density for fixation t after the human's fixations 0..t-1 (one colour
+    scale per column across the rows; earlier fixations white +, the human's fixation t cyan +); last column = the
+    human scanpath. Target box yellow."""
+    from pysaliency.external_datasets.coco_search18 import TASKS
+
+    from canvit.core.preprocess import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
+    from canvit.scanpath.data import ScanpathDataset
+    models = {}
+    for name in STRIP_RETINAS:
+        p = next(iter(results.glob(f"*/retina/{name}/coco_search18_tp_validation.json")), None)
+        if p is None or not p.with_suffix(".npz").exists():
+            print(f"retina_strips: no predictions for {name}")
+            return False
+        r = json.loads(p.read_text())
+        st, fx, models[name] = predictions({"path": p, "protocol": r["protocol"], "dataset": "coco_search18"})
+    sp = fx.scanpaths
+    L = np.asarray(sp.length)
+    ok = [i for i in range(len(L)) if L[i] > max(steps) and all((i, t) in m.logits for m in models.values()
+                                                                    for t in steps)]
+    trials = np.sort(np.random.default_rng(seed).choice(ok, n_trials, replace=False))
+    m0 = models[STRIP_RETINAS[0]]
+    ds = ScanpathDataset(st, fx, scene_size=m0.scene, frame=m0.frame)
+    mean, std = (np.asarray(v, np.float32)[:, None, None] for v in (IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD))
+    h0, w0 = (int(v) for v in st.sizes[int(sp.n[trials[0]])])
+    nr, nc = len(STRIP_RETINAS), len(steps) + 2
+    tile_w = (TEXTWIDTH_IN - 0.45) / nc
+    fig = plt.figure(figsize=(TEXTWIDTH_IN, n_trials * (nr * tile_w * h0 / w0 + 0.55)), layout="constrained")
+    fig.get_layout_engine().set(w_pad=0.01, h_pad=0.02, wspace=0.01, hspace=0.01)
+    for sf, i in zip(fig.subfigures(n_trials, 1, hspace=0.04), trials):
+        n = int(sp.n[i])
+        img, hw = st.stimuli[n], tuple(int(v) for v in st.sizes[n])
+        x, y = np.asarray(sp.xs[i])[: L[i]], np.asarray(sp.ys[i])[: L[i]]
+        box = np.asarray(sp.scanpath_attributes["target_bbox"][i])  # xywh pixels
+        item = ds[int(i)]
+        scene01 = (item["image"].numpy() * std + mean).clip(0, 1)
+        dens = {t: [np.exp(grid_log_density(m.logits[(int(i), t)], hw=hw, scene=m.scene, frame=m.frame))
+                    for m in models.values()] for t in steps}
+        gs = sf.add_gridspec(nr, nc)
+        cbox = item["content"].numpy()  # the image in scene coordinates (x0, y0, x1, y1)
+        sf.suptitle(f"cue '{TASKS[int(st.attributes['task'][n])]}' (scanpath {int(i)})", x=0.01, ha="left")
+        for row, name in enumerate(STRIP_RETINAS):
+            ax = sf.add_subplot(gs[row, 0])
+            f0 = item["fix"][0].numpy()
+            ax.imshow(glimpse_image(scene01, f0, name, cbox), extent=(cbox[0], cbox[2], cbox[3], cbox[1]))
+            mark_fixation(ax, f0[0], f0[1], current=False, s=18, lw=0.7)
+            cmf = name.split("_")[0][3:]
+            ax.set_ylabel(f"cmf {cmf}" + ("\n(trained)" if name == TRAINED_RETINA else ""))
+            if row == 0:
+                ax.set_title("retina view\nat fixation 0")
+            for col, t in enumerate(steps, 1):
+                ax = sf.add_subplot(gs[row, col])
+                ax.imshow(img)
+                ax.imshow(dens[t][row], cmap="magma", alpha=0.7, vmin=0, vmax=max(d.max() for d in dens[t]))
+                ax.add_patch(plt.Rectangle(box[:2], box[2], box[3], fill=False, ec=OKABE_ITO["yellow"], lw=0.6))
+                mark_fixation(ax, x[:t], y[:t], current=False, s=18, lw=0.7)
+                mark_fixation(ax, x[t], y[t], current=True, s=24, lw=0.8)
+                if row == 0:
+                    ax.set_title(f"fixation {t}" + ("\n(beyond training)" if t > TRAINED_FIXATIONS else "\n"))
+        ax = sf.add_subplot(gs[:, -1])
+        ax.imshow(img)
+        ax.add_patch(plt.Rectangle(box[:2], box[2], box[3], fill=False, ec=OKABE_ITO["yellow"], lw=0.6))
+        ax.plot(x, y, color="white", lw=0.6)
+        mark_fixation(ax, x, y, current=False, s=18, lw=0.7)
+        for k, (a, b) in enumerate(zip(x, y)):
+            ax.annotate(str(k), (a, b), xytext=(3, 3), textcoords="offset points", color="white", fontsize=FS - 2)
+        ax.set_title(f"human scanpath\n({L[i]} fixations)")
+        for ax in sf.axes:
+            ax.set(xticks=[], yticks=[])
+            for s_ in ax.spines.values():
+                s_.set_visible(False)
+    save(fig, out / "retina_strips.pdf")
+    return True
+
+
 # --------------------------------------------------------------------------------------- temperature sweep
 TAU_EVALS = [("coco_search18", "tp_validation", "COCO-Search18 TP"), ("coco_search18", "ta_validation",
              "COCO-Search18 TA"), ("coco_freeview", "validation", "COCO-FreeView")]  # FOCUS only (MIT1003 dropped)
@@ -1642,6 +1755,7 @@ def main() -> None:
     priors_index_figure(recs, a.results, figs)
     res_macros |= temperature_figure(recs, figs)
     res_macros |= retina_figure(a.results, figs)
+    retina_strips(a.results, figs)
 
     sacc = {}
     for slug, cond, title in PANELS:
