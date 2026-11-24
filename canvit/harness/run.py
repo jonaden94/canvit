@@ -105,6 +105,12 @@ class RunSettings:
     model. Distinct from ``resume`` (full state, continues the step count), which takes
     priority: resume > seed_ckpt > fresh. Task-level HF seeding (distill's
     ``cfg.hf_seed_ckpt``, ade20k/in1k's ``cfg.model_repo``) happens in ``build_model``."""
+    resume_from: Path | None = None
+    """Continue ANOTHER run's checkpoint in this run's directory: full state (weights, AdamW,
+    step count, LR-schedule position, shard schedule) as if this run had resumed it, used
+    only while this run has no checkpoint of its own (later array tasks resume their own).
+    The LR is then this run's config (base lr, schedule shape), so this is how an LR decay
+    continues a run. W&B: a new run forked from the source run at the checkpoint's step."""
     compile: bool = False        # torch.compile the model after build (perf)
     run_dir: Path | None = None
     """Root for this run's artifacts (`{run_dir}/checkpoints`, `{run_dir}/visualization`),
@@ -196,6 +202,21 @@ def _infinite(loader: Any):
             yield batch
 
 
+def apply_configured_lr(optimizer: Any, scheduler: Any, configured: list[dict]) -> None:
+    """After restoring another run's optimizer + scheduler state, put back THIS run's per-group
+    hyperparameters (lr, initial_lr, weight decay, betas) and base lrs, and set the current lr
+    from this run's schedule at the restored step. AdamW's moments and step count stay."""
+    if len(configured) != len(optimizer.param_groups):
+        raise ValueError(f"resume_from: {len(optimizer.param_groups)} restored param groups, "
+                         f"this run configures {len(configured)}")
+    for g, hp in zip(optimizer.param_groups, configured):
+        g.update(hp)
+    scheduler.base_lrs = [hp["initial_lr"] for hp in configured]
+    for g, base, fn in zip(optimizer.param_groups, scheduler.base_lrs, scheduler.lr_lambdas):
+        g["lr"] = base * fn(scheduler.last_epoch)
+    scheduler._last_lr = [g["lr"] for g in optimizer.param_groups]
+
+
 def run(*, task: RunTask, spec: TrainSpec, settings: RunSettings) -> dict:
     """Train ``task`` under ``spec`` for ``settings.n_steps`` and return the last
     step's metrics. Task-neutral; every task-specific decision is delegated to ``task``.
@@ -250,6 +271,9 @@ def run(*, task: RunTask, spec: TrainSpec, settings: RunSettings) -> dict:
     # strict-loading saved weights of a different arch fails on missing/unexpected keys
     # (train/loop.py 254-261). ---------------------------------------------
     latest = find_latest(ckpt_dir) if (settings.resume and ckpt_dir is not None) else None
+    forked = latest is None and settings.resume_from is not None
+    if forked:
+        latest = settings.resume_from
     prior_ckpt: dict | None = load_checkpoint(latest, device) if latest is not None else None
 
     # --- model + (optional) joint policy -----------------------------------
@@ -297,9 +321,14 @@ def run(*, task: RunTask, spec: TrainSpec, settings: RunSettings) -> dict:
     # > seed_ckpt (WEIGHTS ONLY, fresh opt/sched at step 0) > fresh.
     start_step = settings.start_step
     if prior_ckpt is not None:
-        log.info("RESUME mode: continuing from %s", latest)
+        log.info("RESUME mode: continuing from %s%s", latest, " (resume_from: another run)" if forked else "")
+        configured = [{k: g[k] for k in ("lr", "initial_lr", "weight_decay", "betas")} for g in optimizer.param_groups]
         restore_into(prior_ckpt, model=model, optimizer=optimizer, scheduler=scheduler,
                      joint=joint, path=latest, device=device)
+        if forked:
+            apply_configured_lr(optimizer, scheduler, configured)
+            log.info("RESUME_FROM: lr reset to this run's config: %s at scheduler step %d",
+                     [g["lr"] for g in optimizer.param_groups], scheduler.last_epoch)
         start_step = task.resume_start_step(prior_ckpt, scheduler)
         log.info("RESUME: start_step=%d", start_step)
     elif settings.seed_ckpt is not None:
@@ -348,7 +377,10 @@ def run(*, task: RunTask, spec: TrainSpec, settings: RunSettings) -> dict:
             run_name=settings.run_name or f"{task.name}-unified",
             wandb_project=settings.wandb_project, wandb_entity=settings.wandb_entity,
             wandb_dir=settings.wandb_dir, prev_comet_id=None,
-            prev_wandb_id=prior_meta.get("wandb_run_id"),
+            # resume_from: never continue the SOURCE run's W&B id; fork it at this step instead.
+            prev_wandb_id=None if forked else prior_meta.get("wandb_run_id"),
+            fork_from=(f"{prior_meta['wandb_run_id']}?_step={start_step}"
+                       if forked and prior_meta.get("wandb_run_id") else None),
         )
         # Hyperparameters (train/loop.py 279-282, 423): the task's flattened config,
         # the resolved TrainSpec, the SLURM job id and the trainable/total param split.

@@ -81,6 +81,7 @@ def make_tracker(
     wandb_dir: Path | None,
     prev_comet_id: str | None,
     prev_wandb_id: str | None,
+    fork_from: str | None = None,
 ) -> Tracker:
     """Build the rank-0 tracker for this job. Non-main ranks get a no-op."""
     if not is_main or tracker == "none":
@@ -115,6 +116,12 @@ def make_tracker(
             log.info(f"Resuming wandb run: {prev_wandb_id}")
             kwargs["id"] = prev_wandb_id
             kwargs["resume"] = "allow"
+        elif fork_from is not None:
+            log.info(f"Forking wandb run {fork_from} (new run continues its curves)")
+            try:
+                return Tracker(wandb_run=wandb.init(**kwargs, fork_from=fork_from))
+            except Exception as e:  # fork not available for this entity/server: a plain new run
+                log.warning(f"wandb fork_from={fork_from} failed ({e!r}); creating a NEW wandb run instead")
         else:
             if is_seeding and prev_wandb_id:
                 log.info(f"SEED mode: creating new wandb run (seed source had {prev_wandb_id})")

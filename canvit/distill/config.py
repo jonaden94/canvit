@@ -104,6 +104,10 @@ class Config:
     seed_ckpt: Path | None = None
     """Seed model weights from external checkpoint (.pt in CheckpointData format).
     Starts fresh (new experiment, step=0). Only used if no checkpoint exists in run_dir."""
+    resume_from: Path | None = None
+    """Continue another run's checkpoint with its full state (RunSettings.resume_from), e.g.
+    an LR decay of that run: step count, AdamW and shard schedule continue; the LR is this
+    config's. Only used if no checkpoint exists in run_dir."""
     hf_seed_ckpt: str | None = None
     """Seed model weights from HF Hub repo (e.g. '<org>/canvitb16-add-vpe-...'). Downloads
     config.json + model.safetensors, overrides cfg.model with the checkpoint's config.

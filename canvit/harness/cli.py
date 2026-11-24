@@ -219,7 +219,7 @@ class DistillCmd:
             log_every=self.cfg.log_every, grad_clip=self.cfg.grad_clip, amp=self.cfg.amp,
             seed=self.opts.seed if self.opts.seed is not None else self.cfg.seed,
             device=str(self.cfg.device), compile=self.cfg.compile,
-            seed_ckpt=self.cfg.seed_ckpt,
+            seed_ckpt=self.cfg.seed_ckpt, resume_from=self.cfg.resume_from,
             resume=self.opts.resume if self.opts.resume is not None else True,
             **_identity(self.cfg, self.opts, prefix=""),
             # Break `patcher` down into kpe / embed_head / conditioner (and the
