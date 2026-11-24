@@ -373,7 +373,8 @@ def load_records(results: Path) -> list[dict]:
             print(f"load_records: skipped {p} (limit_scanpaths={pr['limit_scanpaths']})")
             continue
         r.setdefault("dataset", "coco_search18")
-        r.setdefault("split", f"{pr['condition']}_{pr['part']}")
+        if "split" not in r:  # (setdefault would build the default even when the record has a split)
+            r["split"] = f"{pr['condition']}_{pr['part']}"
         r["source"] = "baselines" if top else p.parent.name
         if r["source"] in ("baselines", "deepgaze3"):
             r["kind"] = r["model"] if r["source"] == "baselines" else "deepgaze3"
@@ -1189,7 +1190,8 @@ def load_dir(d: Path) -> list[dict]:
                 or r["protocol"].get("limit_scanpaths") is not None):
             continue
         r.setdefault("dataset", "coco_search18")
-        r.setdefault("split", f"{r['protocol']['condition']}_{r['protocol']['part']}")
+        if "split" not in r:
+            r["split"] = f"{r['protocol']['condition']}_{r['protocol']['part']}"
         recs.append(r | {"kind": "canvit", "source": d.name, "path": p})
     return recs
 
@@ -1373,7 +1375,8 @@ def checkpoint_summary(e: dict, recs: list[dict], out: Path) -> bool:
             m, t = x["metrics"], x.get("diagnostics", {}).get("tempered_global", {})
             cells = [title[(ds, split)].replace(r"$^\ast$", "*") if i == 0 else "", name, f"{int(m['n_fixations'])}",
                      f"{m['ig_image']:.2f}", f"{t['ig_image']:.2f} ({t['temperature']:.1f})" if t else "",
-                     f"{m['ll_image']:.2f}", f"{m['auc_image']:.3f}", f"{m['nss_image']:.2f}"]
+                     *(f"{m[k]:{f}}" if k in m else "—" for k, f in (("ll_image", ".2f"), ("auc_image", ".3f"),
+                                                                    ("nss_image", ".2f")))]
             rows.append(cells)
             md.append("| " + " | ".join(cells) + " |")
     sweeps = [(t, entry_record(e, ds, s)) for ds, s, t in TAU_EVALS]
@@ -1450,7 +1453,9 @@ def checkpoint_summary(e: dict, recs: list[dict], out: Path) -> bool:
             f"- props: {props}{found.replace(chr(10), '; ')}", f"- notes: {e.get('notes', '')}",
             f"- figure: {slug}.pdf", "",
             "Per-image means (pysaliency); IG over the leave-one-out centre bias, LL over uniform (bits/fix). "
-            "IG@τ: at the temperature fitted on 2000 training scanpaths (diagnostic). TP test* ends at the target.", ""]
+            "IG@τ: at the temperature fitted on 2000 training scanpaths (diagnostic). *: scanpaths end at the first "
+            "target fixation (TP test as redistributed; TP val cut the same way, against the centre bias of the cut "
+            "scanpaths).", ""]
     (out / f"{slug}.md").write_text("\n".join(head + md) + "\n")
     return True
 
@@ -1686,10 +1691,13 @@ EVALS = [("coco_search18", "tp_validation", "COCO-Search18 TP"), ("coco_search18
 # Valentin, 2026-11-23: new analyses and the main results table on these only; the others in cross_dataset and
 # the appendix table (results_other.tex).
 FOCUS = [("coco_search18", "tp_validation"), ("coco_search18", "ta_validation"), ("coco_freeview", "validation"),
-         ("coco_search18", "tp_test"), ("coco_search18", "ta_test")]
+         ("coco_search18", "tp_validation_cut"), ("coco_search18", "tp_test"), ("coco_search18", "ta_test")]
 # the results tables also show the official COCO-Search18 test split (a second evaluation, helper_1; TP test
 # scanpaths end at the first target fixation, as redistributed by Gazeformer/ScanDiff); cross_dataset does not
-RESULT_EVALS = EVALS[:3] + [("coco_search18", "tp_test", r"COCO-Search18 TP (test)$^\ast$"),  # *: ends at target
+# TP val cut (helper_1, 2026-11-24): validation TP scanpaths cut at the first target fixation like the test split,
+# scored against the centre bias of the cut scanpaths; DGIII has LL/IG only there (manager: "—" for AUC/NSS)
+RESULT_EVALS = EVALS[:3] + [("coco_search18", "tp_validation_cut", r"COCO-Search18 TP (cut)$^\ast$"),  # val; fits
+                            ("coco_search18", "tp_test", r"COCO-Search18 TP (test)$^\ast$"),  # *: ends at target
                             ("coco_search18", "ta_test", "COCO-Search18 TA (test)")] + EVALS[3:]
 METRICS = [("ig_image", "IG over centre bias\n(bits/fix)"), ("ll_image", "LL over uniform\n(bits/fix)"),
            ("auc_image", "AUC"), ("nss_image", "NSS")]
@@ -1786,24 +1794,24 @@ def results_table(recs: list[dict], out: Path) -> dict[str, str]:
             if r is None:
                 continue
             m = r["metrics"]
-            vals = " & ".join(f"{m[k]:.3f}".replace("-", "$-$") for k in ("ig_image", "ll_image", "auc_image",
-                                                                            "nss_image"))
+            vals = " & ".join(f"{m[k]:.3f}".replace("-", "$-$") if k in m else "---"
+                              for k in ("ig_image", "ll_image", "auc_image", "nss_image"))
             # tables keep short names; the caption names the checkpoint
             name = STYLE[kind][2].replace(f" ({CKPT})", "")
             if r["model"].endswith("cuemix"):  # 18 cues
                 name = "CanViT policy, cue mixture"
             rows.append(f" & {name} & {int(m['n_fixations'])} & {vals} \\\\")
-            tag = {"tp_validation": "TP", "ta_validation": "TA", "tp_test": "TPtest", "ta_test": "TAtest"}.get(
+            tag = {"tp_validation": "TP", "ta_validation": "TA", "tp_validation_cut": "TPcut", "tp_test": "TPtest",
+                   "ta_test": "TAtest"}.get(
                 split) if ds == "coco_search18" else \
                 {"coco_freeview": "FV"}.get(ds)
             if kind in ("canvit", "canvit_heatmap", "deepgaze3") and tag:
                 pre = {"canvit": "cv", "canvit_heatmap": "hm", "deepgaze3": "dg"}[kind]
                 d = r.get("diagnostics", {}).get("tempered_global", {})
-                vals = {f"{pre}IG{tag}": m["ig_image"], f"{pre}LL{tag}": m["ll_image"],
-                        f"{pre}AUC{tag}": m["auc_image"],
-                        f"{pre}NSS{tag}": m["nss_image"]} | {f"{pre}IG{tag}t{w}": m[f"ig_t{i}"]  # no digits in names
-                                                          for i, w in ((1, "One"), (2, "Two"), (3, "Three"))
-                                                          if f"ig_t{i}" in m}
+                vals = {f"{pre}{n}{tag}": m[k] for n, k in (("IG", "ig_image"), ("LL", "ll_image"),
+                                                             ("AUC", "auc_image"), ("NSS", "nss_image")) if k in m}
+                vals |= {f"{pre}IG{tag}t{w}": m[f"ig_t{i}"]  # no digits in names
+                         for i, w in ((1, "One"), (2, "Two"), (3, "Three")) if f"ig_t{i}" in m}
                 if d:  # the temperature diagnostic: global tau and the IG at that tau
                     vals |= {f"{pre}Tau{tag}": d["temperature"], f"{pre}IGtau{tag}": d["ig_image"]}
                 fmt = {k: (".3f" if "AUC" in k else ".2f") for k in vals}
