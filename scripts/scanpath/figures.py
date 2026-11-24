@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import warnings
+from datetime import date
 from functools import lru_cache
 from pathlib import Path
 
@@ -41,6 +42,7 @@ from canvit.scanpath.models import GridScanpathModel, grid_log_density, policy_e
 # one preliminary checkpoint: exp39 s0, best validation step 15000 of a finished 20000-step run;
 # every CanViT label names it
 CKPT = "exp39 s0"
+MAIN_CKPT_DIR = "search_model_mr-r0-base-s0"  # its records dir; other checkpoints only via checkpoints.json
 # The search task head's map read as a fixation distribution: off in every figure and table since 2026-11-23
 # (Valentin: conceptually the wrong measurement); records stay on disk; --heatmap turns it back on.
 SHOW_HEATMAP = False
@@ -361,6 +363,8 @@ def load_records(results: Path) -> list[dict]:
         top = p.parent == results
         if top and (results / "baselines").is_dir():
             continue
+        if not top and p.relative_to(results).parts[0] not in ("baselines", "deepgaze3", MAIN_CKPT_DIR):
+            continue  # other checkpoints (helper_1's checkpoints.json): compare_figure and the summaries only
         pr = r["protocol"]
         if r.get("dataset") in HELD_OUT and p.parent != results and p.parent.name not in ("baselines", "deepgaze3"):
             print(f"load_records: held out {p} ({HELD_OUT[r['dataset']]})")
@@ -1049,23 +1053,33 @@ def _min_fixations(xs, ys, n, k: int):
     return [xs[j] for j in keep], [ys[j] for j in keep], np.asarray(n)[keep]
 
 
-def saccade_compare(rec: dict, ppd: float | None, out: Path, nsac: int = TRAINED_FIXATIONS) -> bool:
-    """(b) CanViT's sampled scanpaths vs the humans', FoAViS Fig. 3 layout: row 1 amplitude of saccades f1-f2 ..
-    (reflected KDE + 10/25/50/75/90 quantile strips), row 2 their direction (wrapped KDE), row 3 next vs
-    preceding amplitude and the turn angle at f2, f3. Only scanpaths with >= nsac + 1 fixations (both sides).
-    Humans black dashed, CanViT blue, the uniform random reference thick grey behind. Unit:
-    SACCADE_UNITS["compare"] (frac: % of the longer side, with degrees on a secondary axis when ``ppd``)."""
+def saccade_sources(rec: dict, nsac: int = TRAINED_FIXATIONS):
+    """(saccades of {humans, canvit, random}, human scanpaths, CanViT scanpaths) for a CanViT record with sampled
+    scanpaths, both sides restricted to scanpaths with >= nsac + 1 fixations; None without samples."""
     sm = samples(rec)
     if sm is None:
-        return False
+        return None
     st, z = sm
     ds, split = rec["dataset"], rec["split"]
     cond = split.split("_")[0] if ds == "coco_search18" else "both"
     _, fx = dataset(ds, rec["protocol"].get("part", eval_part(ds)))
     hxy = _min_fixations(*scanpath_xy(select(fx, condition=cond, limit=None)), nsac + 1)
     cxy = _min_fixations(list(z["xs"]), list(z["ys"]), z["n"], nsac + 1)
-    src = {"humans": saccades(*hxy, st.sizes), "canvit": saccades(*cxy, st.sizes),
-           "random": saccades(*random_xy(*hxy, st.sizes), st.sizes)}
+    return ({"humans": saccades(*hxy, st.sizes), "canvit": saccades(*cxy, st.sizes),
+             "random": saccades(*random_xy(*hxy, st.sizes), st.sizes)}, hxy, cxy)
+
+
+def saccade_compare(rec: dict, ppd: float | None, out: Path, nsac: int = TRAINED_FIXATIONS) -> bool:
+    """(b) CanViT's sampled scanpaths vs the humans', FoAViS Fig. 3 layout: row 1 amplitude of saccades f1-f2 ..
+    (reflected KDE + 10/25/50/75/90 quantile strips), row 2 their direction (wrapped KDE), row 3 next vs
+    preceding amplitude and the turn angle at f2, f3. Only scanpaths with >= nsac + 1 fixations (both sides).
+    Humans black dashed, CanViT blue, the uniform random reference thick grey behind. Unit:
+    SACCADE_UNITS["compare"] (frac: % of the longer side, with degrees on a secondary axis when ``ppd``)."""
+    got = saccade_sources(rec, nsac)
+    if got is None:
+        return False
+    src, hxy, cxy = got
+    ds, split = rec["dataset"], rec["split"]
     unit = SACCADE_UNITS["compare"]
     scale = 100.0 if unit == "frac" else 1.0
     amp = {k: amplitude(s, unit, ppd) * scale for k, s in src.items()}
@@ -1162,85 +1176,283 @@ RES_MARKER = {65: "o", 80: "s", 92: "^"}  # retina resolution -> marker; cmf -> 
 CMF_FILL = {0.75: OKABE_ITO["blue"], 2.2: "#6AA6D8", 7.7: "white"}
 
 
-def load_retinas(results: Path) -> list[dict]:
-    """helper_1's retina sweep, <ckpt>/retina/<cmf..._res..._cps...>/: search_validation.json (Jonathan's search
-    harness) and coco_search18_{tp,ta}_validation.json (our records). One dict per retina with what exists."""
-    import re
-    out = []
-    for d in sorted(results.glob("*/retina/cmf*_res*_cps*")):
-        m = re.fullmatch(r"cmf([\d.]+)_res(\d+)_cps(\d+)", d.name)
-        if m is None or not (d / "search_validation.json").exists():
+def load_dir(d: Path) -> list[dict]:
+    """The scanpath records directly in ``d`` (one checkpoint's results dir), as load_records shapes them (kind
+    'canvit'); unframed ``_scene`` runs, partial runs and shards skipped."""
+    recs = []
+    for p in sorted(d.glob("*.json")):
+        try:
+            r = json.loads(p.read_text())
+        except json.JSONDecodeError:
             continue
-        r = {"name": d.name, "cmf": float(m[1]), "res": int(m[2]), "cps": int(m[3]),
-             "search": json.loads((d / "search_validation.json").read_text())["metrics"]}
-        for c, stem in RET_COLS.items():
-            p = d / f"{stem[0]}.json"
-            if p.exists():
-                r[c] = json.loads(p.read_text())
-        out.append(r)
-    return out
+        if (not isinstance(r, dict) or r.get("task") != "scanpath" or "metrics" not in r or p.stem.endswith("_scene")
+                or r["protocol"].get("limit_scanpaths") is not None):
+            continue
+        r.setdefault("dataset", "coco_search18")
+        r.setdefault("split", f"{r['protocol']['condition']}_{r['protocol']['part']}")
+        recs.append(r | {"kind": "canvit", "source": d.name, "path": p})
+    return recs
 
 
-def retina_figure(results: Path, out: Path) -> dict[str, str]:
-    """H1 (search vs human alignment) across retinas: x = targets found within 3 fixations (policy, Jonathan's
-    search harness, COCO-Search18 validation), y = IG over the centre bias (top: at the tau fitted on training
-    scanpaths, bottom: at tau = 1), columns TP | TA. Marker = retina resolution, fill = cortical magnification;
-    the trained retina ringed. Only the trained retina is in distribution: head and policy saw no other."""
-    rets = [r for r in load_retinas(results) if any(c in r for c in CONDITIONS)]
-    cols = [c for c in RET_COLS if any(c in r for r in rets)]
+def load_checkpoints(results: Path) -> list[dict]:
+    """helper_1's checkpoint list, <results>/checkpoints.json (format agreed 2026-11-24: name = records dir under
+    ``results``, label, group, in_distribution, props; ckpt/task/retina/notes are the runner's). Without the file:
+    the main checkpoint plus its retina sweep, built from the directories. Each entry gains ``recs`` (load_dir)
+    and ``search`` (search_validation.json metrics, or None)."""
+    import re
+    f = results / "checkpoints.json"
+    if f.exists():
+        entries = json.loads(f.read_text())
+    else:
+        entries = [{"name": MAIN_CKPT_DIR, "label": CKPT, "group": "main", "in_distribution": True, "props": {}}]
+        for d in sorted((results / MAIN_CKPT_DIR / "retina").glob("cmf*_res*_cps*")):
+            m = re.fullmatch(r"cmf([\d.]+)_res(\d+)_cps(\d+)", d.name)
+            if m:
+                entries.append({"name": f"{MAIN_CKPT_DIR}/retina/{d.name}", "label": f"{CKPT}, {d.name}",
+                                "group": f"retina sweep {CKPT}", "in_distribution": d.name == TRAINED_RETINA,
+                                "props": {"cmf": float(m[1]), "res": int(m[2]), "cps": int(m[3])}})
+    for e in entries:
+        d = results / e["name"]
+        e["recs"] = load_dir(d)
+        sv = d / "search_validation.json"
+        e["search"] = json.loads(sv.read_text())["metrics"] if sv.exists() else None
+    return entries
+
+
+def entry_record(e: dict, ds: str, split: str) -> dict | None:
+    return next((r for r in e["recs"] if r["dataset"] == ds and r["split"] == split), None)
+
+
+def entry_x(e: dict, x: str) -> tuple[float, float] | None:
+    """(value, standard error) of property ``x`` of a checkpoint entry: 'found3' = targets found within 3 fixations
+    (search_validation.json, binomial SE over SEARCH_VAL_TRIALS), else ``props[x]`` (SE 0); None if missing."""
+    if x == "found3":
+        if not e["search"] or "found_t3_policy" not in e["search"]:
+            return None
+        v = e["search"]["found_t3_policy"]
+        return v, float(np.sqrt(v * (1 - v) / SEARCH_VAL_TRIALS))
+    v = e["props"].get(x)
+    return (float(v), 0.0) if isinstance(v, (int, float)) else None
+
+
+COMPARE_ROWS = [("igtau", "IG over centre bias\n" + r"at fitted $\tau$ (bits/fix)"),
+                ("ig1", "IG over centre bias\n" + r"at $\tau$ = 1 (bits/fix)"), ("auc", "AUC")]
+X_LABELS = {"found3": "targets found within 3 fixations (policy)", "cmf": "cortical magnification",
+            "res": "retina resolution", "step": "training step", "entropy_target": "policy entropy target (nats)"}
+
+
+def _metric(r: dict, key: str) -> float | None:
+    if key == "igtau":
+        return r.get("diagnostics", {}).get("tempered_global", {}).get("ig_image")
+    return r["metrics"].get({"ig1": "ig_image", "auc": "auc_image"}[key])
+
+
+def compare_figure(entries: list[dict], recs: list[dict], x: str, out: Path, fname: str, *, title: str = "",
+                   marker_of=lambda e: STYLE["canvit"][1], fill_of=lambda e: STYLE["canvit"][0],
+                   legend: tuple[list, list] = ([], []), xlog: bool = False) -> bool:
+    """Checkpoints compared: x = ``x`` (entry_x: a props key or 'found3'), rows = COMPARE_ROWS, columns = the focus
+    validation sets (RET_COLS) with records. Reference lines: centre bias (IG 0; its AUC) and DeepGaze III (orange
+    dashed). In-distribution entries are ringed. ``marker_of``/``fill_of`` style one entry (default: CanViT)."""
+    pts = [(e, entry_x(e, x)) for e in entries]
+    pts = [(e, xv) for e, xv in pts if xv is not None]
+    cols = [c for c, (stem, _) in RET_COLS.items() if any(entry_record(e, *_ds_split(stem)) for e, _ in pts)]
+    if len(pts) < 2 or not cols:
+        print(f"compare_figure {fname}: {len(pts)} checkpoints with '{x}', need 2")
+        return False
+    fig, axes = plt.subplots(len(COMPARE_ROWS), len(cols), figsize=(TEXTWIDTH_IN, 1.55 * len(COMPARE_ROWS) + 0.8),
+                             sharex=True, sharey="row", squeeze=False, layout="constrained")
+    for j, c in enumerate(cols):
+        ds, split = _ds_split(RET_COLS[c][0])
+        refs = {k: next((r for r in recs if r["kind"] == k and r["dataset"] == ds and r["split"] == split), None)
+                for k in ("centre_bias", "deepgaze3")}
+        for i, (key, ylabel) in enumerate(COMPARE_ROWS):
+            ax = axes[i, j]
+            if key != "auc":
+                ax.axhline(0, color=STYLE["centre_bias"][0], lw=0.5)
+            elif refs["centre_bias"] is not None:
+                ax.axhline(refs["centre_bias"]["metrics"]["auc_image"], color=STYLE["centre_bias"][0], lw=0.5)
+            dg = refs["deepgaze3"]
+            if dg is not None and key != "igtau":  # DGIII has no temperature diagnostic; its IG is at tau = 1
+                ax.axhline(_metric(dg, key), color=STYLE["deepgaze3"][0], lw=0.6, ls="--")
+            elif dg is not None:
+                ax.axhline(dg["metrics"]["ig_image"], color=STYLE["deepgaze3"][0], lw=0.6, ls="--")
+            for e, (xv, se) in pts:
+                r = entry_record(e, ds, split)
+                y = _metric(r, key) if r is not None else None
+                if y is None:
+                    continue
+                if se:
+                    ax.errorbar(xv, y, xerr=se, color=OKABE_ITO["blue"], lw=0.5, capsize=0, zorder=1)
+                ax.plot(xv, y, marker=marker_of(e), ms=5, ls="none", mec=OKABE_ITO["blue"], mfc=fill_of(e), mew=0.8)
+                if e.get("in_distribution"):
+                    ax.plot(xv, y, marker="o", ms=11, mfc="none", mec="k", mew=0.6, ls="none")
+            if i == 0:
+                ax.set_title(RET_COLS[c][1])
+            if i == len(COMPARE_ROWS) - 1:
+                ax.set_xlabel(X_LABELS.get(x, x))
+            if xlog:
+                ax.set_xscale("log")
+            ax.margins(y=0.1)  # room for the in-distribution ring
+            despine(ax)
+        for i, (_, ylabel) in enumerate(COMPARE_ROWS):
+            axes[i, 0].set_ylabel(ylabel)
+    handles, labels = list(legend[0]), list(legend[1])
+    handles += [plt.Line2D([], [], marker="o", ms=11, mfc="none", mec="k", mew=0.6, ls="none"),
+                plt.Line2D([], [], color=STYLE["centre_bias"][0], lw=0.5),
+                plt.Line2D([], [], color=STYLE["deepgaze3"][0], lw=0.6, ls="--")]
+    labels += ["in distribution (as trained)", "centre bias", r"DeepGaze III ($\tau$ = 1)"]
+    fig.legend(handles, labels, loc="outside upper center", ncol=3, title=title or None)
+    save(fig, out / fname)
+    return True
+
+
+def _ds_split(stem: str) -> tuple[str, str]:
+    """'coco_search18_tp_validation' -> ('coco_search18', 'tp_validation'); 'coco_freeview_validation' -> (.., ..)."""
+    ds = next(d for d in ("coco_search18", "coco_freeview") if stem.startswith(d))
+    return ds, stem[len(ds) + 1:]
+
+
+def retina_figure(results: Path, recs: list[dict], out: Path) -> dict[str, str]:
+    """H1 (search vs human alignment) across retinas, as compare_figure with x = targets found within 3 fixations:
+    the retina-sweep entries of load_checkpoints (names with /retina/). Marker = retina resolution, fill =
+    cortical magnification; the trained retina ringed. Only the trained retina is in distribution: head and policy
+    saw no other. Macros: means over the resolutions of each cmf, tags A/B/C = cmf 0.75/2.2/7.7 (manager)."""
+    rets = [e for e in load_checkpoints(results) if "/retina/" in e["name"] and "cmf" in e["props"]
+            and e["search"] is not None and e["recs"]]
     if len(rets) < 2:
         print(f"retina_figure: {len(rets)} retinas with scanpath records, need 2")
         return {}
-    fig, axes = plt.subplots(2, len(cols), figsize=(TEXTWIDTH_IN, 3.8), sharex=True, sharey="row", squeeze=False,
-                             layout="constrained")
-    for j, cond in enumerate(cols):
-        for i, at in enumerate(("fitted", "one")):
-            ax = axes[i, j]
-            ax.axhline(0, color=STYLE["centre_bias"][0], lw=0.5)
-            for r in rets:
-                if cond not in r:
-                    continue
-                x = r["search"]["found_t3_policy"]
-                y = (r[cond]["diagnostics"]["tempered_global"]["ig_image"] if at == "fitted"
-                     else r[cond]["metrics"]["ig_image"])
-                ax.errorbar(x, y, xerr=np.sqrt(x * (1 - x) / SEARCH_VAL_TRIALS), color=OKABE_ITO["blue"], lw=0.5,
-                            capsize=0, zorder=1)  # binomial SE of found_t3
-                ax.plot(x, y, marker=RES_MARKER.get(r["res"], "D"), ms=5, ls="none", mec=OKABE_ITO["blue"],
-                        mfc=CMF_FILL.get(r["cmf"], "0.5"), mew=0.8)
-                if r["name"] == TRAINED_RETINA:
-                    ax.plot(x, y, marker="o", ms=11, mfc="none", mec="k", mew=0.6, ls="none")
-                    ax.annotate("trained", (x, y), xytext=(7, 4), textcoords="offset points", fontsize=FS - 1)
-            ax.set(title=RET_COLS[cond][1] if i == 0 else None)
-            if i == 1:
-                ax.set_xlabel("targets found within 3 fixations (policy)")
-            despine(ax)
-    axes[0, 0].set_ylabel("IG over centre bias\n" + r"at fitted $\tau$ (bits/fix)")
-    axes[1, 0].set_ylabel("IG over centre bias\n" + r"at $\tau$ = 1 (bits/fix)")
-    handles = [plt.Line2D([], [], marker=m, ms=5, ls="none", mec="0.25", mfc="0.85")  # shape only, no fill code
-               for m in RES_MARKER.values()]
+    handles = [plt.Line2D([], [], marker=m, ms=5, ls="none", mec="0.25", mfc="0.85") for m in RES_MARKER.values()]
     labels = [f"resolution {k}" for k in RES_MARKER]
     handles += [plt.Line2D([], [], marker="o", ms=5, ls="none", mec=OKABE_ITO["blue"], mfc=c) for c in
                 CMF_FILL.values()]
     labels += [f"cortical magnification {k:g}" for k in CMF_FILL]
-    fig.legend(handles, labels, loc="outside upper center", ncol=3,
-               title=f"CanViT search policy {CKPT}, evaluated through {len(rets)} retinas (trained through one)")
-    save(fig, out / "retina.pdf")
-    # macros: means over the resolutions of each cortical magnification, tags A/B/C = cmf 0.75/2.2/7.7 (manager)
+    compare_figure(rets, recs, "found3", out, "retina.pdf",
+                   title=f"CanViT search policy {CKPT}, evaluated through {len(rets)} retinas (trained through one)",
+                   marker_of=lambda e: RES_MARKER.get(e["props"]["res"], "D"),
+                   fill_of=lambda e: CMF_FILL.get(e["props"]["cmf"], "0.5"), legend=(handles, labels))
     macros = {}
     for tag, cmf in zip("ABC", sorted(CMF_FILL)):
-        g = [r for r in rets if r["cmf"] == cmf and all(c in r for c in CONDITIONS)]
-        if not g:
+        g = [e for e in rets if e["props"]["cmf"] == cmf]
+        rs = {c: [entry_record(e, *_ds_split(RET_COLS[c][0])) for e in g] for c in RET_COLS}
+        if not g or not all(r is not None for c in CONDITIONS for r in rs[c]):
             continue
-        tg = [r["tp"]["diagnostics"]["tempered_global"] for r in g]
-        macros[f"retFound{tag}"] = f"{np.mean([r['search']['found_t3_policy'] for r in g]):.2f}"
+        tg = [r["diagnostics"]["tempered_global"] for r in rs["tp"]]
+        macros[f"retFound{tag}"] = f"{np.mean([e['search']['found_t3_policy'] for e in g]):.2f}"
         macros[f"retIGtauTP{tag}"] = _num(np.mean([t["ig_image"] for t in tg]))
-        macros[f"retIGtauTA{tag}"] = _num(np.mean([r["ta"]["diagnostics"]["tempered_global"]["ig_image"] for r in g]))
-        macros[f"retAUCTP{tag}"] = f"{np.mean([r['tp']['metrics']['auc_image'] for r in g]):.3f}"
+        macros[f"retIGtauTA{tag}"] = _num(np.mean([r["diagnostics"]["tempered_global"]["ig_image"] for r in rs["ta"]]))
+        macros[f"retAUCTP{tag}"] = f"{np.mean([r['metrics']['auc_image'] for r in rs['tp']]):.3f}"
         macros[f"retTauTP{tag}"] = f"{np.mean([t['temperature'] for t in tg]):.1f}"
-        if all("fv" in r for r in g):
-            macros[f"retIGtauFV{tag}"] = _num(np.mean([r["fv"]["diagnostics"]["tempered_global"]["ig_image"]
-                                                      for r in g]))
+        if all(r is not None for r in rs["fv"]):
+            macros[f"retIGtauFV{tag}"] = _num(np.mean([r["diagnostics"]["tempered_global"]["ig_image"]
+                                                      for r in rs["fv"]]))
     return macros
+
+
+def checkpoint_summary(e: dict, recs: list[dict], out: Path) -> bool:
+    """One page per checkpoint entry (load_checkpoints) -> <out>/<slug>.{pdf,md}, slug = name with / -> __.
+    Top: the entry (label, props, search score). Table: FOCUS sets x {CanViT (IG, IG at fitted tau, tau, LL, AUC,
+    NSS), centre bias, uniform, DeepGaze III}. Middle: IG over the centre bias vs temperature (temperature_sweep)
+    per focus validation set. Bottom: saccade amplitude and direction of the sampled scanpaths vs the humans' and
+    uniform random fixations (saccade_sources, f1-f(TRAINED_FIXATIONS+1) pooled). CPU only."""
+    if not e["recs"]:
+        print(f"checkpoint_summary: no records for {e['name']}")
+        return False
+    slug = e["name"].replace("/", "__")
+    title = {(d, s): t for d, s, t in RESULT_EVALS}
+    rows = []
+    md = ["| data | model | fixations | IG | IG@τ (τ) | LL | AUC | NSS |", "|---|---|---|---|---|---|---|---|"]
+    for ds, split in FOCUS:
+        r = entry_record(e, ds, split)
+        if r is None:
+            continue
+        refs = [("CanViT", r)] + [(STYLE[k][2], b) for k in ("centre_bias", "uniform", "deepgaze3")
+                                  if (b := next((x for x in recs if x["kind"] == k and x["dataset"] == ds
+                                                 and x["split"] == split), None)) is not None]
+        for i, (name, x) in enumerate(refs):
+            m, t = x["metrics"], x.get("diagnostics", {}).get("tempered_global", {})
+            cells = [title[(ds, split)].replace(r"$^\ast$", "*") if i == 0 else "", name, f"{int(m['n_fixations'])}",
+                     f"{m['ig_image']:.2f}", f"{t['ig_image']:.2f} ({t['temperature']:.1f})" if t else "",
+                     f"{m['ll_image']:.2f}", f"{m['auc_image']:.3f}", f"{m['nss_image']:.2f}"]
+            rows.append(cells)
+            md.append("| " + " | ".join(cells) + " |")
+    sweeps = [(t, entry_record(e, ds, s)) for ds, s, t in TAU_EVALS]
+    sweeps = [(t, r, temperature_sweep(r)) for t, r in sweeps if r is not None]
+    sweeps = [x for x in sweeps if x[2] is not None]
+    sacc = [(t, saccade_sources(r)) for t, r in ((t, entry_record(e, ds, s)) for ds, s, t in TAU_EVALS)
+            if r is not None]
+    sacc = [(t, x) for t, x in sacc if x is not None]
+    ncol = max(len(sweeps), len(sacc), 1)
+    fig = plt.figure(figsize=(TEXTWIDTH_IN, 8.6), layout="constrained")
+    sf_tab, sf_tau, sf_sac = fig.subfigures(3, 1, height_ratios=[0.17 * len(rows) + 0.75, 1.9, 3.4])
+    props = ", ".join(f"{k} {v:.4g}" if isinstance(v, float) else f"{k} {v}" for k, v in e["props"].items())
+    found = (f"\ntargets found within 3 fixations {e['search']['found_t3_policy']:.2f}"
+             if e["search"] and "found_t3_policy" in e["search"] else "")
+    where = "in distribution" if e.get("in_distribution") else "off its training configuration"
+    sf_tab.suptitle(f"{e.get('label', e['name'])}  ({where})\n{props}{found}", x=0.01, ha="left", fontsize=FS)
+    ax = sf_tab.subplots()
+    ax.axis("off")
+    if rows:
+        tb = ax.table(cellText=rows, colLabels=["data", "model", "fix.", "IG", r"IG@$\tau$ ($\tau$)", "LL", "AUC",
+                                                 "NSS"], bbox=[0, 0, 1, 1], cellLoc="right", edges="horizontal")
+        tb.auto_set_font_size(False)
+        tb.set_fontsize(FS - 1)
+        tb.auto_set_column_width(range(8))
+        for (i, j), cell in tb.get_celld().items():
+            if j < 2:
+                cell.set_text_props(ha="left")
+    for j, (t, r, sw) in enumerate(sweeps):
+        ax = sf_tau.add_subplot(1, ncol, j + 1)
+        taus, ig = np.array(sw["taus"]), np.array(sw["ig_image"])
+        ax.axhline(0, color=STYLE["centre_bias"][0], lw=0.5)
+        ax.plot(taus, ig, color=STYLE["canvit"][0], lw=0.8)
+        one = int(np.argmin(abs(taus - 1.0)))
+        ax.plot(taus[one], ig[one], marker="o", mfc="white", mec=STYLE["canvit"][0], ms=4, ls="none")
+        if sw["fitted_tau"]:
+            k = int(np.argmin(abs(taus - sw["fitted_tau"])))
+            ax.plot(taus[k], ig[k], marker=STYLE["canvit"][1], color=STYLE["canvit"][0], ms=4, ls="none")
+        ax.set(xscale="log", title=t, xlabel=r"temperature $\tau$", ylim=(-12, 1.5),
+               ylabel="IG over centre bias\n(bits/fix)" if j == 0 else None)
+        despine(ax)
+    sty = {"humans": dict(color=STYLE["human"][0], ls="--", lw=0.9),
+           "canvit": dict(color=STYLE["canvit"][0], ls="-", lw=0.9), "random": RANDOM_REF}
+    gx, ga = np.linspace(0, 100, 401), np.linspace(-180, 180, 361)
+    for j, (t, (src, hxy, cxy)) in enumerate(sacc):
+        a1, a2 = sf_sac.add_subplot(2, ncol, j + 1), sf_sac.add_subplot(2, ncol, ncol + j + 1)
+        for k, s in src.items():
+            m = s["index"] <= TRAINED_FIXATIONS
+            a1.plot(gx, _kde_reflect(amplitude(s, "frac", None)[m] * 100, gx, 2.0), **sty[k])
+            a2.plot(ga, _kde_circ(np.degrees(np.angle(np.exp(1j * s["angle"][m & (s["length"] >= 0.01)]))), ga, 8.0),
+                    **sty[k])
+        a1.set(title=f"{t}\nscanpaths: {len(hxy[0]):,} human, {len(cxy[0]):,} CanViT",
+               xlabel="amplitude (% of longer side)", ylabel="density" if j == 0 else None)
+        a2.set(xlim=(-180, 180), xticks=[-180, -90, 0, 90, 180], xticklabels=["left", "down", "right", "up", "left"],
+               xlabel="direction", ylabel="density" if j == 0 else None)
+        despine(a1), despine(a2)
+    if sweeps:
+        sf_tau.legend([plt.Line2D([], [], color=STYLE["canvit"][0], lw=0.8),
+                       plt.Line2D([], [], marker="o", mfc="white", mec=STYLE["canvit"][0], ms=4, ls="none"),
+                       plt.Line2D([], [], marker=STYLE["canvit"][1], color=STYLE["canvit"][0], ms=4, ls="none")],
+                      ["CanViT policy (free viewing: cue mixture)", r"$\tau$ = 1",
+                       r"$\tau$ fitted on training scanpaths"],
+                      loc="outside upper center", ncol=3)
+    if sacc:
+        sf_sac.legend([plt.Line2D([], [], **{k: v for k, v in sty[k].items() if k in ("color", "ls", "lw")})
+                       for k in sty], ["humans", "CanViT samples", "uniform random fixations"],
+                      loc="outside upper center", ncol=3,
+                      title=f"saccades $f_1$–$f_{{{TRAINED_FIXATIONS + 1}}}$, scanpaths with ≥ "
+                            f"{TRAINED_FIXATIONS + 1} fixations")
+    out.mkdir(parents=True, exist_ok=True)
+    save(fig, out / f"{slug}.pdf")
+    head = [f"> Generated by scripts/scanpath/figures.py --summary (Claude Opus 5.5 code), {date.today()}.", "",
+            f"# {e.get('label', e['name'])}", "",
+            f"- records: `$LOGS_DIR/scanpath_eval/{e['name']}/`; in distribution: {e.get('in_distribution')}",
+            f"- props: {props}{found.replace(chr(10), '; ')}", f"- notes: {e.get('notes', '')}",
+            f"- figure: {slug}.pdf", "",
+            "Per-image means (pysaliency); IG over the leave-one-out centre bias, LL over uniform (bits/fix). "
+            "IG@τ: at the temperature fitted on 2000 training scanpaths (diagnostic). TP test* ends at the target.", ""]
+    (out / f"{slug}.md").write_text("\n".join(head + md) + "\n")
+    return True
 
 
 STRIP_RETINAS = ["cmf0.75_res65_cps6", "cmf2.2_res65_cps6", "cmf7.7_res65_cps6"]  # resolution fixed, cmf varies
@@ -1720,6 +1932,9 @@ def main() -> None:
                     help="published numbers (reference_numbers.csv); default $SCANPATH_REFERENCES")
     ap.add_argument("--png", action="store_true", help="also write .png previews beside the .pdf figures")
     ap.add_argument("--heatmap", action="store_true", help="also show the search heatmap (off since 2026-11-23)")
+    ap.add_argument("--summary", action="append", default=None, metavar="NAME",
+                    help="only the one-page summary of this checkpoints.json entry (repeatable; 'all' = every entry) "
+                         "-> <out>/summaries/")
     a = ap.parse_args()
     global PNG_PREVIEW, SHOW_HEATMAP
     PNG_PREVIEW, SHOW_HEATMAP = a.png, a.heatmap
@@ -1737,6 +1952,15 @@ def main() -> None:
 
     global DATA_LOCATION
     DATA_LOCATION = a.data
+    if a.summary:
+        recs, entries = load_records(a.results), load_checkpoints(a.results)
+        pick = entries if "all" in a.summary else [e for e in entries if e["name"] in a.summary]
+        missing = set(a.summary) - {"all"} - {e["name"] for e in pick}
+        if missing:
+            raise SystemExit(f"--summary: not in {a.results / 'checkpoints.json'}: {sorted(missing)}")
+        for e in pick:
+            checkpoint_summary(e, recs, a.out / "summaries")
+        return
     sv, fv = dataset("coco_search18", "validation")
     example_trials(sv, fv, figs)
     ent = entropy_figure(sv, fv, figs)
@@ -1754,7 +1978,7 @@ def main() -> None:
     res_macros |= priors_figure(recs, a.results, figs, tabs)
     priors_index_figure(recs, a.results, figs)
     res_macros |= temperature_figure(recs, figs)
-    res_macros |= retina_figure(a.results, figs)
+    res_macros |= retina_figure(a.results, recs, figs)
     retina_strips(a.results, figs)
 
     sacc = {}
