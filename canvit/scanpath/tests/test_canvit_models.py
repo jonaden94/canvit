@@ -247,6 +247,55 @@ def test_a_non_search_checkpoint_loads_and_scores_human_scanpaths(fake_search, t
     assert np.isfinite(model.log_likelihoods(sv, fx)).all()
 
 
+@pytest.mark.parametrize("name", ["distill", "ade20k"])
+def test_distill_and_ade20k_checkpoints_load_to_the_same_policy(name, tmp_path):
+    """A foveated distill / ade20k checkpoint as the harness writes it (model built by the task's own checkpoint path,
+    so no teacher or pretrained download) loads to the same policy. distill's model IS the backbone; distill takes
+    its backbone from the run config (argv), not from model_config. ~150 MB checkpoint: keep TMPDIR off a small /tmp."""
+    from dataclasses import asdict
+
+    from canvit.harness.cli import command_from_run_config, run_config_of
+    from canvit.harness.infra.checkpoint import save_checkpoint
+    from canvit.scanpath.evaluate import training_display_frame
+    from canvit.search.tests.test_search_task import _FOVEATED
+    argv = [name] + (["--cfg.backbone-name", "vits16"] if name == "distill" else []) + [
+        "--cfg.device", "cpu", "--cfg.run-group", "g", "--cfg.logs-dir", str(tmp_path / "logs")]
+    cmd, _ = command_from_run_config({"argv": argv})
+    task, _ = cmd.build()
+    torch.manual_seed(0)
+    if name == "ade20k":
+        from canvit.core.model.segmentation import CanViTForSemanticSegmentation
+        model = CanViTForSemanticSegmentation(backbone_name="vits16", model_config=_FOVEATED, num_classes=150,
+                                              glimpse_grid_size=8)
+    else:
+        import dacite
+
+        from canvit import CanViTForPretrainingConfig
+        mc = dacite.from_dict(CanViTForPretrainingConfig, asdict(task.cfg.model) | _FOVEATED | {"teacher_dim": 64},
+                              config=dacite.Config(strict=False))
+        model, _ = task.build_model(torch.device("cpu"), prior_model_config={"canvit": asdict(mc)})
+    model.eval()
+    assert task.is_foveated(model) and training_display_frame(name)[0] == "scene"
+    joint = task.build_policy(model, device=torch.device("cpu"), canvas_grid=task.canvas_grid(model),
+                              generator=torch.Generator().manual_seed(0))
+    torch.manual_seed(1)
+    for p in joint.scorer.parameters():
+        p.data.normal_(0, 0.5)
+    joint.scorer.eval()
+    ep = PolicyEpisode(task=task, model=model, joint=joint, device=torch.device("cpu"), amp=False)
+    opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1)
+    ckpt = save_checkpoint(tmp_path / "best.pt", model=model, optimizer=opt,
+                           scheduler=torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 1.0), step=1, task_name=name,
+                           spec=task.default_spec(), model_config=task.model_config(model), joint=joint,
+                           metadata={"run_config": run_config_of(cmd, argv), "pretrain_view_scale": {
+                               "mode": "fixed", "fixed_scale": task.cfg.foveated_scale.fixed_scale}},
+                           update_latest=False)
+    loaded = PolicyEpisode.load(ckpt, device=torch.device("cpu"), need_policy=True)
+    assert loaded.task.name == name and not loaded.is_search
+    batch = _batch(torch.zeros(B, 3, 2)) | {"cue": torch.full((B,), -1)}
+    assert torch.equal(loaded.run(batch, n=2)["policy"], ep.run(batch, n=2)["policy"])
+
+
 # --- free viewing with a search model: the uniform mixture over the cues ------------------------------
 
 def test_cue_mixture_is_the_mean_of_the_per_cue_pixel_densities(fake_cs18):
