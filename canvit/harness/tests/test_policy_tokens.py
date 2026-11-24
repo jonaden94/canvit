@@ -145,8 +145,9 @@ def test_joint_pg_trains_tokens_readout_and_backbone(mode):
 
 def test_builder_refuses_what_tokens_cannot_honour():
     m = _model(n_policy_tokens=_K)
-    with pytest.raises(ValueError, match="PG only"):
-        build_policy(canvit=m, rl=JointPolicyConfig(objective="qreg", feats_detached=False),
+    # pg / qreg / sac are allowed since exp41 (2026-11-24); vpg needs a value head the tokens lack
+    with pytest.raises(ValueError, match="not vpg"):
+        build_policy(canvit=m, rl=JointPolicyConfig(objective="vpg", feats_detached=False),
                      feature_groups=POLICY_FEATURE_GROUPS, device=_DEV, canvas_grid=_G,
                      min_viewpoint_scale=0.05, foveated_scale=FoveatedScaleConfig(),
                      generator=torch.Generator())
