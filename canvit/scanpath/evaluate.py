@@ -68,6 +68,10 @@ class ScanpathConfig:
     only read when pysaliency's cache does not exist yet."""
     condition: Literal["both", "tp", "ta"] = "both"
     """COCO-Search18: which scanpaths to score: target present, absent, or both (``target_present``)."""
+    cut_at_target: bool = False
+    """COCO-Search18 TP: score each scanpath only up to its first fixation on the target
+    (:func:`cut_at_first_target_fixation`), the format of the redistributed test split (HAT/Gazeformer), so that
+    validation and test are comparable. The centre bias is then the KDE of the cut fixations too."""
     grid: int = 32
     """Cells per axis the CanViT models predict on (the search policy's 32x32)."""
     scene_size: int = 512
@@ -158,7 +162,8 @@ def frame_is_identity(stimuli, frame: tuple[int, int] | None, scene: int) -> boo
 def split_name(cfg: ScanpathConfig) -> str:
     """The evaluated split in result names: ``<condition>_<part>`` for one COCO-Search18 condition, else the part."""
     part = cfg.part or eval_part(cfg.dataset)
-    return f"{cfg.condition}_{part}" if cfg.condition != "both" else part
+    name = f"{cfg.condition}_{part}" if cfg.condition != "both" else part
+    return name + "_cut" if cfg.cut_at_target else name
 
 
 def load(cfg: ScanpathConfig, part: str):
@@ -174,6 +179,20 @@ def select(fixations, *, condition: str, limit: int | None):
     if limit is not None:
         keep &= np.cumsum(keep) <= limit
     return fixations.filter_scanpaths(np.flatnonzero(keep))
+
+
+def cut_at_first_target_fixation(fixations):
+    """The fixations up to and including each scanpath's first fixation in its target box (``target_bbox``, xywh
+    pixels, edges inclusive; the start fixation does not count); scanpaths that never reach the box stay whole.
+    The same definition as external/checks/tp_truncation_check.py (DeepGaze III, outside the repo). A kept
+    fixation's history is all earlier fixations, so this equals truncating the scanpaths."""
+    bbox = np.asarray(fixations.scanpaths.scanpath_attributes["target_bbox"], float)[fixations.scanpath_index]
+    x, y, t = fixations.x, fixations.y, fixations.scanpath_history_length
+    inside = ((x >= bbox[:, 0]) & (x <= bbox[:, 0] + bbox[:, 2]) & (y >= bbox[:, 1]) & (y <= bbox[:, 1] + bbox[:, 3])
+              & (t >= 1))
+    first_hit = np.full(len(fixations.scanpaths), np.iinfo(np.int64).max)
+    np.minimum.at(first_hit, fixations.scanpath_index[inside], t[inside])
+    return fixations[t <= first_hit[fixations.scanpath_index]]
 
 
 def subset_scanpaths(fixations, n: int, *, seed: int):
@@ -403,6 +422,10 @@ def run(cfg: ScanpathConfig) -> dict[str, Any]:
         raise ValueError(f"{cfg.dataset} has the parts {DATASETS[cfg.dataset]}, not {part!r}")
     stimuli, fixations = load(cfg, part)
     fixations = select(fixations, condition=cfg.condition, limit=cfg.limit_scanpaths)
+    if cfg.cut_at_target:
+        if cfg.condition != "tp":
+            raise ValueError("--cfg.cut-at-target needs --cfg.condition tp (only TP scanpaths have a target)")
+        fixations = cut_at_first_target_fixation(fixations)
     in_sample = fit_part(cfg.dataset) == part  # no split: the training subset is the evaluated set itself
     record = {"task": "scanpath", "dataset": cfg.dataset, "split": split_name(cfg)}
 
@@ -498,6 +521,7 @@ def run(cfg: ScanpathConfig) -> dict[str, Any]:
     }
 
 
-__all__ = ["ScanpathConfig", "aggregate", "centre_bias_fit", "centre_bias_model", "density_metrics_mask",
+__all__ = ["ScanpathConfig", "aggregate", "centre_bias_fit", "centre_bias_model", "cut_at_first_target_fixation",
+           "density_metrics_mask",
            "grid_diagnostics", "parallel_per_fixation_scores", "per_fixation_scores", "predict", "run",
            "scored_fixations", "scores", "select", "shard_indices", "split_name", "subset_scanpaths"]

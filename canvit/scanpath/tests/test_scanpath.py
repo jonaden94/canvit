@@ -10,9 +10,10 @@ import pysaliency
 import pytest
 import torch
 from pysaliency.baseline_utils import CrossvalidatedBaselineModel
+from pysaliency.utils.variable_length_array import VariableLengthArray
 
 from canvit.scanpath.data import ScanpathDataset, clip_to_stimuli, collate_scanpath, local_mirror, pixel_to_scene
-from canvit.scanpath.evaluate import scores, select
+from canvit.scanpath.evaluate import cut_at_first_target_fixation, scores, select
 from canvit.scanpath.models import GridScanpathModel, _pixel_cells, fit_centre_bias, grid_log_density
 
 from .conftest import H, W, scanpaths
@@ -118,6 +119,20 @@ def test_select_by_condition_and_limit(fake_search):
     assert len(select(fv, condition="tp", limit=None).scanpaths) == tp.sum()
     assert len(select(fv, condition="ta", limit=None).scanpaths) == (~tp).sum()
     assert len(select(fv, condition="both", limit=5).scanpaths) == 5
+
+
+def test_cut_keeps_fixations_up_to_the_first_one_in_the_target_box():
+    box = [0.1 * W, 0.2 * H, 0.2 * W, 0.2 * H]  # x 16.8..50.4, y 21..42
+    inn, out = (30.0, 30.0), (W / 2, H / 2)  # the start fixation (index 0) in the box does not count
+    paths = [[inn, out, inn, out, inn], [out, out, out], [out, inn]]
+    fix = pysaliency.ScanpathFixations(pysaliency.Scanpaths(
+        xs=VariableLengthArray([[p[0] for p in s] for s in paths]),
+        ys=VariableLengthArray([[p[1] for p in s] for s in paths]), n=np.zeros(3, int),
+        ts=VariableLengthArray([list(range(len(s))) for s in paths]),
+        scanpath_attributes={"target_present": np.ones(3, int), "target_bbox": np.array([box] * 3)}))
+    cut = cut_at_first_target_fixation(fix)
+    assert list(zip(cut.scanpath_index, cut.scanpath_history_length)) == [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1),
+                                                                         (1, 2), (2, 0), (2, 1)]
 
 
 def test_clipping_reaches_fixations_and_histories(fake_search):

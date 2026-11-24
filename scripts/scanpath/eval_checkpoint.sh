@@ -16,6 +16,8 @@
 #      checkpoints 1680x1050: COCO-Search18 content only ever occupied the scene rows of that box; owner decision
 #      2026-11-23); "scene" = the comparison rows (stimulus fills the scene), written as <stem>_scene.*
 #      PART=test: COCO-Search18's official test split instead of data.eval_part (a second evaluation).
+#      CUT=1: COCO-Search18 TP only, CPU: score the saved <stem>.npz with every scanpath cut at its first target
+#      fixation (--cfg.cut-at-target; the test split's format) -> <stem>_cut.json. Run after the uncut record.
 #      RETINA: a multi-retina backbone's retina other than the trained one (--cfg.retina; head and policy were
 #      trained through one retina, so others are out of distribution for them); give it its own <name>.
 # On SLURM: slurm/runs/scanpath/eval_checkpoint.sbatch (same arguments).
@@ -38,9 +40,10 @@ for s in "${SETS[@]}"; do
   if [ -n "${DISPLAY_FRAME:-}" ]; then
     frame=(--cfg.display-frame "$DISPLAY_FRAME"); [ "$DISPLAY_FRAME" = scene ] && stem="${stem}_scene"
   fi
+  base=$stem; [ -n "${CUT:-}" ] && stem="${stem}_cut"
   retina=(); [ -n "${RETINA:-}" ] && retina=(--cfg.retina "$RETINA")
   train=(--cfg.train-scanpaths "$N")
-  [ "$has_train" = 1 ] && train+=(--cfg.save-train-predictions "$OUT/${stem}_train$N.npz")
+  [ "$has_train" = 1 ] && train+=(--cfg.save-train-predictions "$OUT/${base}_train$N.npz")
   common=(--cfg.dataset "$ds" --cfg.condition "$cond" --cfg.part "$split_part" --cfg.model canvit_policy --cfg.ckpt "$CKPT" "${frame[@]}" "${retina[@]}"
           --cfg.num-workers "${NUM_WORKERS:-2}" --cfg.batch-size "${BATCH_SIZE:-16}" "${train[@]}")
   if [ -n "${SHARD:-}" ]; then  # GPU stage of one block
@@ -54,7 +57,9 @@ for s in "${SETS[@]}"; do
   fi
   [ -f "$OUT/$stem.json" ] && { echo "skip $OUT/$stem.json"; continue; }
   echo "$(date '+%F %H:%M') $stem"
-  if [ -n "${SHARDS:-}" ]; then  # CPU stage: score the shards' predictions
+  if [ -n "${CUT:-}" ]; then  # CPU: the uncut predictions, scored on the cut scanpaths
+    run=(--cfg.predictions "$OUT/$base.npz" --cfg.device cpu --cfg.cut-at-target)
+  elif [ -n "${SHARDS:-}" ]; then  # CPU stage: score the shards' predictions
     preds=(); for ((i = 0; i < SHARDS; i++)); do preds+=("$OUT/$stem.shard${i}of$SHARDS.npz"); done
     run=(--cfg.predictions "${preds[@]}" --cfg.device cpu)
   else
