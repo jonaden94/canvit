@@ -40,15 +40,18 @@ log = logging.getLogger(__name__)
 STEMS = {"tp": "coco_search18_tp_validation", "ta": "coco_search18_ta_validation", "fv": "coco_freeview_validation"}
 # pixels per degree of the eye-tracking displays (as protocol.deepgaze.ppd of the DeepGaze III records)
 PPD = {"coco_search18": 31.1, "coco_freeview": 31.1}
-FORMS = {"none": (), "log": ("a",), "linear+log": ("a", "b")}
+FORMS = {"none": (), "linear": ("b",), "quadratic": ("q",), "log": ("a",), "linear+log": ("a", "b")}
+SUMMARY_FORMS = ("none", "log", "linear+log")  # what evaluate_entry fits; linear/quadratic: the form comparison
 TAUS = np.unique(np.concatenate([np.geomspace(0.25, 128.0, 37), [1.0]]))  # the best-tau sweep (val)
 CHUNK = 6000  # fixations per autograd pass
 
 
 # --------------------------------------------------------------------------------------------------- data
-def _batch(path: Path, part: str) -> dict:
+def _batch(path: Path, part: str, analysis: bool = False) -> dict:
     """One record's CellBatch (``priors.cell_batch``, val or its training subset) reduced to what the fit needs:
-    logits, log pixels per cell, the human's cell, image index, and d (deg) from the current fixation to every cell."""
+    logits, log pixels per cell, the human's cell, image index, and d (deg) from the current fixation to every cell.
+    ``analysis``: also the centre bias per cell (``log_cb``, for the no-policy base) and the humans' saccade
+    lengths (``amp_deg``)."""
     from .data import letterbox_geometry, load_dataset
     from .evaluate import ScanpathConfig, centre_bias_model, select, train_subset
     from .models import GridScanpathModel
@@ -77,9 +80,17 @@ def _batch(path: Path, part: str) -> dict:
         h, w = (int(v) for v in st.sizes[int(n)])
         cw = letterbox_geometry(h, w, model.scene, model.frame)[1]
         deg[b.n == n] = w * model.scene / (2 * cw) / PPD[rec["dataset"]]
-    return {"logits": b.logits.astype(np.float32), "logcount": b.logcount.astype(np.float32), "cell": b.cell,
-            "n": b.n, "d": (d_scene * deg[:, None]).astype(np.float32), "r": (deg / grid).astype(np.float32),
-            "grid": grid}
+    out = {"logits": b.logits.astype(np.float32), "logcount": b.logcount.astype(np.float32), "cell": b.cell,
+           "n": b.n, "d": (d_scene * deg[:, None]).astype(np.float32), "r": (deg / grid).astype(np.float32),
+           "grid": grid}
+    if analysis:
+        from .models import without_start_fixations
+        sx = without_start_fixations(fx)  # same order as the batch (priors.cell_batch)
+        xh = np.array([sx.x_hist[i][int(b.t[i]) - 1] for i in range(len(sx))])
+        yh = np.array([sx.y_hist[i][int(b.t[i]) - 1] for i in range(len(sx))])
+        out |= {"log_cb": np.nan_to_num(b.log_cb).astype(np.float32),
+                "amp_deg": np.hypot(np.asarray(sx.x) - xh, np.asarray(sx.y) - yh) / PPD[rec["dataset"]]}
+    return out
 
 
 def train_npz(path: Path, rec: dict) -> Path:
@@ -103,7 +114,8 @@ def _tensors(key: str, D: dict) -> dict:
             "logcount": torch.as_tensor(D["logcount"], dtype=torch.float64),
             "d": torch.as_tensor(D["d"], dtype=torch.float64),
             "r": torch.as_tensor(D["r"], dtype=torch.float64)[:, None],
-            "cell": torch.as_tensor(D["cell"]).long(), "n": np.asarray(D["n"])}
+            "cell": torch.as_tensor(D["cell"]).long(), "n": np.asarray(D["n"])} | (
+        {"log_cb": torch.as_tensor(D["log_cb"], dtype=torch.float64)} if "log_cb" in D else {})
 
 
 def _chunk(D: dict, i: int, j: int) -> dict:
@@ -111,15 +123,22 @@ def _chunk(D: dict, i: int, j: int) -> dict:
 
 
 # ---------------------------------------------------------------------------------------------------- fit
-def log_p(form: str, p: dict, D: dict, tau: torch.Tensor | float | None = None) -> torch.Tensor:
-    """[N, C] log p(cell); ``tau`` None: exp(p['log_tau_<key>'])."""
-    if tau is None:
-        tau = torch.exp(p[f"log_tau_{D['key']}"])
-    z = D["logits"] / tau + D["logcount"]
+def log_p(form: str, p: dict, D: dict, tau: torch.Tensor | float | None = None, base: str = "policy"
+          ) -> torch.Tensor:
+    """[N, C] log p(cell); ``tau`` None: exp(p['log_tau_<key>']). ``base`` "cb": the centre bias instead of the
+    policy (no tau; needs ``_batch(analysis=True)``)."""
+    if base == "cb":
+        z = D["log_cb"] + D["logcount"]
+    else:
+        if tau is None:
+            tau = torch.exp(p[f"log_tau_{D['key']}"])
+        z = D["logits"] / tau + D["logcount"]
     if "a" in FORMS[form]:
         z = z + p["a"] * torch.log(D["d"] + D["r"])
     if "b" in FORMS[form]:
         z = z - p["b"] * D["d"]
+    if "q" in FORMS[form]:
+        z = z - p["q"] * D["d"] ** 2
     return torch.log_softmax(z, 1)
 
 
@@ -127,9 +146,11 @@ def _human(lp: torch.Tensor, D: dict) -> torch.Tensor:
     return lp[torch.arange(len(D["cell"])), D["cell"]]
 
 
-def fit(form: str, train: list[dict]) -> tuple[dict[str, float], dict[str, float]]:
-    """Maximum-likelihood parameters (tau per dataset, the prior shared) and their image-clustered SEs."""
-    names = [f"log_tau_{D['key']}" for D in train] + list(FORMS[form])
+def fit(form: str, train: list[dict], base: str = "policy") -> tuple[dict[str, float], dict[str, float], np.ndarray]:
+    """Maximum-likelihood parameters (tau per dataset, the prior shared), their image-clustered SEs and covariance."""
+    names = ([f"log_tau_{D['key']}" for D in train] if base == "policy" else []) + list(FORMS[form])
+    if not names:
+        return {}, {}, np.zeros((0, 0))
     N = sum(len(D["cell"]) for D in train)
 
     def pieces():
@@ -141,7 +162,7 @@ def fit(form: str, train: list[dict]) -> tuple[dict[str, float], dict[str, float
         val, grad = 0.0, np.zeros(len(x))
         for C in pieces():
             xt = torch.tensor(x, dtype=torch.float64, requires_grad=True)
-            loss = -_human(log_p(form, dict(zip(names, xt)), C), C).sum() / N
+            loss = -_human(log_p(form, dict(zip(names, xt)), C, base=base), C).sum() / N
             loss.backward()
             val, grad = val + float(loss.detach()), grad + xt.grad.numpy()
         return val, grad
@@ -157,14 +178,15 @@ def fit(form: str, train: list[dict]) -> tuple[dict[str, float], dict[str, float
         G = np.zeros((inv.max() + 1, len(names)))  # per-image sums of the per-fixation scores
         for i in range(0, len(D["cell"]), CHUNK):
             C = _chunk(D, i, i + CHUNK)
-            H += torch.autograd.functional.hessian(lambda x: -_human(log_p(form, dict(zip(names, x)), C), C).sum(),
-                                                   xh).numpy()
-            np.add.at(G, inv[i:i + CHUNK], torch.func.jacfwd(lambda x: _human(log_p(form, dict(zip(names, x)), C),
-                                                                              C))(xh).numpy())
+            def ll(x, C=C):  # [n] log p(the human's cell)
+                return _human(log_p(form, dict(zip(names, x)), C, base=base), C)
+            H += torch.autograd.functional.hessian(lambda x: -ll(x).sum(), xh).numpy()
+            np.add.at(G, inv[i:i + CHUNK], torch.func.jacfwd(ll)(xh).numpy())
         meat += G.T @ G
     Hi = np.linalg.inv(H)
-    se = np.sqrt(np.clip(np.diag(Hi @ meat @ Hi), 0, None))
-    return dict(zip(names, map(float, res.x))), dict(zip(names, map(float, se)))
+    cov = Hi @ meat @ Hi
+    se = np.sqrt(np.clip(np.diag(cov), 0, None))
+    return dict(zip(names, map(float, res.x))), dict(zip(names, map(float, se))), cov
 
 
 def image_average(v: np.ndarray, n: np.ndarray) -> float:
@@ -172,18 +194,19 @@ def image_average(v: np.ndarray, n: np.ndarray) -> float:
     return ia(v, n)
 
 
-def val_ig(form: str, p: dict, V: dict, record_ig: float, taus=None) -> np.ndarray:
+def val_ig(form: str, p: dict, V: dict, record_ig: float, taus=None, base: str = "policy") -> np.ndarray:
     """IG over the centre bias (bits/fix, per image) on validation: the record's IG (policy at tau = 1, no prior)
-    plus the exact per-fixation shift. ``taus`` None: the fitted tau; else one value per tau (prior fixed)."""
+    plus the exact per-fixation shift. ``taus`` None: the fitted tau; else one value per tau (prior fixed).
+    ``base`` "cb": over the centre bias itself (pass record_ig = 0; the cell-level shift is exact)."""
     pt = {k: torch.tensor(v, dtype=torch.float64) for k, v in p.items()}
     grid = [None] if taus is None else list(taus)
     shift = np.zeros((len(grid), len(V["cell"])))
     with torch.no_grad():
         for i in range(0, len(V["cell"]), CHUNK):
             C = _chunk(V, i, i + CHUNK)
-            ref = _human(log_p("none", {}, C, tau=1.0), C)
+            ref = _human(log_p("none", {}, C, tau=1.0, base=base), C)
             for j, tau in enumerate(grid):
-                shift[j, i:i + CHUNK] = ((_human(log_p(form, pt, C, tau=tau), C) - ref) / np.log(2)).numpy()
+                shift[j, i:i + CHUNK] = ((_human(log_p(form, pt, C, tau=tau, base=base), C) - ref) / np.log(2)).numpy()
     return np.array([record_ig + image_average(s, V["n"]) for s in shift])
 
 
@@ -199,7 +222,7 @@ def evaluate_entry(entry: Path, processes: int = 6) -> dict:
     deg_unit = float(np.median(np.concatenate([v["r"] for v in built.values()]))) * built[jobs[0]]["grid"]
     grid = built[jobs[0]]["grid"]
     train = [_tensors(k, built.pop((k, "train"))) for k in recs]
-    fits = {form: fit(form, train) for form in FORMS}
+    fits = {form: fit(form, train)[:2] for form in SUMMARY_FORMS}
     for form, (p, se) in fits.items():
         log.info("fit %s: %s", form, {k: f"{v:.4g} +- {se[k]:.2g}" for k, v in p.items()})
     n_train = {D["key"]: len(D["cell"]) for D in train}

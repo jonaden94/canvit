@@ -22,10 +22,19 @@ def _data(key: str, a: float, n: int = 4000, cells: int = 64, seed: int = 0) -> 
 
 def test_fit_recovers_log_prior():
     D = _data("tp", a=-1.5)
-    p, se = sc.fit("log", [D])
+    p, se, cov = sc.fit("log", [D])
     assert abs(p["a"] + 1.5) < 4 * se["a"] + 0.05
     assert abs(np.exp(p["log_tau_tp"]) - 3.0) < 0.6
-    assert se["a"] > 0
+    assert se["a"] > 0 and cov.shape == (2, 2) and np.isclose(np.sqrt(cov[-1, -1]), se["a"])
+
+
+def test_centre_bias_base_and_quadratic():
+    D = _data("tp", a=-1.0)
+    D["log_cb"] = torch.zeros_like(D["logits"])  # a flat centre bias: the base is uniform over the cells
+    p, se, _ = sc.fit("quadratic", [D], base="cb")
+    assert list(p) == ["q"] and p["q"] > 0  # a falling prior; no tau without the policy
+    ig = sc.val_ig("none", {}, D, record_ig=0.0, base="cb")
+    assert np.isclose(ig[0], 0.0)  # the centre bias over itself
 
 
 def test_val_shift_is_zero_at_the_record_model():
