@@ -1427,7 +1427,7 @@ def checkpoint_summary(e: dict, recs: list[dict], out: Path) -> bool:
             a1.plot(gx, _kde_reflect(amplitude(s, "frac", None)[m] * 100, gx, 2.0), **sty[k])
             a2.plot(ga, _kde_circ(np.degrees(np.angle(np.exp(1j * s["angle"][m & (s["length"] >= 0.01)]))), ga, 8.0),
                     **sty[k])
-        a1.set(title=f"{t}\nscanpaths: {len(hxy[0]):,} human, {len(cxy[0]):,} CanViT",
+        a1.set(title=f"{t}\n{len(hxy[0]):,} human / {len(cxy[0]):,} CanViT",
                xlabel="amplitude (% of longer side)", ylabel="density" if j == 0 else None)
         a2.set(xlim=(-180, 180), xticks=[-180, -90, 0, 90, 180], xticklabels=["left", "down", "right", "up", "left"],
                xlabel="direction", ylabel="density" if j == 0 else None)
