@@ -96,6 +96,7 @@ def test_human_fixations_change_the_later_predictions(fake_cs18):
         assert not torch.equal(pa[k][:, 1], pb[k][:, 1])  # after a different fixation 1: not
 
 
+@pytest.mark.slow  # > 10 s on CPU; deselect with -m 'not slow'
 def test_precompute_covers_every_scored_fixation_and_feeds_pysaliency(fake_cs18, fake_search):
     from canvit.scanpath.canvit_models import precompute
     from canvit.scanpath.data import make_scanpath_loader
@@ -178,6 +179,7 @@ def test_non_search_policy_reproduces_its_deploy_rollout_without_a_cue():
 from canvit.search.tests.test_search_eval import trained  # noqa: E402,F401 -- trains the tiny search run once
 
 
+@pytest.mark.slow  # > 10 s on CPU; deselect with -m 'not slow'
 def test_load_builds_the_runs_task_and_policy_from_the_checkpoint_alone(trained):  # noqa: F811
     _, run_dir, _, argv = trained
     ckpt = run_dir / "checkpoints" / "best.pt"
@@ -210,6 +212,7 @@ def test_a_checkpoint_without_run_config_is_refused(tmp_path):
         PolicyEpisode.load(ckpt, device=torch.device("cpu"), need_policy=True)
 
 
+@pytest.mark.slow  # > 10 s on CPU; deselect with -m 'not slow'
 def test_a_non_search_checkpoint_loads_and_scores_human_scanpaths(fake_search, tmp_path):
     """A checkpoint as the harness writes it for a non-search task (in1k: no cue, square training frame, the
     policy in ``policy_state``) builds the same episode, and its predictions score in pysaliency."""
@@ -234,7 +237,9 @@ def test_a_non_search_checkpoint_loads_and_scores_human_scanpaths(fake_search, t
     assert torch.equal(loaded.run(batch, n=2)["policy"], ep.run(batch, n=2)["policy"])
     assert training_display_frame(loaded.task)[0] == "scene"
     # human search trials (with cues) through a model that takes none: the cue is ignored, no cue mixture
+    from canvit.scanpath.evaluate import select
     _, _, sv, fv = fake_search
+    fv = select(fv, condition="both", limit=8)  # target present and absent; keeps the test fast
     scene = loaded.task.cfg.scene_size
     loader = make_scanpath_loader(sv, fv, scene_size=scene, batch_size=4, num_workers=0,
                                   frame=parse_display_frame("scene"))
@@ -247,6 +252,7 @@ def test_a_non_search_checkpoint_loads_and_scores_human_scanpaths(fake_search, t
     assert np.isfinite(model.log_likelihoods(sv, fx)).all()
 
 
+@pytest.mark.slow  # > 10 s on CPU (builds a ViT-S backbone); deselect with -m 'not slow'
 @pytest.mark.parametrize("name", ["distill", "ade20k"])
 def test_distill_and_ade20k_checkpoints_load_to_the_same_policy(name, tmp_path):
     """A foveated distill / ade20k checkpoint as the harness writes it (model built by the task's own checkpoint path,
@@ -298,6 +304,7 @@ def test_distill_and_ade20k_checkpoints_load_to_the_same_policy(name, tmp_path):
 
 # --- free viewing with a search model: the uniform mixture over the cues ------------------------------
 
+@pytest.mark.slow  # > 10 s on CPU; deselect with -m 'not slow'
 def test_cue_mixture_is_the_mean_of_the_per_cue_pixel_densities(fake_cs18):
     from canvit.scanpath.models import _pixel_cells, grid_log_density
     from canvit.search.data import COCO_SEARCH18_CLASSES
@@ -308,10 +315,10 @@ def test_cue_mixture_is_the_mean_of_the_per_cue_pixel_densities(fake_cs18):
     assert m.name == "canvit_search_policy_cuemix"
     mixed = m.forced_logits(batch, 2, CG)  # [B, 2, G*G]
     cell, _ = _pixel_cells(*hw, S, CG)
+    per_cue = [ep.run(batch | {"cue": torch.full((B,), k)}, 2)["policy"] for k in range(len(COCO_SEARCH18_CLASSES))]
     for b in range(B):
         for t in range(2):
-            dens = [np.exp(grid_log_density(ep.run(batch | {"cue": torch.full((B,), k)}, 2)["policy"][b, t].numpy(),
-                                            hw=hw, scene=S)) for k in range(len(COCO_SEARCH18_CLASSES))]
+            dens = [np.exp(grid_log_density(pc[b, t].numpy(), hw=hw, scene=S)) for pc in per_cue]
             expected = np.log(np.mean(dens, 0))
             got = mixed[b, t].numpy()
             assert np.allclose(got[cell], expected, atol=1e-5)  # the mixture, per pixel
@@ -339,11 +346,13 @@ def test_mixture_samples_come_from_the_mixed_density(fake_cs18):
     assert (xy[..., 1].abs() <= 0.67).all()  # clamped onto the image
 
 
+@pytest.mark.slow  # > 10 s on CPU; deselect with -m 'not slow'
 def test_sharded_predictions_equal_the_unsharded_run(fake_cs18, fake_search, tmp_path):
     """--cfg.shard i N writes one block's predictions; --cfg.predictions merges the files: the same table."""
-    from canvit.scanpath.evaluate import ScanpathConfig, predict, shard_indices
+    from canvit.scanpath.evaluate import ScanpathConfig, predict, select, shard_indices
     from canvit.scanpath.models import GridScanpathModel
     _, _, sv, fv = fake_search
+    fv = select(fv, condition="both", limit=12)  # enough for three uneven shards; keeps the test fast
     cfg = ScanpathConfig(scene_size=S, grid=CG, batch_size=4, num_workers=0, display_frame="1680x1050")
     m = CanViTModel(_episode(fake_cs18[0]), "policy")
     whole = predict(cfg, m, sv, fv)
