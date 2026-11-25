@@ -1,0 +1,400 @@
+diff --git a/canvit/harness/config.py b/canvit/harness/config.py
+index 43ebddb..b19ce11 100644
+--- a/canvit/harness/config.py
++++ b/canvit/harness/config.py
+@@ -138,6 +138,21 @@ class JointPolicyConfig:
+     ``per_step``). ``ema_abs``: divide by an EMA of the mean absolute reward and clip to +-10
+     (Haoze). ``none``: no scaling."""
+ 
++    # Optional per-saccade cost (objective='pg' with reward='terminal' only; refused elsewhere).
++    # d = Euclidean distance between consecutive glimpse centres in [-1, 1] units (scene width 2;
++    # the first saccade starts at t0's scene centre). "none" (default) leaves every run unchanged.
++    saccade_cost: Literal["none", "log", "linear"] = "none"
++    """``log``: c(d) = log(1 + d / r), r = half a policy-grid cell (1 / centers_per_axis) — the
++    form that fits human saccade lengths best post hoc. ``linear``: c(d) = d / 2, the fraction of
++    the scene width. ``none``: no cost, nothing measured."""
++    saccade_cost_weight: float = 0.0
++    """beta (``standardized``) or lambda (``raw``). 0 with a form set: saccade lengths and costs
++    are logged (policy/saccade_len, policy/saccade_cost) but the target is unchanged."""
++    saccade_cost_combine: Literal["standardized", "raw"] = "standardized"
++    """``standardized``: action t's target = the standardised reward - weight * z_batch(c_t);
++    unit-free, so the weight keeps its meaning while the terminal reward shrinks ~10x over
++    training. ``raw``: target = standardise(R - weight * sum_t c_t), the cost in reward units."""
++
+     # VPG only (objective="vpg"); ignored by qreg/pg. Defaults = autoreg exp12's values.
+     vpg_entropy_bonus: float = 5e-3
+     """FIXED entropy weight (autoreg ``rl_entropy_weight``). Separate from ``entropy_bonus``
+diff --git a/canvit/harness/policy/build.py b/canvit/harness/policy/build.py
+index f72d62b..4e588ee 100644
+--- a/canvit/harness/policy/build.py
++++ b/canvit/harness/policy/build.py
+@@ -35,7 +35,7 @@ from canvit.core.policy import (
+     fixation_candidates,
+ )
+ from canvit.harness.config import FoveatedScaleConfig, JointPolicyConfig
+-from canvit.harness.policy.joint import JointPolicy
++from canvit.harness.policy.joint import JointPolicy, SaccadeCost
+ from canvit.harness.policy.rl import PG, VPG, Objective, QReg, resolve_reward
+ from canvit.harness.rollout.selector import PolicySelector, RandomSelector
+ 
+@@ -116,6 +116,16 @@ def build_policy(
+     # Reward kind + centring + scaling; refuses what the objective cannot honour.
+     reward = resolve_reward(objective=obj, reward=rl.reward, center=rl.reward_center, scale=rl.reward_scale)
+ 
++    # Optional saccade cost: defined on the deferred (terminal-reward) PG path only.
++    saccade_cost = SaccadeCost(form=rl.saccade_cost, weight=rl.saccade_cost_weight,
++                               combine=rl.saccade_cost_combine, r=1.0 / rl.centers_per_axis)
++    if saccade_cost.active and not (isinstance(obj, PG) and reward.kind == "terminal"):
++        raise ValueError(
++            f"saccade_cost={rl.saccade_cost!r} is implemented for objective='pg' with "
++            f"reward='terminal' only (got objective={rl.objective!r}, reward={reward.kind!r}).")
++    if not saccade_cost.active and rl.saccade_cost_weight != 0.0:
++        raise ValueError("saccade_cost_weight is set but saccade_cost='none': choose 'log' or 'linear'.")
++
+     # VPG is defined for the FOVEATED action space (autoreg_tryout only ever ran a foveated
+     # model). It runs on uniform and is internally consistent there, but it is not the same
+     # problem: the action space gains a SCALE dimension the original never had, and t0
+@@ -197,7 +207,7 @@ def build_policy(
+         rl_weight=rl.rl_weight, keep_random_branch=rl.keep_random_branch,
+         target_momentum=rl.target_momentum, device=device,
+         prime_target=rl.prime_on_policy, prime_warmup=rl.policy_warmup_steps,
+-        reward=reward,
++        reward=reward, saccade_cost=saccade_cost,
+     )
+     if isinstance(obj, PG) and obj.entropy_target is not None:
+         alpha0 = obj.entropy_bonus if obj.alpha_init is None else obj.alpha_init
+diff --git a/canvit/harness/policy/joint.py b/canvit/harness/policy/joint.py
+index a8af05a..496b9fa 100644
+--- a/canvit/harness/policy/joint.py
++++ b/canvit/harness/policy/joint.py
+@@ -23,6 +23,7 @@ groups): distillation has no task probe, unlike the ADE20K policy trainer.
+ """
+ 
+ from dataclasses import dataclass, field
++from typing import Literal
+ 
+ import torch
+ import torch.distributed as dist
+@@ -49,6 +50,52 @@ from canvit.harness.rollout.selector import PolicySelector, RandomSelector
+ from canvit.harness.rollout.viewpoint import ViewpointType
+ 
+ 
++@dataclass(frozen=True)
++class SaccadeCost:
++    """Optional cost of each policy saccade on the terminal-reward PG target
++    (``JointPolicyConfig.saccade_cost*``). ``d`` is the Euclidean distance between
++    consecutive glimpse centres in the [-1, 1] centre units (scene width = 2).
++
++    ``log``: c(d) = log(1 + d / r), r = half a policy-grid cell (= 1 / centers_per_axis).
++    ``linear``: c(d) = d / 2, the fraction of the scene width. ``none``: no cost (default).
++
++    ``combine='standardized'``: target_t = std(R) - weight * z_batch(c_t), where std(R) is
++    the reward as the resolved ``RewardSpec`` centres/scales it; unit-free, so ``weight``
++    keeps its meaning while R shrinks over training. ``combine='raw'``: the cost enters in
++    reward units, target_t = std(R - weight * sum_t c_t)."""
++
++    form: Literal["none", "log", "linear"] = "none"
++    weight: float = 0.0
++    combine: Literal["standardized", "raw"] = "standardized"
++    r: float = 1.0 / 32
++    std_eps: float = 1e-2
++    """Floor on the batch std of c_t in the ``standardized`` combination (cost units; the log
++    cost's batch std is ~1, the linear one's ~0.2)."""
++
++    @property
++    def active(self) -> bool:
++        """Saccade lengths are measured (and logged). ``weight == 0`` leaves the target unchanged."""
++        return self.form != "none"
++
++    def cost(self, d: Tensor) -> Tensor:
++        if self.form == "log":
++            return torch.log1p(d / self.r)
++        assert self.form == "linear", f"no cost for form={self.form!r}"
++        return d / 2.0
++
++
++def _batch_z(x: Tensor, mask: Tensor | None, *, eps: float) -> Tensor:
++    """Population z-score over the batch (only masked-in rows; the others are 0), the std
++    floored at ``eps``: a batch whose saccades are (nearly) equal long gets a (nearly) zero
++    cost term instead of its rounding noise blown up to unit scale."""
++    if mask is not None:
++        out = torch.zeros_like(x)
++        if bool(mask.any()):
++            out[mask] = _batch_z(x[mask], None, eps=eps)
++        return out
++    return (x - x.mean()) / x.std(unbiased=False).clamp_min(eps)
++
++
+ @dataclass
+ class JointPolicy:
+     """Owns the policy machinery consulted by ``training_step`` when RL is on: the
+@@ -72,6 +119,8 @@ class JointPolicy:
+     reward: RewardSpec = field(default_factory=lambda: RewardSpec("fractional", "running_mean", "running_std"))
+     """The resolved reward (``rl.resolve_reward``). The default is the historical QReg/PG one."""
+     ema_abs: dict[int, Tensor] = field(default_factory=dict)  # per-depth state of reward_scale='ema_abs'
++    saccade_cost: SaccadeCost = field(default_factory=SaccadeCost)
++    """Optional per-saccade cost (terminal-reward PG only). The default is off."""
+     _rollout_entropies: list = field(default_factory=list)  # entropy_update='per_rollout' accumulator
+ 
+     def branch_selector(self, t0_type: ViewpointType) -> tuple[object, bool]:
+@@ -209,7 +258,8 @@ class JointPolicy:
+         return self.scorer.vhead(feats.float().mean(dim=(2, 3))).squeeze(-1)
+ 
+     def trajectory_loss(self, *, scores: Tensor, flat_idx: Tensor, values: Tensor | None,
+-                        reward: Tensor, mask: Tensor | None = None) -> Tensor:
++                        reward: Tensor, mask: Tensor | None = None,
++                        saccade_len: Tensor | None = None) -> Tensor:
+         """The weighted policy loss for a WHOLE trajectory (the deferred, terminal-reward
+         path). ``scores`` [B, T, A] carries grad; ``reward`` [B] is the detached terminal
+         reward, given to every one of the T actions. ``mask`` [B] (PG only): the trials that
+@@ -221,9 +271,22 @@ class JointPolicy:
+         PG (``values=None``): per action step t, the reward is centred/scaled under the
+         resolved ``RewardSpec`` (depth t+1, the depth the inline path would use) and fed to
+         :func:`pg_loss`; the result is the MEAN over the T steps, the same scale as the
+-        inline path's mean over depths."""
++        inline path's mean over depths.
++
++        ``saccade_len`` [B, T] (detached; only with an active ``saccade_cost``, PG only): the
++        length of each action's saccade. Action t's target is lowered by its OWN cost c_t
++        (``standardized``) or the reward by the trajectory's summed cost (``raw``); see
++        :class:`SaccadeCost`. Absent => the historical computation, unchanged."""
+         obj = self.objective
+         self._require_pg_for_mask(mask)
++        sc = self.saccade_cost
++        cost = None
++        if saccade_len is not None:
++            if not isinstance(obj, PG):
++                raise NotImplementedError("the saccade cost is implemented for objective='pg' only")
++            cost = sc.cost(saccade_len.float())
++            if sc.combine == "raw" and sc.weight != 0.0:
++                reward = reward - sc.weight * cost.sum(dim=1)
+         if isinstance(obj, VPG):
+             assert values is not None
+             loss, metrics = vpg_loss(
+@@ -238,6 +301,8 @@ class JointPolicy:
+         losses, entropies = [], []
+         for t in range(n_steps):
+             target = self._standardize(t + 1, reward, mask)
++            if cost is not None and sc.combine == "standardized" and sc.weight != 0.0:
++                target = target - sc.weight * _batch_z(cost[:, t], mask, eps=sc.std_eps)
+             if mask is None:
+                 loss_t, ent_t, _ = pg_loss(scores[:, t], flat_idx[:, t], target, alpha=self._alpha(obj),
+                                            crit_all=None)
+@@ -253,6 +318,10 @@ class JointPolicy:
+         ent_mean = torch.stack(entropies).mean()
+         self.last_step = {"policy_entropy": ent_mean,
+                           "alpha": torch.as_tensor(self._alpha(obj)).detach().float()}
++        if cost is not None:  # logged as policy/saccade_len (centre units, scene width 2), policy/saccade_cost
++            assert saccade_len is not None
++            self.last_step["saccade_len"] = saccade_len.float().mean()
++            self.last_step["saccade_cost"] = cost.mean()
+         return self.rl_weight * torch.stack(losses).mean()
+ 
+     def glimpse_loss(self, *, depth: int, scores: Tensor, flat_idx: Tensor, reward: Tensor,
+diff --git a/canvit/harness/rollout/engine.py b/canvit/harness/rollout/engine.py
+index 973581e..12de18f 100644
+--- a/canvit/harness/rollout/engine.py
++++ b/canvit/harness/rollout/engine.py
+@@ -269,6 +269,11 @@ def run_rollout(
+         # Empty for the historical inline-credit objectives (QReg/PG).
+         defer = is_policy and joint is not None and joint.defers_credit
+         traj: list[dict[str, Tensor]] = []
++        # Optional saccade cost (terminal-reward PG only, refused elsewhere by build_policy):
++        # the length of each policy saccade, measured from the previous glimpse centre (t0's
++        # FULL view sits at the scene centre). Off => nothing is measured, the path is unchanged.
++        measure_saccades = defer and joint is not None and joint.saccade_cost.active
++        prev_centre: Tensor | None = None
+ 
+         # Optional per-glimpse task metrics (distill's scene/cls sub-losses), summed
+         # here and averaged over the branch below. Absent hook => untouched fast path.
+@@ -304,6 +309,8 @@ def run_rollout(
+             L = task.step_loss(gout.readout)
+         _viz_capture(branch_idx, gout, vp0_named, vp0, L)
+         _acc(L)
++        if measure_saccades:
++            prev_centre = vp0.centers.detach().float()
+         if is_policy and not defer:  # seed the reward denominator with the FULL-anchor loss (no policy loss at t0)
+             prev_pi_loss = task.per_image_loss(gout.readout).detach()
+ 
+@@ -345,6 +352,11 @@ def run_rollout(
+                 assert joint is not None and aux is not None
+                 traj.append({"scores": aux["scores"], "flat_idx": aux["flat_idx"],
+                              "value": joint.state_value(aux["feats"]) if joint.needs_value else None})
++                if measure_saccades:
++                    assert prev_centre is not None
++                    centre = vp.centers.detach().float()  # [B, 2] (cy, cx) in [-1, 1]
++                    traj[-1]["saccade_len"] = (centre - prev_centre).norm(dim=-1)
++                    prev_centre = centre
+             elif is_policy:
+                 assert joint is not None and prev_pi_loss is not None and aux is not None
+                 cur_pi = task.per_image_loss(gout.readout).detach()
+@@ -392,6 +404,8 @@ def run_rollout(
+                     flat_idx=torch.stack([a["flat_idx"] for a in traj], dim=1),
+                     values=torch.stack([a["value"] for a in traj], dim=1) if joint.needs_value else None,
+                     reward=reward, **mask_kw,
++                    **({"saccade_len": torch.stack([a["saccade_len"] for a in traj], dim=1)}
++                       if measure_saccades else {}),
+                 ) * n_glimpses
+                 chunk_loss = chunk_loss + ploss
+                 pol_acc["loss"] = pol_acc["loss"] + ploss.detach() / n_glimpses
+diff --git a/canvit/harness/tests/test_saccade_cost.py b/canvit/harness/tests/test_saccade_cost.py
+new file mode 100644
+index 0000000..c9fff9c
+--- /dev/null
++++ b/canvit/harness/tests/test_saccade_cost.py
+@@ -0,0 +1,143 @@
++"""The optional per-saccade cost on the terminal-reward PG target (``JointPolicyConfig.saccade_cost*``).
++
++Off (the default) and weight 0 must reproduce the historical trajectory loss bit for bit; a
++positive weight must lower the target of the actions with the longest saccades. CPU only.
++"""
++
++from dataclasses import replace
++
++import pytest
++import torch
++
++import canvit.harness.policy.joint as joint_mod
++from canvit.harness.policy.joint import JointPolicy, SaccadeCost
++from canvit.harness.policy.rl import PG, RewardSpec
++
++B, T, A = 8, 3, 16
++SEARCH_REWARD = RewardSpec("terminal", "batch_mean", "batch_std")
++
++
++def _jp(cost: SaccadeCost = SaccadeCost()) -> JointPolicy:
++    # Only the trajectory-loss fields are used; the selectors/scorer are not touched here.
++    return JointPolicy(policy_selector=None, random_selector=None, scorer=None,  # type: ignore[arg-type]
++                       objective=PG(entropy_bonus=1e-3, entropy_target=None), rl_weight=1.0,
++                       keep_random_branch=False, target_momentum=0.997, device=torch.device("cpu"),
++                       reward=SEARCH_REWARD, saccade_cost=cost)
++
++
++def _batch(seed: int = 0):
++    g = torch.Generator().manual_seed(seed)
++    scores = torch.randn(B, T, A, generator=g)
++    flat_idx = torch.randint(A, (B, T), generator=g)
++    reward = -torch.rand(B, generator=g)
++    saccade_len = 2 * torch.rand(B, T, generator=g)  # [-1, 1] units: 0 .. scene width
++    mask = torch.arange(B) % 2 == 0  # as search: target-absent trials carry no reward
++    return scores, flat_idx, reward, saccade_len, mask
++
++
++def _loss_and_grad(jp: JointPolicy, scores: torch.Tensor, **kw):
++    s = scores.clone().requires_grad_(True)
++    loss = jp.trajectory_loss(scores=s, values=None, **kw)
++    loss.backward()
++    return loss.detach(), s.grad
++
++
++@pytest.mark.parametrize("with_mask", [False, True])
++@pytest.mark.parametrize("form", ["log", "linear"])
++def test_no_cost_or_zero_weight_is_the_historical_loss_bit_for_bit(with_mask, form):
++    scores, flat_idx, reward, saccade_len, mask = _batch()
++    kw = {"flat_idx": flat_idx, "reward": reward} | ({"mask": mask} if with_mask else {})
++    ref_loss, ref_grad = _loss_and_grad(_jp(), scores, **kw)
++    for combine in ("standardized", "raw"):
++        loss, grad = _loss_and_grad(_jp(SaccadeCost(form, 0.0, combine)), scores, saccade_len=saccade_len, **kw)
++        assert torch.equal(loss, ref_loss) and torch.equal(grad, ref_grad)
++
++
++def _targets(monkeypatch, jp: JointPolicy, **kw) -> torch.Tensor:
++    seen = []
++    real = joint_mod.pg_loss
++
++    def spy(scores, flat_idx, target, **k):
++        seen.append(target.clone())
++        return real(scores, flat_idx, target, **k)
++
++    monkeypatch.setattr(joint_mod, "pg_loss", spy)
++    jp.trajectory_loss(values=None, **kw)
++    return torch.stack(seen, dim=1)  # [B, T]
++
++
++@pytest.mark.parametrize("form", ["log", "linear"])
++def test_a_positive_weight_lowers_the_target_of_long_saccades(monkeypatch, form):
++    scores, flat_idx, reward, saccade_len, _ = _batch()
++    kw = {"scores": scores, "flat_idx": flat_idx, "reward": reward, "saccade_len": saccade_len}
++    base = _targets(monkeypatch, _jp(SaccadeCost(form, 0.0)), **kw)
++    beta = 0.3
++    got = _targets(monkeypatch, _jp(SaccadeCost(form, beta)), **kw)
++    shift = got - base  # = -beta * z_batch(c_t): per step, longer saccade -> lower target
++    for t in range(T):
++        order = saccade_len[:, t].argsort()
++        assert (shift[order, t].diff() <= 1e-6).all()
++        assert torch.allclose(shift[:, t].mean(), torch.tensor(0.0), atol=1e-6)  # centred: no net push
++        assert torch.allclose(shift[:, t].std(unbiased=False), torch.tensor(beta), atol=1e-5)
++
++
++def test_raw_combine_is_the_cost_subtracted_from_the_reward(monkeypatch):
++    scores, flat_idx, reward, saccade_len, _ = _batch()
++    lam, sc = 0.05, SaccadeCost("log", 0.05, "raw", r=1 / 32)
++    got = _targets(monkeypatch, _jp(sc), scores=scores, flat_idx=flat_idx, reward=reward, saccade_len=saccade_len)
++    want = _targets(monkeypatch, _jp(), scores=scores, flat_idx=flat_idx,
++                    reward=reward - lam * torch.log1p(saccade_len * 32).sum(dim=1))
++    assert torch.allclose(got, want)
++
++
++def test_cost_forms():
++    d = torch.tensor([0.0, 1 / 32, 2.0])
++    assert torch.allclose(SaccadeCost("log", r=1 / 32).cost(d), torch.log1p(d * 32))
++    assert torch.allclose(SaccadeCost("log", r=1 / 32).cost(d)[1], torch.tensor(2.0).log())  # d = r -> log 2
++    assert torch.allclose(SaccadeCost("linear").cost(d), torch.tensor([0.0, 1 / 64, 1.0]))
++
++
++# --------------------------------------------------------------------------- #
++# Through run_rollout + build_policy, on the tiny foveated model of test_reward_options
++# --------------------------------------------------------------------------- #
++from canvit.harness.config import JointPolicyConfig  # noqa: E402
++from canvit.harness.tests.test_reward_options import _build, _MaskedTask, _rollout, seg  # noqa: E402,F401
++
++
++def _rl(**kw) -> JointPolicyConfig:
++    return JointPolicyConfig(objective="pg", select_bn_eval=False, reward="terminal", reward_center="batch_mean",
++                             reward_scale="batch_std", width=16, block_layers=1, centers_per_axis=32, **kw)
++
++
++def _rollout_grads(seg, rl):
++    from canvit.harness.tests.test_task_digests import _B
++    torch.manual_seed(1)
++    jp = _build(seg, rl, scorer_input_norm="none")
++    out = _rollout(seg, jp, _MaskedTask(seg, mask=None, bump=torch.ones(_B)))
++    return torch.cat([p.grad.flatten() for p in jp.scorer.parameters() if p.grad is not None]), out
++
++
++def test_rollout_with_zero_weight_trains_exactly_as_without_and_logs_saccades(seg):
++    base, out0 = _rollout_grads(seg, _rl())
++    assert "saccade_len" not in out0.policy_metrics
++    same, out = _rollout_grads(seg, _rl(saccade_cost="log"))
++    assert torch.equal(base, same)
++    d = float(out.policy_metrics["saccade_len"])
++    assert 0.0 < d <= 2 * 2 ** 0.5  # centre units: at most the scene diagonal
++    moved, _ = _rollout_grads(seg, _rl(saccade_cost="log", saccade_cost_weight=0.3))
++    assert not torch.equal(base, moved)  # the cost reaches the scorer gradient
++
++
++@pytest.mark.parametrize("kw, match", [
++    ({"reward": "difference"}, "reward='terminal' only"),
++    ({"objective": "qreg", "reward": "fractional", "reward_center": "default", "reward_scale": "default",
++      "select_bn_eval": True}, "objective='pg'"),
++])
++def test_the_cost_is_refused_off_the_terminal_pg_path(seg, kw, match):
++    with pytest.raises(ValueError, match=match):
++        _build(seg, replace(_rl(saccade_cost="log", saccade_cost_weight=0.1), **kw), scorer_input_norm="none")
++
++
++def test_a_weight_without_a_form_is_refused(seg):
++    with pytest.raises(ValueError, match="saccade_cost='none'"):
++        _build(seg, _rl(saccade_cost_weight=0.1), scorer_input_norm="none")
+diff --git a/canvit/search/config.py b/canvit/search/config.py
+index 3a07425..65a3742 100644
+--- a/canvit/search/config.py
++++ b/canvit/search/config.py
+@@ -199,4 +199,7 @@ def search_policy_config() -> JointPolicyConfig:
+         entropy_alpha_min=1e-6,
+         entropy_alpha_max=0.1,
+         entropy_update="per_rollout",
++        # Saccade cost off (the default). The proposed sweep: --rl.saccade-cost {log,linear}
++        # --rl.saccade-cost-weight {0,0.1,0.3,1.0} (combine 'standardized').
++        saccade_cost="none",
+     )
