@@ -52,15 +52,16 @@ class BoundSearchTask:
     """Per-batch :class:`RolloutTask`: binds this batch's targets and boxes.
 
     Optional engine hooks, present only when they apply: ``step_weight`` (``supervise='last'``),
-    ``policy_cond`` (a policy is trained) and ``reward_mask`` (``condition='both'``: only the
-    target-present trials carry a policy reward, Haoze's ``valid_mask``).
+    ``policy_cond`` (a policy is trained), ``reward_mask`` (``condition='both'``: only the
+    target-present trials carry a policy reward, Haoze's ``valid_mask``) and ``saccade_beta``
+    (a beta-conditioned saccade cost: each trial's beta [B], already inside ``policy_cond``).
 
     Losses (Haoze's, with ``condition='both'``): the heatmap KL averaged over the
     target-present trials only, plus ``presence_weight`` x the presence loss over all trials."""
 
     def __init__(self, *, model: Any, targets: Tensor, boxes: Tensor, canvas_grid: int,
                  cfg: SearchConfig, policy_embed: Callable[[Tensor], Tensor] | None = None,
-                 present: Tensor | None = None):
+                 present: Tensor | None = None, saccade_beta: Tensor | None = None):
         self.model = model
         self.cfg = cfg
         self.targets = targets
@@ -76,6 +77,8 @@ class BoundSearchTask:
             self.step_weight = self._last_only
         if policy_embed is not None:
             self.policy_cond = lambda: policy_embed(targets)
+        if saccade_beta is not None:
+            self.saccade_beta = saccade_beta
 
     @staticmethod
     def _last_only(t: int, n_glimpses: int) -> float:
@@ -119,6 +122,9 @@ class SearchRunTask:
     """Run-level visual-search task for ``harness.run``."""
 
     name = "search"
+    display_frame = "1680x1050"
+    """How the training images sit in the scene (read by the scanpath evaluation): COCO-Search18's 1680x1050
+    displays letterboxed into the scene (``SearchDataset``; the crop augmentation keeps the aspect)."""
 
     def __init__(self, cfg: SearchConfig, *, rl=None):
         self.cfg = cfg
@@ -260,6 +266,20 @@ class SearchRunTask:
             return lambda t: core.head.policy_embedding(t, detach=self.cfg.detach_policy_embedding)
         return lambda t: jp.scorer.target_embed(t)
 
+    def _policy_cond(self, model, targets: Tensor, beta: Tensor | None = None) -> Tensor:
+        """The scorer's FiLM input for ``targets``: the cue embedding, plus, for a
+        beta-conditioned saccade cost, the features of each row's beta (None: the eval beta
+        ``saccade_cost_beta_eval`` for every row)."""
+        embed = self._policy_embed(model)
+        assert embed is not None and self._joint is not None
+        cue = embed(targets)
+        sc = self._joint.saccade_cost
+        if not sc.conditioned:
+            return cue
+        if beta is None:
+            beta = torch.full((len(targets),), sc.beta_eval, device=cue.device)
+        return torch.cat([cue, sc.features(beta).to(cue.dtype)], dim=-1)
+
     def policy_feature_groups(self):
         return POLICY_FEATURE_GROUPS
 
@@ -285,10 +305,16 @@ class SearchRunTask:
         return batch["image"].to(device, non_blocking=True)
 
     def bind(self, batch, device, *, model, head):
+        targets = batch["target"].to(device)
+        policy_embed, beta = self._policy_embed(model), None
+        jp = self._joint
+        if jp is not None and jp.saccade_cost.conditioned:  # stage 2: one beta per trial
+            beta = jp.saccade_cost.sample_beta(len(targets), device)
+            policy_embed = lambda t: self._policy_cond(model, t, beta)  # noqa: E731
         bound = BoundSearchTask(
-            model=getattr(model, "module", model), targets=batch["target"].to(device),
+            model=getattr(model, "module", model), targets=targets,
             boxes=batch["boxes"].to(device), canvas_grid=self.canvas_grid(model), cfg=self.cfg,
-            policy_embed=self._policy_embed(model), present=batch["present"].to(device))
+            policy_embed=policy_embed, present=batch["present"].to(device), saccade_beta=beta)
         self._bound = bound  # this step's targets, for viz_frame
         return bound
 
@@ -307,7 +333,8 @@ class SearchRunTask:
         k_tp = min(len(tp), max(n // 2, n - len(ta)))
         return torch.cat([tp[:k_tp], ta[:n - k_tp]])
 
-    def _policy_logits(self, model, joint, state: RecurrentState, targets: Tensor, idx: Tensor) -> Tensor:
+    def _policy_logits(self, model, joint, state: RecurrentState, targets: Tensor, idx: Tensor,
+                       beta: Tensor | None = None) -> Tensor:
         """[n, Gp, Gp] scorer logits on ``state`` for the batch rows ``idx``: the
         distribution the policy draws the NEXT fixation from. The scorer is deterministic
         (no BatchNorm, no dropout), so this equals the selector's own forward. The encoder's
@@ -320,16 +347,15 @@ class SearchRunTask:
         enc.prev = tuple(None if x is None else x if x.shape[0] == 1 else x[idx] for x in prev)
         try:
             with torch.no_grad():
-                embed = self._policy_embed(model)
-                assert embed is not None
-                scores = joint.scorer(enc(st).float(), cond=embed(targets[idx]))
+                cond = self._policy_cond(model, targets[idx], None if beta is None else beta[idx])
+                scores = joint.scorer(enc(st).float(), cond=cond)
         finally:
             enc.prev = prev
         g = int(round(scores[0].numel() ** 0.5))
         return scores.reshape(len(idx), g, g).float()
 
     def _viz_capture(self, model, *, hidden, logits, presence, state, centers, targets, joint,
-                     idx: Tensor) -> dict:
+                     idx: Tensor, beta: Tensor | None = None) -> dict:
         """One glimpse of the figure for the batch rows ``idx`` (``_viz_index``), on CPU.
         ``logits`` / ``presence`` are already restricted to those rows."""
         return {"idx": idx.cpu(),
@@ -337,7 +363,7 @@ class SearchRunTask:
                 "logits": logits.detach().float().cpu(),
                 "presence": presence.detach().float().cpu() if presence is not None else None,
                 "canvas": hidden[idx].detach().float().cpu(),
-                "policy_next": (self._policy_logits(model, joint, state, targets, idx).cpu()
+                "policy_next": (self._policy_logits(model, joint, state, targets, idx, beta).cpu()
                                 if joint is not None else None)}
 
     def _episode(self, frames: list[dict], *, images, boxes, targets, present):
@@ -374,7 +400,8 @@ class SearchRunTask:
         with torch.no_grad():
             logits, pres = core.head(gout.readout[idx].float(), bound.targets[idx])
         return self._viz_capture(core, hidden=gout.readout, logits=logits, presence=pres, state=gout.state,
-                                 centers=viewpoint.centers, targets=bound.targets, joint=self._joint, idx=idx)
+                                 centers=viewpoint.centers, targets=bound.targets, joint=self._joint, idx=idx,
+                                 beta=getattr(bound, "saccade_beta", None))
 
     def render_viz(self, viz, *, batch, run_dir, step):
         """Training-rollout figure -> ``{run_dir}/visualization/search_train/``."""
@@ -439,10 +466,9 @@ class SearchRunTask:
             return out.state
 
         if joint is not None:
-            embed = self._policy_embed(model)
-            assert embed is not None
             deploy_rollout_viewpoints(joint=joint, advance=advance, t0_type=ViewpointType.FULL,
-                                      batch_size=B, device=images.device, n=T, cond=lambda: embed(targets))
+                                      batch_size=B, device=images.device, n=T,
+                                      cond=lambda: self._policy_cond(model, targets))
         else:
             assert choose is not None
             sel = self._random_selector()
@@ -646,11 +672,19 @@ class SearchRunTask:
 
     def checkpoint_metadata(self, model):
         from canvit.checkpoint import downstream_pretrain_view_scale
-        return {"task": "search", "scene_size": self.cfg.scene_size, "n_timesteps": self.cfg.n_timesteps,
+        meta = {"task": "search", "scene_size": self.cfg.scene_size, "n_timesteps": self.cfg.n_timesteps,
                 "model_repo": str(self.cfg.model_repo),
                 "pretrain_view_scale": downstream_pretrain_view_scale(
                     patcher_name=getattr(model.canvit.cfg, "patcher_name", None),
                     foveated_scale=self.cfg.foveated_scale)}
+        rl = self.rl
+        if rl.saccade_cost != "none":  # absent when off: the historical metadata
+            meta["saccade_cost"] = {
+                "form": rl.saccade_cost, "weight": rl.saccade_cost_weight, "combine": rl.saccade_cost_combine,
+                "beta_mode": rl.saccade_cost_beta_mode, "beta_eval": rl.saccade_cost_beta_eval,
+                "r": 1.0 / rl.centers_per_axis,
+                "beta_features": "[beta, log1p(beta / 0.1)] appended to the FiLM cue (conditioned only)"}
+        return meta
 
 
 __all__ = ["BoundSearchTask", "SearchRunTask", "POLICY_FEATURE_GROUPS"]

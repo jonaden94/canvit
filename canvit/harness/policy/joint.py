@@ -23,6 +23,7 @@ groups): distillation has no task probe, unlike the ADE20K policy trainer.
 """
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 import torch
 import torch.distributed as dist
@@ -49,6 +50,73 @@ from canvit.harness.rollout.selector import PolicySelector, RandomSelector
 from canvit.harness.rollout.viewpoint import ViewpointType
 
 
+@dataclass(frozen=True)
+class SaccadeCost:
+    """Optional cost of each policy saccade on the terminal-reward PG target
+    (``JointPolicyConfig.saccade_cost*``). ``d`` is the Euclidean distance between
+    consecutive glimpse centres in the [-1, 1] centre units (scene width = 2).
+
+    ``log``: c(d) = log(1 + d / r), r = half a policy-grid cell (= 1 / centers_per_axis).
+    ``linear``: c(d) = d / 2, the fraction of the scene width. ``none``: no cost (default).
+
+    ``combine='standardized'``: target_t = std(R) - weight * z_batch(c_t), where std(R) is
+    the reward as the resolved ``RewardSpec`` centres/scales it; unit-free, so ``weight``
+    keeps its meaning while R shrinks over training. ``combine='raw'``: the cost enters in
+    reward units, target_t = std(R - weight * sum_t c_t)."""
+
+    form: Literal["none", "log", "linear"] = "none"
+    weight: float = 0.0
+    combine: Literal["standardized", "raw"] = "standardized"
+    r: float = 1.0 / 32
+    std_eps: float = 1e-2
+    """Floor on the batch std of c_t in the ``standardized`` combination (cost units; the log
+    cost's batch std is ~1, the linear one's ~0.2)."""
+    conditioned: bool = False
+    """Stage 2 (``saccade_cost_beta_mode='conditioned'``): each trial draws its own
+    beta ~ U[0, weight], the policy sees :meth:`features` (beta) next to its FiLM cue, and
+    action t's target is lowered by beta_b * z_batch(c_t). False: one fixed beta = ``weight``."""
+    beta_eval: float = 0.0
+    """``conditioned`` only: the beta every trial gets at validation / deploy."""
+
+    @property
+    def active(self) -> bool:
+        """Saccade lengths are measured (and logged). ``weight == 0`` leaves the target unchanged."""
+        return self.form != "none"
+
+    def sample_beta(self, batch_size: int, device: torch.device) -> Tensor:
+        """``conditioned``: one beta per trial, U[0, weight], held for the whole trajectory."""
+        assert self.conditioned
+        return self.weight * torch.rand(batch_size, device=device)
+
+    @staticmethod
+    def features(beta: Tensor) -> Tensor:
+        """[B] -> [B, BETA_FEATURES], appended to the policy's FiLM cue. beta = 0 is a real point."""
+        beta = beta.float()
+        return torch.stack([beta, torch.log1p(beta / 0.1)], dim=-1)
+
+    def cost(self, d: Tensor) -> Tensor:
+        if self.form == "log":
+            return torch.log1p(d / self.r)
+        assert self.form == "linear", f"no cost for form={self.form!r}"
+        return d / 2.0
+
+
+BETA_FEATURES = 2
+"""Width of :meth:`SaccadeCost.features`: the FiLM cue of a beta-conditioned policy grows by this."""
+
+
+def _batch_z(x: Tensor, mask: Tensor | None, *, eps: float) -> Tensor:
+    """Population z-score over the batch (only masked-in rows; the others are 0), the std
+    floored at ``eps``: a batch whose saccades are (nearly) equal long gets a (nearly) zero
+    cost term instead of its rounding noise blown up to unit scale."""
+    if mask is not None:
+        out = torch.zeros_like(x)
+        if bool(mask.any()):
+            out[mask] = _batch_z(x[mask], None, eps=eps)
+        return out
+    return (x - x.mean()) / x.std(unbiased=False).clamp_min(eps)
+
+
 @dataclass
 class JointPolicy:
     """Owns the policy machinery consulted by ``training_step`` when RL is on: the
@@ -72,6 +140,8 @@ class JointPolicy:
     reward: RewardSpec = field(default_factory=lambda: RewardSpec("fractional", "running_mean", "running_std"))
     """The resolved reward (``rl.resolve_reward``). The default is the historical QReg/PG one."""
     ema_abs: dict[int, Tensor] = field(default_factory=dict)  # per-depth state of reward_scale='ema_abs'
+    saccade_cost: SaccadeCost = field(default_factory=SaccadeCost)
+    """Optional per-saccade cost (terminal-reward PG only). The default is off."""
     _rollout_entropies: list = field(default_factory=list)  # entropy_update='per_rollout' accumulator
 
     def branch_selector(self, t0_type: ViewpointType) -> tuple[object, bool]:
@@ -209,7 +279,8 @@ class JointPolicy:
         return self.scorer.vhead(feats.float().mean(dim=(2, 3))).squeeze(-1)
 
     def trajectory_loss(self, *, scores: Tensor, flat_idx: Tensor, values: Tensor | None,
-                        reward: Tensor, mask: Tensor | None = None) -> Tensor:
+                        reward: Tensor, mask: Tensor | None = None,
+                        saccade_len: Tensor | None = None, saccade_beta: Tensor | None = None) -> Tensor:
         """The weighted policy loss for a WHOLE trajectory (the deferred, terminal-reward
         path). ``scores`` [B, T, A] carries grad; ``reward`` [B] is the detached terminal
         reward, given to every one of the T actions. ``mask`` [B] (PG only): the trials that
@@ -221,9 +292,25 @@ class JointPolicy:
         PG (``values=None``): per action step t, the reward is centred/scaled under the
         resolved ``RewardSpec`` (depth t+1, the depth the inline path would use) and fed to
         :func:`pg_loss`; the result is the MEAN over the T steps, the same scale as the
-        inline path's mean over depths."""
+        inline path's mean over depths.
+
+        ``saccade_len`` [B, T] (detached; only with an active ``saccade_cost``, PG only): the
+        length of each action's saccade. Action t's target is lowered by its OWN cost c_t
+        (``standardized``) or the reward by the trajectory's summed cost (``raw``); see
+        :class:`SaccadeCost`. Absent => the historical computation, unchanged.
+        ``saccade_beta`` [B] (``conditioned`` cost only): each trial's own beta, in place of
+        the scalar ``weight``; a constant beta gives the fixed-beta target exactly."""
         obj = self.objective
         self._require_pg_for_mask(mask)
+        sc = self.saccade_cost
+        cost = None
+        if saccade_len is not None:
+            if not isinstance(obj, PG):
+                raise NotImplementedError("the saccade cost is implemented for objective='pg' only")
+            cost = sc.cost(saccade_len.float())
+            assert (saccade_beta is not None) == sc.conditioned, "a conditioned cost needs the per-trial beta"
+            if sc.combine == "raw" and sc.weight != 0.0:
+                reward = reward - sc.weight * cost.sum(dim=1)
         if isinstance(obj, VPG):
             assert values is not None
             loss, metrics = vpg_loss(
@@ -238,6 +325,9 @@ class JointPolicy:
         losses, entropies = [], []
         for t in range(n_steps):
             target = self._standardize(t + 1, reward, mask)
+            if cost is not None and sc.combine == "standardized" and sc.weight != 0.0:
+                beta = sc.weight if saccade_beta is None else saccade_beta
+                target = target - beta * _batch_z(cost[:, t], mask, eps=sc.std_eps)
             if mask is None:
                 loss_t, ent_t, _ = pg_loss(scores[:, t], flat_idx[:, t], target, alpha=self._alpha(obj),
                                            crit_all=None)
@@ -253,6 +343,10 @@ class JointPolicy:
         ent_mean = torch.stack(entropies).mean()
         self.last_step = {"policy_entropy": ent_mean,
                           "alpha": torch.as_tensor(self._alpha(obj)).detach().float()}
+        if cost is not None:  # logged as policy/saccade_len (centre units, scene width 2), policy/saccade_cost
+            assert saccade_len is not None
+            self.last_step["saccade_len"] = saccade_len.float().mean()
+            self.last_step["saccade_cost"] = cost.mean()
         return self.rl_weight * torch.stack(losses).mean()
 
     def glimpse_loss(self, *, depth: int, scores: Tensor, flat_idx: Tensor, reward: Tensor,

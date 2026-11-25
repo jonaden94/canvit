@@ -88,6 +88,10 @@ class HarnessOpts:
     amp_dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"
     log_grad_norms: bool = True
     log_timing: bool = True
+    human_eval_every: int = 0
+    """Human alignment every N steps (a multiple of the eval cadence; 0 = off): RunSettings.human_eval_every."""
+    human_eval_data: Path | None = None
+    """The human-subset cache for ``human_eval_every`` (``python -m canvit.scanpath.online --out <file>``)."""
 
 
 def _resolve_run_dir(logs_dir: Path, run_group: str, run_name: str | None,
@@ -121,6 +125,7 @@ def _common(opts: HarnessOpts) -> dict[str, Any]:
         "signal_checkpoint": opts.signal_checkpoint,
         "use_failed_marker": opts.use_failed_marker, "amp_dtype": opts.amp_dtype,
         "log_grad_norms": opts.log_grad_norms, "log_timing": opts.log_timing,
+        "human_eval_every": opts.human_eval_every, "human_eval_data": opts.human_eval_data,
     }
     if opts.ema_alpha is not None:   # else: the task's own default (see each build())
         out["ema_alpha"] = opts.ema_alpha

@@ -76,6 +76,9 @@ class In1kRunTask:
     config passed in (``rl``)."""
 
     name = "in1k"
+    display_frame = "scene"
+    """How the training images sit in the scene (read by the scanpath evaluation): ``RandomResizedCrop`` to the
+    square scene (``in1k/data.py``)."""
     best_metric = "top1"
     """Eval key the harness maximizes for `best.pt` — matches `in1k/train.py`'s
     `best_top1` selection. NB the standalone also writes a `best-hf/` export alongside;

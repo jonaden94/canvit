@@ -91,6 +91,9 @@ class Ade20kRunTask:
     """
 
     name = "ade20k"
+    display_frame = "scene"
+    """How the training images sit in the scene (read by the scanpath evaluation): centre-cropped or squished
+    to the square scene (``Ade20kConfig`` resize mode)."""
 
     def __init__(self, cfg, *, rl=None):
         self.cfg = cfg

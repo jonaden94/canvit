@@ -38,6 +38,9 @@ dependencies = [
 # transformers, tyro, dinov3-in1k-probes -- is a base dependency here, so only the one
 # scripts/demos/basic.py import that nothing else needs is left optional.
 demo = ["scikit-learn>=1.7.0"]
+# Human scanpath evaluation (`python -m canvit.harness.evaluate scanpath`, docs/scanpath.md): pysaliency (MIT) is the
+# metric and dataset authority. Pinned: the evaluation uses its baseline and dataset internals.
+scanpath = ["pysaliency==0.2.23"]
 
 [build-system]
 requires = ["hatchling"]

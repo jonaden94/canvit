@@ -121,6 +121,11 @@ class RunSettings:
     """Render the task's training-batch visualization every N steps (0 = off). Figures
     are written LOCALLY under ``run_dir/visualization/`` — never uploaded (D-G). Only
     tasks that implement ``render_viz`` (currently distill's multistep PCA) produce any."""
+    human_eval_every: int = 0
+    """Score the live policy on a fixed human-scanpath subset every N steps (0 = off; a multiple
+    of ``eval_every``): ``canvit.scanpath.online``, logged as ``val/human/*``, never used to select
+    checkpoints. Needs ``human_eval_data`` (a cache built by ``python -m canvit.scanpath.online``)."""
+    human_eval_data: Path | None = None
     # experiment tracker (off by default so run() is import-safe / offline)
     tracker: Literal["wandb", "none"] = "none"
     wandb_project: str | None = None
@@ -415,6 +420,16 @@ def run(*, task: RunTask, spec: TrainSpec, settings: RunSettings) -> dict:
         if tracker is not None:
             tracker.log_metrics({f"eval/best_{name}": value}, step=step)
 
+    human_eval = None  # human alignment at eval steps (canvit.scanpath.online); measured, never selected on
+    if settings.human_eval_every:
+        if not settings.eval_every or settings.human_eval_every % settings.eval_every:
+            raise ValueError(f"human_eval_every ({settings.human_eval_every}) must be a multiple of eval_every "
+                             f"({settings.eval_every}): it runs inside the eval step")
+        if settings.human_eval_data is None:
+            raise ValueError("human_eval_every needs human_eval_data (python -m canvit.scanpath.online --out ...)")
+        from canvit.scanpath.online import HumanEval
+        human_eval = HumanEval.load(settings.human_eval_data, task=task, device=device)
+
     def on_eval(step: int) -> dict:
         # tracker/run_dir go through so a task's validation can log its OWN rich series
         # (distill's per-timestep val curves + probe accuracy) and write its figures to
@@ -441,6 +456,13 @@ def run(*, task: RunTask, spec: TrainSpec, settings: RunSettings) -> dict:
             # steps), so losing the series made it invisible.
             payload["timing/val_seconds"] = val_seconds
             tracker.log_metrics(payload, step=step)
+        if human_eval is not None and step % settings.human_eval_every == 0:
+            t_h = time.perf_counter()  # logged only: `metrics` (the best-checkpoint choice) stays the task's own
+            human = {f"val/human/{k}": v for k, v in human_eval(task=task, model=model, joint=joint).items()}
+            human["timing/human_eval_seconds"] = time.perf_counter() - t_h
+            log.info("step %d  human alignment: %s", step, human)
+            if tracker is not None:
+                tracker.log_metrics(human, step=step)
         if is_dist:
             ddp.barrier()
         return metrics
