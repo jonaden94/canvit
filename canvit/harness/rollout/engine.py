@@ -269,6 +269,17 @@ def run_rollout(
         # Empty for the historical inline-credit objectives (QReg/PG).
         defer = is_policy and joint is not None and joint.defers_credit
         traj: list[dict[str, Tensor]] = []
+        # Optional saccade cost (terminal-reward PG only, refused elsewhere by build_policy):
+        # the length of each policy saccade, measured from the previous glimpse centre (t0's
+        # FULL view sits at the scene centre). Off => nothing is measured, the path is unchanged.
+        measure_saccades = defer and joint is not None and joint.saccade_cost.active
+        prev_centre: Tensor | None = None
+        # Stage 2 (beta-conditioned policy): the task's per-trial beta [B], drawn at bind.
+        beta_kw: dict[str, Tensor] = {}
+        if measure_saccades and joint is not None and joint.saccade_cost.conditioned:
+            beta = getattr(task, "saccade_beta", None)
+            assert beta is not None, "a beta-conditioned saccade cost needs the task's per-trial saccade_beta"
+            beta_kw = {"saccade_beta": beta}
 
         # Optional per-glimpse task metrics (distill's scene/cls sub-losses), summed
         # here and averaged over the branch below. Absent hook => untouched fast path.
@@ -304,6 +315,8 @@ def run_rollout(
             L = task.step_loss(gout.readout)
         _viz_capture(branch_idx, gout, vp0_named, vp0, L)
         _acc(L)
+        if measure_saccades:
+            prev_centre = vp0.centers.detach().float()
         if is_policy and not defer:  # seed the reward denominator with the FULL-anchor loss (no policy loss at t0)
             prev_pi_loss = task.per_image_loss(gout.readout).detach()
 
@@ -345,6 +358,11 @@ def run_rollout(
                 assert joint is not None and aux is not None
                 traj.append({"scores": aux["scores"], "flat_idx": aux["flat_idx"],
                              "value": joint.state_value(aux["feats"]) if joint.needs_value else None})
+                if measure_saccades:
+                    assert prev_centre is not None
+                    centre = vp.centers.detach().float()  # [B, 2] (cy, cx) in [-1, 1]
+                    traj[-1]["saccade_len"] = (centre - prev_centre).norm(dim=-1)
+                    prev_centre = centre
             elif is_policy:
                 assert joint is not None and prev_pi_loss is not None and aux is not None
                 cur_pi = task.per_image_loss(gout.readout).detach()
@@ -392,6 +410,8 @@ def run_rollout(
                     flat_idx=torch.stack([a["flat_idx"] for a in traj], dim=1),
                     values=torch.stack([a["value"] for a in traj], dim=1) if joint.needs_value else None,
                     reward=reward, **mask_kw,
+                    **({"saccade_len": torch.stack([a["saccade_len"] for a in traj], dim=1)}
+                       if measure_saccades else {}), **beta_kw,
                 ) * n_glimpses
                 chunk_loss = chunk_loss + ploss
                 pol_acc["loss"] = pol_acc["loss"] + ploss.detach() / n_glimpses

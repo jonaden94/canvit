@@ -35,7 +35,7 @@ from canvit.core.policy import (
     fixation_candidates,
 )
 from canvit.harness.config import FoveatedScaleConfig, JointPolicyConfig
-from canvit.harness.policy.joint import JointPolicy
+from canvit.harness.policy.joint import BETA_FEATURES, JointPolicy, SaccadeCost
 from canvit.harness.policy.rl import PG, VPG, Objective, QReg, resolve_reward
 from canvit.harness.rollout.selector import PolicySelector, RandomSelector
 
@@ -115,6 +115,31 @@ def build_policy(
 
     # Reward kind + centring + scaling; refuses what the objective cannot honour.
     reward = resolve_reward(objective=obj, reward=rl.reward, center=rl.reward_center, scale=rl.reward_scale)
+
+    # Optional saccade cost: defined on the deferred (terminal-reward) PG path only.
+    conditioned = rl.saccade_cost_beta_mode == "conditioned"
+    saccade_cost = SaccadeCost(form=rl.saccade_cost, weight=rl.saccade_cost_weight,
+                               combine=rl.saccade_cost_combine, r=1.0 / rl.centers_per_axis,
+                               conditioned=conditioned, beta_eval=rl.saccade_cost_beta_eval)
+    if saccade_cost.active and not (isinstance(obj, PG) and reward.kind == "terminal"):
+        raise ValueError(
+            f"saccade_cost={rl.saccade_cost!r} is implemented for objective='pg' with "
+            f"reward='terminal' only (got objective={rl.objective!r}, reward={reward.kind!r}).")
+    if not saccade_cost.active and rl.saccade_cost_weight != 0.0:
+        raise ValueError("saccade_cost_weight is set but saccade_cost='none': choose 'log' or 'linear'.")
+    if conditioned:
+        # Stage 2: beta rides on the FiLM cue, so only a FiLM-conditioned scorer (search) can see it.
+        if not saccade_cost.active or rl.saccade_cost_weight <= 0.0 or rl.saccade_cost_combine != "standardized":
+            raise ValueError(
+                "saccade_cost_beta_mode='conditioned' needs a cost form, saccade_cost_weight > 0 (the upper "
+                "end of beta ~ U[0, weight]) and saccade_cost_combine='standardized'.")
+        if film_cond_dim is None:
+            raise ValueError("saccade_cost_beta_mode='conditioned' needs a FiLM-conditioned scorer "
+                             "(the search task); this task's policy has no conditioning input.")
+        film_cond_dim = film_cond_dim + BETA_FEATURES
+    elif rl.saccade_cost_beta_eval != 0.0:
+        raise ValueError("saccade_cost_beta_eval is set but saccade_cost_beta_mode='fixed': it only "
+                         "applies to a beta-conditioned policy.")
 
     # VPG is defined for the FOVEATED action space (autoreg_tryout only ever ran a foveated
     # model). It runs on uniform and is internally consistent there, but it is not the same
@@ -197,7 +222,7 @@ def build_policy(
         rl_weight=rl.rl_weight, keep_random_branch=rl.keep_random_branch,
         target_momentum=rl.target_momentum, device=device,
         prime_target=rl.prime_on_policy, prime_warmup=rl.policy_warmup_steps,
-        reward=reward,
+        reward=reward, saccade_cost=saccade_cost,
     )
     if isinstance(obj, PG) and obj.entropy_target is not None:
         alpha0 = obj.entropy_bonus if obj.alpha_init is None else obj.alpha_init
