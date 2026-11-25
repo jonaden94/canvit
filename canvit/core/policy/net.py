@@ -128,19 +128,22 @@ class FiLM(nn.Module):
 N_UNET_ENC, N_UNET_DEC = 6, 5  # 32,16,8,4,2,1 down; ->2,4,8,16,32 up
 
 
-def build_unet(width: int, block_layers: int) -> tuple[nn.ModuleList, nn.ModuleList]:
-    """The scorer's ConvNeXt-V2 U-Net body: ``N_UNET_ENC`` encoder stages at ``width``
-    (average-pooled 2x between them, 32 -> 1) and ``N_UNET_DEC`` decoder stages, each
-    taking ``[upsampled, skip]`` (2*width) back to width."""
-    enc = nn.ModuleList([_stage(width, width, block_layers) for _ in range(N_UNET_ENC)])
-    dec = nn.ModuleList([_stage(2 * width, width, block_layers) for _ in range(N_UNET_DEC)])
+def build_unet(width: int, block_layers: int, levels: int = N_UNET_ENC) -> tuple[nn.ModuleList, nn.ModuleList]:
+    """The scorer's ConvNeXt-V2 U-Net body: ``levels`` encoder stages at ``width``
+    (average-pooled 2x between them; the default ``N_UNET_ENC`` = 6 goes 32 -> 1) and
+    ``levels - 1`` decoder stages, each taking ``[upsampled, skip]`` (2*width) back to width.
+    ``levels`` < 6 stops at a coarser bottleneck (3 -> 8x8; ported from policy-algos 2ba0249:
+    on ADE20K 3 levels = 6 levels, t4 0.4526 vs 0.4520)."""
+    assert 1 <= levels <= N_UNET_ENC, f"levels: 1 (no pooling) .. {N_UNET_ENC} (pool 32 -> 1)"
+    enc = nn.ModuleList([_stage(width, width, block_layers) for _ in range(levels)])
+    dec = nn.ModuleList([_stage(2 * width, width, block_layers) for _ in range(levels - 1)])
     return enc, dec
 
 
-def build_unet_film(cond_dim: int, width: int) -> tuple[nn.ModuleList, nn.ModuleList]:
+def build_unet_film(cond_dim: int, width: int, levels: int = N_UNET_ENC) -> tuple[nn.ModuleList, nn.ModuleList]:
     """One :class:`FiLM` per encoder and per decoder stage of :func:`build_unet`."""
-    return (nn.ModuleList([FiLM(cond_dim, width) for _ in range(N_UNET_ENC)]),
-            nn.ModuleList([FiLM(cond_dim, width) for _ in range(N_UNET_DEC)]))
+    return (nn.ModuleList([FiLM(cond_dim, width) for _ in range(levels)]),
+            nn.ModuleList([FiLM(cond_dim, width) for _ in range(levels - 1)]))
 
 
 def unet_forward(
@@ -161,7 +164,7 @@ def unet_forward(
         skips.append(h)
         if i < len(enc) - 1:
             h = F.avg_pool2d(h, 2)
-    d = skips[-1]  # 1x1 global bottleneck
+    d = skips[-1]  # the bottleneck (1x1 global at the default 6 levels)
     for j, stage in enumerate(dec):
         d = stage(torch.cat([F.interpolate(d, scale_factor=2, mode="nearest"), skips[len(enc) - 2 - j]], dim=1))
         if film is not None:
@@ -266,6 +269,7 @@ class ViewpointScorer(  # pyright: ignore[reportIncompatibleMethodOverride]  # S
         readout: Readout = "unet",
         input_norm: InputNorm = "batch",
         film_cond_dim: int | None = None,
+        levels: int = N_UNET_ENC,
     ):
         super().__init__()
         scales, groups = tuple(scales), tuple(groups)  # config.json round-trips tuples as lists
@@ -276,7 +280,7 @@ class ViewpointScorer(  # pyright: ignore[reportIncompatibleMethodOverride]  # S
         # 'local' skips the U-Net entirely -- do not INSTANTIATE it either, or the unused
         # params would ride in the optimizer and the published state_dict.
         if readout == "unet":
-            self.enc, self.dec = build_unet(width, block_layers)
+            self.enc, self.dec = build_unet(width, block_layers, levels)
         else:
             self.enc = self.dec = None
         if action_space == "fixation":
@@ -304,7 +308,7 @@ class ViewpointScorer(  # pyright: ignore[reportIncompatibleMethodOverride]  # S
         if film_cond_dim is not None:
             assert readout == "unet", "FiLM conditioning needs readout='unet' (it modulates the U-Net stages)"
             self.film_in = FiLM(film_cond_dim, width)
-            self.film_enc, self.film_dec = build_unet_film(film_cond_dim, width)
+            self.film_enc, self.film_dec = build_unet_film(film_cond_dim, width, levels)
         else:
             self.film_in = self.film_enc = self.film_dec = None
 

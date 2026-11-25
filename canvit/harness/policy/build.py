@@ -229,6 +229,7 @@ def build_policy(
         centers_per_axis=rl.centers_per_axis, block_layers=rl.block_layers, groups=feature_groups,
         dueling=dueling, action_space=action_space, readout=rl.policy_readout,
         input_norm=scorer_input_norm, film_cond_dim=film_cond_dim,  # type: ignore[arg-type]
+        levels=rl.policy_levels,
     ).to(device)
     if isinstance(obj, VPG) and obj.value_bias_init is not None:
         assert scorer.vhead is not None
@@ -277,7 +278,7 @@ def _attach_sac_critics(jp: JointPolicy, obj: SAC, *, canvit: Any, rl: JointPoli
             canvas_dim=canvit.cfg.canvas_dim, width=rl.width, n_scale=n_scale, scales=scales,
             centers_per_axis=rl.centers_per_axis, block_layers=rl.block_layers, groups=feature_groups,
             dueling=False, action_space=action_space, readout=rl.policy_readout,
-            input_norm=scorer_input_norm,  # type: ignore[arg-type]
+            input_norm=scorer_input_norm, levels=rl.policy_levels,  # type: ignore[arg-type]
         ).to(device)
 
     import copy

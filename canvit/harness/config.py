@@ -177,6 +177,9 @@ class JointPolicyConfig:
     """Uniform-patcher candidate scales; ignored for foveated/square (fixation grid)."""
     width: int = 128
     block_layers: int = 3
+    policy_levels: int = 6
+    """U-Net depth of the canvas scorer (and SAC's critics): 6 (default, historical) pools 32 -> 1;
+    3 stops at 8x8 (on ADE20K as good as 6, half the parameters)."""
     policy_readout: Literal["unet", "local"] = "unet"
     """Scorer body — how much of the scene ONE candidate's score sees.
 
