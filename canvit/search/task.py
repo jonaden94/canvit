@@ -41,6 +41,7 @@ log = logging.getLogger(__name__)
 
 
 POLICY_FEATURE_GROUPS: tuple[str, ...] = ("ln_feat",)  # the plain canvas, no handcrafted maps
+ALL_RETINAS = "all"  # --cfg.retina: use a multi-retina backbone through every retina
 
 
 def _canvas_hidden(model: Any, state: RecurrentState, canvas_grid: int) -> Tensor:
@@ -150,9 +151,12 @@ class SearchRunTask:
         """Frozen backbone; task head and policy trained JOINTLY; no BPTT (the backbone runs
         under no_grad, so there is no cross-timestep graph to keep)."""
         from canvit.harness.spec import BpttSpec, GroupOptim, ScheduleSpec, TrainSpec
-        head = GroupOptim(lr=self.cfg.peak_lr, weight_decay=self.cfg.weight_decay,
-                          schedule=ScheduleSpec(kind="warmup_cosine", warmup_steps=self.cfg.warmup_steps,
-                                                total_steps=self.cfg.max_steps))
+        if self.cfg.lr_schedule == "cosine":
+            head_sched = ScheduleSpec(kind="warmup_cosine", warmup_steps=self.cfg.warmup_steps,
+                                      total_steps=self.cfg.max_steps)
+        else:
+            head_sched = ScheduleSpec(kind="warmup_constant", warmup_steps=self.cfg.warmup_steps)
+        head = GroupOptim(lr=self.cfg.peak_lr, weight_decay=self.cfg.weight_decay, schedule=head_sched)
         pol = self.rl
         policy = GroupOptim(lr=pol.policy_lr, weight_decay=pol.policy_weight_decay, betas=pol.policy_betas,
                             schedule=ScheduleSpec(kind="warmup_constant", warmup_steps=self._policy_warmup_steps()))
@@ -188,16 +192,29 @@ class SearchRunTask:
             model = CanViTForVisualSearch.from_pretrained_backbone(
                 c.model_repo, n_classes=len(self._classes()), cond_dim=c.cond_dim, kind=c.head,
                 width=c.head_width, block_layers=c.head_block_layers, dropout=c.dropout,
-                presence=c.condition == "both",
+                presence=c.condition == "both", levels=c.head_levels,
             ).to(device)
         if not consumes_full_image(model):
             raise ValueError(f"the search task supports FOVEATED backbones only; {c.model_repo} has patcher "
                              f"{getattr(model.canvit.cfg, 'patcher_name', '?')!r}.")
-        fix_backbone_retina(model, c.retina, c.model_repo)
+        self._apply_retina(model, source=c.model_repo)
         fs = c.foveated_scale
         log.warning("foveated view scale: mode=%s fixed_scale=%s -- this MUST match the backbone's "
                     "pretraining scale or every glimpse is out of distribution.", fs.mode, fs.fixed_scale)
         return model, model.head
+
+    def _apply_retina(self, model, *, source) -> None:
+        """``--cfg.retina``: one named retina of a multi-retina backbone (``fix_backbone_retina``),
+        or ``all``: every retina, as distill trains -- the rollout engine draws each training
+        sample's retina, ``evaluate`` validates each one (``_retina_names``)."""
+        c = self.cfg
+        if c.retina != ALL_RETINAS:
+            fix_backbone_retina(model, c.retina, source)
+            return
+        n = getattr(model.canvit.patcher, "n_retinas", 1)
+        if n < 2:
+            raise ValueError(f"--cfg.retina {ALL_RETINAS} needs a multi-retina backbone; {source} has one retina.")
+        log.info("multi-retina backbone: all %d retinas (drawn per training sample, each validated)", n)
 
     def canvas_grid(self, model):
         if self.cfg.canvas_grid is not None:
@@ -478,6 +495,71 @@ class SearchRunTask:
     @torch.no_grad()
     def evaluate(self, *, model, head, val_loader, device, step, tracker=None, run_dir=None, joint=None):
         """Validation under each of ``cfg.eval_policies`` (random / greedy / policy fixations).
+        Metrics: :meth:`_evaluate_once`.
+
+        ``--cfg.retina all`` (a multi-retina backbone through every retina): each retina is
+        validated on the same images (same seeded random fixations); the MEAN over retinas
+        goes under the usual keys (so ``best_metric`` and best.pt follow it), each retina's
+        values under ``<retina>/<key>`` (all of them in ``eval.jsonl``; the tracker gets the
+        last-glimpse ``found`` / ``hit`` / ``correct_found`` / ``presence_acc`` per retina),
+        and its figures under ``visualization/<retina>/``."""
+        common = dict(model=model, val_loader=val_loader, device=device, step=step, run_dir=run_dir, joint=joint)
+        names_r = self._retina_names(model)
+        if names_r is None:
+            full = self._evaluate_once(**common)
+            per: dict[str, dict[str, float]] = {}
+        else:
+            patcher = model.canvit.patcher
+            per = {}
+            try:
+                for i, name in enumerate(names_r):
+                    patcher.set_retinas(i)
+                    per[name] = self._evaluate_once(**common, viz_prefix=f"{name}/")
+            finally:
+                patcher.set_retinas(None)
+            keys = set.intersection(*(set(v) for v in per.values()))
+            full = {k: sum(v[k] for v in per.values()) / len(per) for k in sorted(keys)}
+        T = self.cfg.n_timesteps
+        pct = percent_label(self.cfg.overlap_box_frac)
+        if run_dir is not None:
+            import json
+            from pathlib import Path
+            Path(run_dir).mkdir(parents=True, exist_ok=True)  # an empty tmp dir can vanish (tests)
+            flat = {**full, **{f"{name}/{k}": v for name, d in per.items() for k, v in d.items()}}
+            with open(Path(run_dir) / "eval.jsonl", "a") as f:
+                f.write(json.dumps({"step": step, **flat}) + "\n")
+        if tracker is not None:
+            tracker.log_metrics({f"overview/{k}": v for k, v in self._overview(full, T, pct).items()}, step=step)
+        policies = [p for p in self.cfg.eval_policies if p != "policy" or joint is not None]
+        crit = ["found", f"found_{pct}", "hit", f"hit_{pct}"]
+        names = ["loss", *crit, *(f"correct_{c}" for c in crit)]
+        if f"presence_acc_t0_{policies[0]}" in full:
+            names += ["presence_acc", "recall", "specificity", "precision", "f1"]
+        per_glimpse = {"loss", "found", "hit", "correct_found", "presence_acc"}
+        # ordered by metric, then fixation rule, then glimpse (W&B shows panels in log order)
+        out = {f"{k}_t{t}_{p}": full[f"{k}_t{t}_{p}"]
+               for k in names for p in policies for t in range(T) if k in per_glimpse or t == T - 1}
+        L = T - 1
+        for name, d in per.items():
+            out.update({f"{name}/{k}_t{L}_{p}": d[f"{k}_t{L}_{p}"]
+                        for k in ("found", "hit", "correct_found", "presence_acc") for p in policies
+                        if f"{k}_t{L}_{p}" in d})
+        return out
+
+    @staticmethod
+    def _retina_names(model) -> list[str] | None:
+        """The retinas to validate one by one: all of a multi-retina patcher that no task
+        fixed to one retina (``--cfg.retina all``); None otherwise (one pass, as before)."""
+        patcher = model.canvit.patcher
+        if getattr(patcher, "n_retinas", 1) > 1 and getattr(patcher, "fixed_retina", None) is None:
+            return list(patcher.retina_names)
+        return None
+
+    def _evaluate_once(self, *, model, val_loader, device, step, run_dir=None, joint=None,
+                       viz_prefix: str = "") -> dict[str, float]:
+        """One validation pass under each of ``cfg.eval_policies``; returns every metric
+        (``<metric>_t<t>_<policy>``). ``viz_prefix`` (e.g. ``<retina>/``) is put in front of
+        the figure folders.
 
         Localisation, over the target-present trials, after glimpse t (X = ``percent_label``
         of ``cfg.overlap_box_frac``, 10 by default):
@@ -495,10 +577,10 @@ class SearchRunTask:
         ``recall`` (present trials judged present), ``specificity`` (absent judged absent),
         ``precision``, ``f1``.
 
-        Keys are ``<metric>_t<t>_<policy>``. Every value goes to ``run_dir/eval.jsonl`` (one
-        line per validation). The returned dict -- the harness logs it under ``eval/`` -- holds
-        ``loss`` / ``found`` / ``hit`` / ``correct_found`` / ``presence_acc`` at every glimpse
-        and the rest at the last glimpse only. ``tracker`` additionally gets a short
+        Keys are ``<metric>_t<t>_<policy>``. :meth:`evaluate` writes every value to
+        ``run_dir/eval.jsonl`` (one line per validation) and returns -- the harness logs it under
+        ``eval/`` -- ``loss`` / ``found`` / ``hit`` / ``correct_found`` / ``presence_acc`` at every
+        glimpse and the rest at the last glimpse only; ``tracker`` additionally gets a short
         ``overview/`` section (``_overview``)."""
         T = self.cfg.n_timesteps
         cg = self.canvas_grid(model)
@@ -566,16 +648,13 @@ class SearchRunTask:
                     if record:
                         try:  # a diagnostic: a plotting failure must never abort validation
                             self._save_episode(record, batch=batch, run_dir=run_dir,
-                                               subdir=f"search_val_{p}", step=step,
+                                               subdir=f"{viz_prefix}search_val_{p}", step=step,
                                                title=f"val step {step}, fixations: {p}")
                         except Exception:
                             log.exception("search val viz failed at step %d (validation continues)", step)
                 n += images.shape[0]
         if was_training:
             model.head.train()
-        names = ["loss", *crit, *(f"correct_{c}" for c in crit)]
-        if has_presence:
-            names += ["presence_acc", "recall", "specificity", "precision", "f1"]
         full: dict[str, float] = {}
         for p in policies:
             s = sums[p]
@@ -592,18 +671,7 @@ class SearchRunTask:
                     full[f"specificity_t{t}_{p}"] = tneg / max(n_ta, 1)
                     full[f"precision_t{t}_{p}"] = prec
                     full[f"f1_t{t}_{p}"] = 2 * prec * rec / (prec + rec) if prec + rec > 0 else 0.0
-        if run_dir is not None:
-            import json
-            from pathlib import Path
-            Path(run_dir).mkdir(parents=True, exist_ok=True)  # an empty tmp dir can vanish (tests)
-            with open(Path(run_dir) / "eval.jsonl", "a") as f:
-                f.write(json.dumps({"step": step, **full}) + "\n")
-        if tracker is not None:
-            tracker.log_metrics({f"overview/{k}": v for k, v in self._overview(full, T, pct).items()}, step=step)
-        per_glimpse = {"loss", "found", "hit", "correct_found", "presence_acc"}
-        # ordered by metric, then fixation rule, then glimpse (W&B shows panels in log order)
-        return {f"{k}_t{t}_{p}": full[f"{k}_t{t}_{p}"]
-                for k in names for p in policies for t in range(T) if k in per_glimpse or t == T - 1}
+        return full
 
     @staticmethod
     def _overview(full: dict[str, float], T: int, pct: str) -> dict[str, float]:

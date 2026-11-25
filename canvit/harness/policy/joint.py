@@ -419,9 +419,10 @@ class JointPolicy:
         """The weighted policy loss for ONE glimpse. ``scores`` [B, A] carries grad
         (the train-mode scorer forward); ``flat_idx`` [B] is the taken candidate;
         ``reward`` [B] is the raw fractional distill-MSE reduction (detached). ``mask``: as
-        in :meth:`trajectory_loss` (PG only)."""
+        in :meth:`trajectory_loss` (PG, and plain QReg: its MSE over the masked-in rows only)."""
         obj = self.objective
-        self._require_pg_for_mask(mask)
+        if not (isinstance(obj, QReg) and extra_idx is None):
+            self._require_pg_for_mask(mask)
         if isinstance(obj, PG):
             # Historical default (fractional, running_mean + running_std / z_subtract_only)
             # resolves to exactly `self._norm(depth).normalize(reward, subtract_only=...)`.
@@ -445,7 +446,11 @@ class JointPolicy:
             rows = torch.cat([torch.arange(B, device=scores.device),
                               torch.arange(B, device=scores.device).repeat_interleave(K)])
             loss, _ = qreg_loss(scores[rows], idx, target)
-        else:
+        elif mask is None:
             target = self._standardize(depth, reward)
             loss, _ = qreg_loss(scores, flat_idx, target)
+        else:  # visual search: only the target-present trials carry a reward
+            target = self._standardize(depth, reward, mask)
+            loss = (qreg_loss(scores[mask], flat_idx[mask], target[mask])[0] if bool(mask.any())
+                    else scores.sum() * 0.0)
         return self.rl_weight * loss
