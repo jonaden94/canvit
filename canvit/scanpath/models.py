@@ -1,0 +1,255 @@
+"""Grid predictions as pysaliency models, and the fitted centre bias (design §3, §4.1).
+
+pysaliency provides the models and the metrics; this file only adapts what it cannot know:
+
+- :class:`GridScanpathModel` -- a ``pysaliency.ScanpathModel`` whose conditional log density comes
+  from logits a CanViT episode precomputed on the G x G scene grid (``canvit_models.py``), keyed by
+  pysaliency's ``(scanpath_index, history length)``. Each stimulus pixel takes the cell its centre
+  falls in (letterbox of ``data.py``). The cells are equal in SCENE area, so a cell's logit is a density
+  per area: every pixel of a cell gets exp(logit), renormalised over the stimulus pixels -- a cell the
+  letterbox edge cuts keeps its per-pixel density and loses mass with its lost pixels; cells with no
+  stimulus pixel (letterbox padding) get none. (Before 2026-11-23 a cut cell kept the whole cell's mass,
+  concentrated on its few pixels.)
+- :class:`DensitySaliencyMap` -- the density as a ``ScanpathSaliencyMapModel``, so pysaliency's
+  NSS / AUC score the density itself (as in Kümmerer et al.), not the log density.
+- :func:`fit_centre_bias` -- bandwidth and eps of pysaliency's ``CrossvalidatedBaselineModel``
+  (leave-one-image-out KDE + uniform, Kümmerer's centre-bias baseline), chosen by log-likelihood
+  on the TRAINING split; the model scored against is then built on the evaluated split.
+"""
+
+from __future__ import annotations
+
+import logging
+from functools import lru_cache
+
+import numpy as np
+import pysaliency
+import torch
+from pysaliency.baseline_utils import CrossvalidatedBaselineModel
+from pysaliency.datasets import as_stimulus
+from scipy.special import log_softmax
+
+from .data import pixel_to_scene
+
+log = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=16)
+def _pixel_cells(h: int, w: int, scene: int, grid: int, frame: tuple[int, int] | None = None
+                 ) -> tuple[np.ndarray, np.ndarray]:
+    """[h, w] flat cell index of every pixel centre, and [G*G] pixel count per cell (``frame``:
+    data.letterbox_geometry)."""
+    yy, xx = np.meshgrid(np.arange(h) + 0.5, np.arange(w) + 0.5, indexing="ij")
+    xy = pixel_to_scene(torch.from_numpy(np.stack([xx, yy], -1)), hw=(h, w), scene=scene, frame=frame).numpy()
+    ij = np.clip(np.floor((xy + 1) / 2 * grid), 0, grid - 1).astype(np.int64)
+    cell = ij[..., 1] * grid + ij[..., 0]
+    return cell, np.bincount(cell.ravel(), minlength=grid * grid)
+
+
+def _log_count(count: np.ndarray) -> np.ndarray:
+    with np.errstate(divide="ignore"):
+        return np.log(count)  # -inf for cells without a stimulus pixel
+
+
+def grid_log_density(logits: np.ndarray, *, hw: tuple[int, int], scene: int,
+                     frame: tuple[int, int] | None = None) -> np.ndarray:
+    """[G*G] scene-grid logits -> [h, w] log density over the stimulus pixels (sums to 1): every pixel gets
+    its cell's logit, normalised over the pixels (= cell probabilities ``softmax(logits + log pixels)``,
+    spread evenly over each cell's pixels)."""
+    grid = int(round(len(logits) ** 0.5))
+    cell, count = _pixel_cells(hw[0], hw[1], scene, grid, frame)
+    logp = log_softmax(logits.astype(np.float64) + _log_count(count))
+    with np.errstate(invalid="ignore"):  # -inf - -inf in cells no pixel reads
+        return (logp - _log_count(count))[cell]
+
+
+class GridScanpathModel(pysaliency.ScanpathModel):
+    """Precomputed grid logits as a pysaliency scanpath model. ``logits[(scanpath_index, t)]`` [G*G]
+    is the prediction for fixation t after the human's fixations 0..t-1 (history length t).
+
+    ``temperature`` divides the logits: one global value, or per history length t (missing t: 1). It is a
+    DIAGNOSTIC only (owner, 2026-11-20: one global entropy alpha in training; tau shows how far the policy's
+    sharpness is from the human-optimal one) and never feeds back into training.
+
+    ``frame`` (H, W) or None: the display frame the stimuli were letterboxed into (``data.letterbox_geometry``);
+    the predictions only mean something in the geometry they were made in, so it is saved with them."""
+
+    def __init__(self, logits: dict[tuple[int, int], np.ndarray], *, scene_size: int, name: str,
+                 temperature: float | dict[int, float] = 1.0, frame: tuple[int, int] | None = None):
+        super().__init__()
+        self.logits, self.scene, self.name, self.temperature = logits, scene_size, name, temperature
+        self.frame = None if frame is None else (int(frame[0]), int(frame[1]))
+        self.frame_recorded = True  # load(): False for files written before the frame existed
+
+    def tau(self, t: int) -> float:
+        return self.temperature if isinstance(self.temperature, float | int) else self.temperature.get(t, 1.0)
+
+    def with_temperature(self, temperature: float | dict[int, float]) -> GridScanpathModel:
+        return GridScanpathModel(self.logits, scene_size=self.scene, name=self.name, temperature=temperature,
+                                 frame=self.frame)
+
+    def conditional_log_density(self, stimulus, x_hist, y_hist, t_hist, attributes=None, out=None):
+        key = (int(attributes["scanpath_index"]), len(x_hist))
+        if key not in self.logits:
+            raise KeyError(f"{self.name}: no prediction for scanpath {key[0]} after {key[1]} fixations "
+                           "(was the episode run long enough?)")
+        return grid_log_density(self.logits[key] / self.tau(key[1]), hw=as_stimulus(stimulus).size,
+                                scene=self.scene, frame=self.frame)
+
+    def save(self, path, *, meta: dict | None = None) -> None:
+        """The predictions as ``.npz`` (keys [N, 2] = (scanpath_index, t), float32 logits; ``meta``: JSON, e.g. the
+        checkpoint's provenance). float32, not float16: logits reach ~40, where float16 steps are 0.03."""
+        import json
+        keys = np.array(list(self.logits), dtype=np.int64).reshape(-1, 2)
+        np.savez_compressed(path, keys=keys, logits=np.stack([self.logits[tuple(k)] for k in keys]).astype(np.float32),
+                            scene_size=self.scene, name=self.name, meta=json.dumps(meta or {}, default=str),
+                            frame=np.array(self.frame or (0, 0), dtype=np.int64))
+
+    @classmethod
+    def load(cls, *paths) -> GridScanpathModel:
+        """One or several saved prediction files (e.g. the shards of one run) as one model; ``.meta`` = the first
+        file's meta. Refuses files of different models and overlapping keys."""
+        import json
+        logits: dict[tuple[int, int], np.ndarray] = {}
+        first = None
+        for path in paths:
+            z = np.load(path)
+            fr = tuple(int(v) for v in z["frame"]) if "frame" in z else (0, 0)  # files before 2026-11-23: none
+            head = (int(z["scene_size"]), str(z["name"]), None if fr == (0, 0) else fr)
+            if first is not None and head != first[0]:
+                raise ValueError(f"{path}: predictions of {head}, not {first[0]}")
+            part = {(int(a), int(b)): v.astype(np.float32) for (a, b), v in zip(z["keys"], z["logits"])}
+            if logits.keys() & part.keys():
+                raise ValueError(f"{path}: predictions overlap with the files before it")
+            logits |= part
+            first = first or (head, json.loads(str(z["meta"])) if "meta" in z else {})
+        assert first is not None, "no prediction file given"
+        model = cls(logits, scene_size=first[0][0], name=first[0][1], frame=first[0][2])
+        model.meta = first[1]
+        model.frame_recorded = "frame" in np.load(paths[0])  # False: written before the frame existed
+        return model
+
+
+def _scored_cells(model: GridScanpathModel, stimuli, fixations):
+    """For every fixation with a history: its logits [N, G*G], the cell it landed in [N], log(pixels of the
+    image in each cell) [N, G*G] (-inf: none), and its history length [N]. (pysaliency's LL = log p(cell) -
+    log(pixels in cell); the second term does not depend on the temperature, so fitting on cells is exact.)"""
+    fx = without_start_fixations(fixations)
+    logits, cells, logcount = [], [], []
+    for i in range(len(fx)):
+        h, w = stimuli.sizes[int(fx.n[i])]
+        lg = model.logits[(int(fx.scanpath_index[i]), int(fx.scanpath_history_length[i]))]
+        cell, count = _pixel_cells(int(h), int(w), model.scene, int(round(len(lg) ** 0.5)), model.frame)
+        logits.append(lg)
+        cells.append(cell[fx.y_int[i], fx.x_int[i]])
+        logcount.append(_log_count(count))
+    return (np.stack(logits).astype(np.float64), np.array(cells), np.stack(logcount),
+            np.asarray(fx.scanpath_history_length))
+
+
+def _cell_log_probs(logits: np.ndarray, logcount: np.ndarray, tau) -> np.ndarray:
+    """log p(cell) at temperature ``tau`` (scalar or [N, 1]): the temperature scales the logits, not the area."""
+    return log_softmax(logits / tau + logcount, axis=1)
+
+
+def fit_temperature(model: GridScanpathModel, stimuli, fixations, *, per_index: bool = False,
+                    min_fixations: int = 50) -> float | dict[int, float]:
+    """The temperature maximising the mean log-likelihood of the human fixations (fit on the TRAINING split).
+    ``per_index``: one per history length t with >= ``min_fixations`` fixations (a secondary diagnostic)."""
+    from scipy.optimize import minimize_scalar
+    logits, cells, logcount, t = _scored_cells(model, stimuli, fixations)
+    rows = np.arange(len(cells))
+
+    def fit(mask) -> float:
+        def nll(log_tau):
+            logp = _cell_log_probs(logits[mask], logcount[mask], float(np.exp(log_tau)))
+            return -logp[rows[: mask.sum()], cells[mask]].mean()
+        log_tau = minimize_scalar(nll, bounds=(-4.0, 4.0), method="bounded").x
+        if abs(abs(log_tau) - 4.0) < 1e-3:  # e.g. an uninformative map: flattening it is all the fit can do
+            log.warning("temperature fit at the edge of [e^-4, e^4]: tau=%.3g", np.exp(log_tau))
+        return float(np.exp(log_tau))
+
+    if not per_index:
+        return fit(np.ones(len(cells), dtype=bool))
+    return {int(i): fit(t == i) for i in np.unique(t) if (t == i).sum() >= min_fixations}
+
+
+def cell_scores(model: GridScanpathModel, stimuli, fixations, *, chunk: int = 20000
+                ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per scored fixation, at the model's temperature: log p(the cell it landed in) and the entropy (nats) of
+    p(cell) over the image's cells (``p(cell)`` as in :func:`grid_log_density`), and the history length t.
+    pysaliency's LL is log p(cell) - log(pixels in cell), so a temperature changes it by exactly the change in
+    log p(cell). Chunked: [N, G*G] float64 for every fixation of a big dataset would not fit in memory."""
+    fx = without_start_fixations(fixations)
+    lp, H = [], []
+    for i in range(0, len(fx), chunk):
+        logits, cells, logcount, t = _scored_cells(model, stimuli, fx[i:i + chunk])
+        taus = np.array([model.tau(int(j)) for j in t])[:, None]
+        logp = _cell_log_probs(logits, logcount, taus)
+        lp.append(logp[np.arange(len(cells)), cells])
+        H.append(-(np.exp(logp) * np.where(np.isfinite(logp), logp, 0.0)).sum(1))
+    return np.concatenate(lp), np.concatenate(H), np.asarray(fx.scanpath_history_length)
+
+
+def policy_entropy(model: GridScanpathModel, stimuli, fixations) -> tuple[np.ndarray, np.ndarray]:
+    """Entropy (nats) of the predicted next-fixation distribution over the image's cells, at the model's
+    temperature, per scored fixation; and the history length t (:func:`cell_scores`)."""
+    _, H, t = cell_scores(model, stimuli, fixations)
+    return H, t
+
+
+class DensitySaliencyMap(pysaliency.ScanpathSaliencyMapModel):
+    """A scanpath model's conditional density as a saliency map (for pysaliency's NSS and AUC)."""
+
+    def __init__(self, model: pysaliency.ScanpathModel):
+        super().__init__()
+        self.model = model
+
+    def conditional_saliency_map(self, stimulus, x_hist, y_hist, t_hist, attributes=None, out=None):
+        d = np.exp(self.model.conditional_log_density(stimulus, x_hist, y_hist, t_hist, attributes=attributes))
+        # A flat density is not exactly flat after exp(log): pysaliency's NSS then divides rounding noise by a
+        # ~1e-22 std and returns +-1 (seen for UniformModel, 2026-11-20). Make it exactly constant -> NSS 0.
+        if d.max() - d.min() <= 1e-9 * d.max():
+            d = np.full_like(d, d.mean())
+        return d
+
+
+def without_start_fixations(fixations):
+    """The fixations with a history: the start fixation of every scanpath is forced to the display centre,
+    so in a centre bias it is a spike at one pixel, not viewing behaviour. Kept out of the centre bias's
+    KDE and of its fit (measured 2026-11-20: it cost ~0.15 bits/fix and made the fit pick the narrowest
+    bandwidth on the grid)."""
+    return fixations[fixations.scanpath_history_length > 0]
+
+
+def fit_centre_bias(stimuli, fixations, *, n_images: int = 200, seed: int = 0,
+                    bandwidths=(0.004, 0.0063, 0.01, 0.016, 0.025, 0.04, 0.063),
+                    epss=(1e-7, 1e-4)) -> dict[str, float]:
+    """Grid search of ``CrossvalidatedBaselineModel(bandwidth, eps)``: mean log-likelihood (bits/fix)
+    of the fixations on ``n_images`` random training stimuli, each scored by the KDE of all OTHER
+    training stimuli; start fixations excluded throughout (:func:`without_start_fixations`). Returns the
+    best ``{"bandwidth", "eps", "ll"}``; warns at a grid edge. (Grid widened down to 0.004 on 2026-11-23: CAT2000's
+    best was the old lower edge 0.01 with the likelihood still rising.) Grouping the leave-out by photo instead of
+    stimulus (a photo can be a stimulus under several cues) changed the held-out score by <= 0.01 bits."""
+    fixations = without_start_fixations(fixations)
+    rng = np.random.default_rng(seed)
+    pick = rng.choice(len(stimuli), size=min(n_images, len(stimuli)), replace=False)
+    sub = fixations[np.isin(fixations.n, pick)]
+    best = {"ll": -np.inf}
+    for bw in bandwidths:
+        for eps in epss:
+            # memory_cache_size: pysaliency otherwise keeps every 14 MB map of every grid point (OOM at 20 GB)
+            m = CrossvalidatedBaselineModel(stimuli, fixations, bandwidth=bw, eps=eps, memory_cache_size=4)
+            ll = float(m.information_gain(stimuli, sub, baseline_model=pysaliency.UniformModel()))
+            log.info("centre bias bandwidth=%.4f eps=%.0e: %.4f bits/fix over uniform", bw, eps, ll)
+            if ll > best["ll"]:
+                best = {"bandwidth": float(bw), "eps": float(eps), "ll": ll}
+    for k, grid in (("bandwidth", bandwidths), ("eps", epss)):
+        if best[k] in (grid[0], grid[-1]):
+            log.warning("centre bias: %s=%g is at the edge of the searched grid", k, best[k])
+    return best
+
+
+__all__ = ["DensitySaliencyMap", "GridScanpathModel", "cell_scores", "fit_centre_bias", "fit_temperature",
+           "grid_log_density",
+           "policy_entropy", "without_start_fixations"]

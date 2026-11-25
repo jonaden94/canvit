@@ -101,6 +101,9 @@ class DistillRunTask:
     the model — stashed in ``build_model`` — and the first shard)."""
 
     name = "distill"
+    display_frame = "scene"
+    """How the training images sit in the scene (read by the scanpath evaluation): resized and centre-cropped
+    to the square scene (``core.preprocess``)."""
 
     def __init__(self, cfg):
         self.cfg = cfg

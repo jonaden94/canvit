@@ -119,6 +119,9 @@ class SearchRunTask:
     """Run-level visual-search task for ``harness.run``."""
 
     name = "search"
+    display_frame = "1680x1050"
+    """How the training images sit in the scene (read by the scanpath evaluation): COCO-Search18's 1680x1050
+    displays letterboxed into the scene (``SearchDataset``; the crop augmentation keeps the aspect)."""
 
     def __init__(self, cfg: SearchConfig, *, rl=None):
         self.cfg = cfg

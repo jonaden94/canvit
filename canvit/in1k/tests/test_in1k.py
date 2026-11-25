@@ -3,6 +3,7 @@ produces per-timestep CLS tokens for both patcher routings; frozen mode trains
 only LN+head (backbone untouched) while finetune reaches the backbone; metrics
 count correctly."""
 
+import os
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,15 @@ from ..rollout import eval_viewpoints, rollout_cls_tokens
 
 _IN1K_SHARDS = Path("/mnt/vast-nhr/projects/nib00021/jonathan/datasets") \
     / "webdataset-imagenet-1k-no-features/train-shuffled"
+
+
+def _readable_dir(p: Path) -> bool:
+    """``is_dir()`` RAISES on a path that exists but is not readable (a user outside group
+    HPC_nib00021), which failed the whole suite at collection instead of skipping this test."""
+    try:
+        return p.is_dir() and os.access(p, os.R_OK | os.X_OK)
+    except OSError:
+        return False
 
 _B, _G, _T, _IMG, _C = 2, 8, 3, 224, 10
 _DEVICE = torch.device("cpu")
@@ -87,7 +97,7 @@ def test_eval_viewpoints_shapes() -> None:
         assert vps[0].centers.shape == (_B, 2)
 
 
-@pytest.mark.skipif(not _IN1K_SHARDS.is_dir(), reason="IN1k webdataset shards not mounted on this node")
+@pytest.mark.skipif(not _readable_dir(_IN1K_SHARDS), reason="IN1k webdataset shards not mounted on this node")
 def test_train_pipeline_decodes_real_shards() -> None:
     """End-to-end on the real IN1k shards: the webdataset pipeline decodes
     jpg+json into (image [B,3,S,S], labels in [0,999]) with the train aug."""

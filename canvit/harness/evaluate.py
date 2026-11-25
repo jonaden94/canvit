@@ -52,6 +52,7 @@ from canvit.ade20k.dinov3_baseline import DinoV3BaselineOpts
 from canvit.distill.config import Config as DistillConfig
 from canvit.harness.config import JointPolicyConfig
 from canvit.in1k.config import In1kConfig
+from canvit.scanpath.config import ScanpathConfig
 from canvit.search.config import SearchConfig, search_policy_config
 
 log = logging.getLogger(__name__)
@@ -287,11 +288,32 @@ class Ade20kDinoV3Eval:
         return evaluate_dinov3(self.cfg, self.opts)
 
 
+@dataclass
+class ScanpathEval:
+    """Human scanpaths: teacher-forced likelihood of each human fixation given the earlier ones
+    (design notes outside the repo: canvit_claude/scanpath/). Its own ``run()``, like ``ade20k-dinov3``: the baseline
+    models have no checkpoint to restore, so ``evaluate()``'s strict reload does not apply."""
+
+    cfg: ScanpathConfig = field(default_factory=ScanpathConfig)
+    out: Path | None = None
+
+    def run(self) -> dict[str, Any]:
+        try:
+            from canvit.scanpath.evaluate import run
+        except ModuleNotFoundError as e:
+            if e.name != "pysaliency":
+                raise
+            raise SystemExit("the scanpath evaluation needs pysaliency: install the scanpath extra "
+                             "(pip install -e '.[scanpath]', or uv sync --extra scanpath)") from e
+        return run(self.cfg)
+
+
 Command = Annotated[Ade20kEval, tyro.conf.subcommand("ade20k")] | \
     Annotated[Ade20kDinoV3Eval, tyro.conf.subcommand("ade20k-dinov3")] | \
     Annotated[In1kEval, tyro.conf.subcommand("in1k")] | \
     Annotated[DistillEval, tyro.conf.subcommand("distill")] | \
-    Annotated[SearchEval, tyro.conf.subcommand("search")]
+    Annotated[SearchEval, tyro.conf.subcommand("search")] | \
+    Annotated[ScanpathEval, tyro.conf.subcommand("scanpath")]
 
 _CHECKPOINT_EVALS: dict[str, type] = {"ade20k": Ade20kEval, "in1k": In1kEval,
                                       "distill": DistillEval, "search": SearchEval}
@@ -340,7 +362,7 @@ def main(argv: list[str] | None = None) -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     cmd, config_source = parse(list(sys.argv[1:] if argv is None else argv))
-    if isinstance(cmd, Ade20kDinoV3Eval):
+    if isinstance(cmd, (Ade20kDinoV3Eval, ScanpathEval)):
         record, out = cmd.run(), cmd.out
     else:
         task, task_name = cmd.build()
