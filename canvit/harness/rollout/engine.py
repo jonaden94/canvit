@@ -398,16 +398,27 @@ def run_rollout(
                 cur_pi = task.per_image_loss(gout.readout).detach()
                 raw_r = joint.inline_reward(prev_pi_loss, cur_pi)
                 prev_pi_loss = cur_pi
-                term = joint.sac_actor_step(scores=aux["scores"], feats=feats_t) * scale
+                with amp_ctx:
+                    term = joint.sac_actor_step(scores=aux["scores"], feats=feats_t) * scale
+                # The critics read detached features, so their graph is independent of everything
+                # else: backward each critic term at once (same gradient as inside the chunk's
+                # backward; only one twin-critic graph is alive at a time).
+                critic_now = torch.zeros((), device=device)
+                pending = []
                 if sac_prev:
-                    term = term + joint.sac_critic_term(**sac_prev, next_feats=feats_t, next_logp=logp_t) * scale
+                    pending.append(dict(sac_prev, next_feats=feats_t, next_logp=logp_t))
                 sac_prev = {"feats": feats_t, "flat_idx": aux["flat_idx"], "r": joint.sac_reward(raw_r)}
                 if t == n_glimpses - 1:
-                    term = term + joint.sac_critic_term(**sac_prev) * scale
+                    pending.append(dict(sac_prev))
+                for kw in pending:
+                    with amp_ctx:
+                        c = joint.sac_critic_term(**kw)
+                    (c * scale / n_glimpses / n_branches).backward()
+                    critic_now = critic_now + c.detach()
                 chunk_loss = chunk_loss + term
                 if split_grads is not None:
                     chunk_pol = term if chunk_pol is None else chunk_pol + term
-                pol_acc["loss"] = pol_acc["loss"] + term.detach() / scale
+                pol_acc["loss"] = pol_acc["loss"] + term.detach() / scale + critic_now
                 pol_acc["reward"] = pol_acc["reward"] + _masked_mean(raw_r, rmask).detach()
                 pol_acc["n"] += 1
                 if t == n_glimpses - 1:
