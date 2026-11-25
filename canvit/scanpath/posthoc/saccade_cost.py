@@ -1,17 +1,19 @@
 """The saccade-length (distance) bias a checkpoint still misses, as a post-hoc log-prior on its map; measured in bits.
 
-Per scored fixation (current fixation f, cells j of the G x G scene grid, d_j = |c_j - f| in DEGREES):
+Per scored fixation (current fixation f, cells j of the G x G scene grid, d_j = |c_j - f| in SCENE UNITS, [-1, 1]):
 
-    log p(j) = log_softmax_j( logits_j / tau_dataset + log pixels_j + prior(d_j) )
-    prior:  none  |  log  a log(d + r)  |  linear+log  a log(d + r) - b d          (r = half a grid cell)
+    log p(j) = log_softmax_j( logits_j / tau_dataset + log pixels_j - w c(d_j) )
+    c:  none  |  log  log(1 + d / r)  |  linear  d / 2          (r = half a grid cell = 1 / G)
+
+c is the RL training's cost, exactly (``cost_forms``: same d, same r, same scaling); only the weight w (and tau)
+is fitted. Quadratic and linear+log shapes were compared on 2026-11-24 and dropped (Valentin, 2026-11-25).
 
 One shared fit of the prior over the focus datasets the checkpoint has (COCO-Search18 TP + TA validation,
 COCO-FreeView validation; their 2000-scanpath TRAINING predictions ``<stem>_train2000.npz``), tau per dataset (a
 per-dataset calibration). Maximum likelihood on cells (scipy L-BFGS-B, torch autograd), SEs from the
 image-clustered sandwich covariance. Scored on validation as IG over the centre bias with the exact per-fixation
 shift ``priors`` and ``evaluate`` use. Under entropy-regularised RL with temperature alpha a reward cost c(d)
-multiplies the policy by exp(-c(d)/alpha), so the fitted log prior is the cost per unit alpha:
-c(d)/alpha = -a log(1 + d/r) (+ b d). "strength" of the log form = -a (nats per unit log(1 + d/r)).
+multiplies the policy by exp(-lambda c(d)/alpha), so the fitted weight is w = lambda / alpha.
 
 Analysis and the choice of the form: normative_modelling/external/saccade_cost/ (2026-11-24; same numbers for exp39 s0,
 the log form wins on both the policy and the centre bias). Written by Claude (AI, Claude Opus 5.5), 2026-11-24.
@@ -35,13 +37,14 @@ import numpy as np
 import torch
 from scipy.optimize import minimize
 
+from .cost_forms import saccade_cost
+
 log = logging.getLogger(__name__)
 
 STEMS = {"tp": "coco_search18_tp_validation", "ta": "coco_search18_ta_validation", "fv": "coco_freeview_validation"}
 # pixels per degree of the eye-tracking displays (as protocol.deepgaze.ppd of the DeepGaze III records)
 PPD = {"coco_search18": 31.1, "coco_freeview": 31.1}
-FORMS = {"none": (), "linear": ("b",), "quadratic": ("q",), "log": ("a",), "linear+log": ("a", "b")}
-SUMMARY_FORMS = ("none", "log", "linear+log")  # what evaluate_entry fits; linear/quadratic: the form comparison
+FORMS = {"none": (), "log": ("w",), "linear": ("w",)}  # the fitted parameters besides tau
 TAUS = np.unique(np.concatenate([np.geomspace(0.25, 128.0, 37), [1.0]]))  # the best-tau sweep (val)
 CHUNK = 6000  # fixations per autograd pass
 
@@ -49,7 +52,8 @@ CHUNK = 6000  # fixations per autograd pass
 # --------------------------------------------------------------------------------------------------- data
 def _batch(path: Path, part: str, analysis: bool = False) -> dict:
     """One record's CellBatch (``priors.cell_batch``, val or its training subset) reduced to what the fit needs:
-    logits, log pixels per cell, the human's cell, image index, and d (deg) from the current fixation to every cell.
+    logits, log pixels per cell, the human's cell, image index, d (scene units) from the current fixation to every
+    cell, r = 1 / grid, and ``deg``: degrees per scene unit of each fixation's image (for reading only).
     ``analysis``: also the centre bias per cell (``log_cb``, for the no-policy base) and the humans' saccade
     lengths (``amp_deg``)."""
     from ..data import letterbox_geometry, load_dataset
@@ -81,8 +85,7 @@ def _batch(path: Path, part: str, analysis: bool = False) -> dict:
         cw = letterbox_geometry(h, w, model.scene, model.frame)[1]
         deg[b.n == n] = w * model.scene / (2 * cw) / PPD[rec["dataset"]]
     out = {"logits": b.logits.astype(np.float32), "logcount": b.logcount.astype(np.float32), "cell": b.cell,
-           "n": b.n, "d": (d_scene * deg[:, None]).astype(np.float32), "r": (deg / grid).astype(np.float32),
-           "grid": grid}
+           "n": b.n, "d": d_scene.astype(np.float32), "r": np.full(len(b), 1.0 / grid), "deg": deg, "grid": grid}
     if analysis:
         from ..models import without_start_fixations
         sx = without_start_fixations(fx)  # same order as the batch (priors.cell_batch)
@@ -133,12 +136,8 @@ def log_p(form: str, p: dict, D: dict, tau: torch.Tensor | float | None = None, 
         if tau is None:
             tau = torch.exp(p[f"log_tau_{D['key']}"])
         z = D["logits"] / tau + D["logcount"]
-    if "a" in FORMS[form]:
-        z = z + p["a"] * torch.log(D["d"] + D["r"])
-    if "b" in FORMS[form]:
-        z = z - p["b"] * D["d"]
-    if "q" in FORMS[form]:
-        z = z - p["q"] * D["d"] ** 2
+    if form != "none":
+        z = z - p["w"] * saccade_cost(form, D["d"], D["r"])
     return torch.log_softmax(z, 1)
 
 
@@ -219,10 +218,10 @@ def evaluate_entry(entry: Path, processes: int = 6) -> dict:
     with ProcessPoolExecutor(min(processes, len(jobs))) as ex:
         built = dict(zip(jobs, ex.map(_batch, [recs[k] for k, _ in jobs], [p for _, p in jobs])))
     log.info("cell batches: %s", {f"{k}/{p}": len(v["cell"]) for (k, p), v in built.items()})
-    deg_unit = float(np.median(np.concatenate([v["r"] for v in built.values()]))) * built[jobs[0]]["grid"]
+    deg_unit = float(np.median(np.concatenate([v["deg"] for v in built.values()])))
     grid = built[jobs[0]]["grid"]
     train = [_tensors(k, built.pop((k, "train"))) for k in recs]
-    fits = {form: fit(form, train)[:2] for form in SUMMARY_FORMS}
+    fits = {form: fit(form, train)[:2] for form in FORMS}
     for form, (p, se) in fits.items():
         log.info("fit %s: %s", form, {k: f"{v:.4g} +- {se[k]:.2g}" for k, v in p.items()})
     n_train = {D["key"]: len(D["cell"]) for D in train}
@@ -233,16 +232,15 @@ def evaluate_entry(entry: Path, processes: int = 6) -> dict:
         rig = json.loads(path.read_text())["metrics"]["ig_image"]
         p0 = fits["none"][0]
         row = {"ig_tau": float(val_ig("none", p0, V, rig)[0]), "tau": float(np.exp(p0[f"log_tau_{k}"]))}
-        for form, tag in (("log", "log"), ("linear+log", "linlog")):
+        for form in ("log", "linear"):
             p = fits[form][0]
-            row[f"ig_{tag}"] = float(val_ig(form, p, V, rig)[0])
-            row[f"gain_{tag}"] = row[f"ig_{tag}"] - row["ig_tau"]
-            row[f"tau_{tag}"] = float(np.exp(p[f"log_tau_{k}"]))
-        sweep = val_ig("log", {"a": fits["log"][0]["a"]}, V, rig, TAUS)
+            row[f"ig_{form}"] = float(val_ig(form, p, V, rig)[0])
+            row[f"gain_{form}"] = row[f"ig_{form}"] - row["ig_tau"]
+            row[f"tau_{form}"] = float(np.exp(p[f"log_tau_{k}"]))
+        sweep = val_ig("log", {"w": fits["log"][0]["w"]}, V, rig, TAUS)
         row["best_tau_log_val"], row["ig_best_tau_log_val"] = float(TAUS[int(np.argmax(sweep))]), float(sweep.max())
         per[k] = row
         log.info("%s: %s", k, {kk: round(v, 3) for kk, v in row.items()})
-    (pl, sl), (pll, sll) = fits["log"], fits["linear+log"]
     gl = float(np.mean([v["gain_log"] for v in per.values()]))
     names = {"tp": "CS18 TP", "ta": "TA", "fv": "FreeView"}
     try:
@@ -253,16 +251,17 @@ def evaluate_entry(entry: Path, processes: int = 6) -> dict:
     return {
         "key_line": f"distance bias still missing: +{gl:.2f} bits/fix (log cost, mean of "
                     f"{', '.join(names[k] for k in per)} val)",
-        "gain_log_mean": gl, "gain_linlog_mean": float(np.mean([v["gain_linlog"] for v in per.values()])),
-        "fit": {"log": {"a": pl["a"], "a_se": sl["a"], "lambda_over_alpha": -pl["a"]},
-                "linlog": {"a": pll["a"], "a_se": sll["a"], "b_per_deg": pll["b"], "b_se": sll["b"]}},
-        "per_dataset": per, "n_train_fixations": n_train, "deg_per_scene_unit": deg_unit, "r_deg": deg_unit / grid,
+        "gain_log_mean": gl, "gain_linear_mean": float(np.mean([v["gain_linear"] for v in per.values()])),
+        "fit": {form: {"weight": fits[form][0]["w"], "weight_se": fits[form][1]["w"]} for form in ("log", "linear")},
+        "cost_forms": {"log": "log(1 + d/r)", "linear": "d/2", "r": 1.0 / grid,
+                       "d": "distance between glimpse centres in scene units [-1, 1] (scene width 2), as in training"},
+        "per_dataset": per, "n_train_fixations": n_train, "grid": grid, "deg_per_scene_unit": deg_unit,
         "records": {k: str(v) for k, v in recs.items()},
         "notes": "IG: bits/fix over the centre bias, validation, per image then over images. One fit of the prior "
-                 "shared over the datasets listed, tau per dataset (tau, tau_log, tau_linlog: fitted on the 2000 "
-                 "training scanpaths). best_tau_log_val: argmax of validation IG over tau with the log prior fixed "
-                 "(optimistic). lambda_over_alpha = -a: RL cost c(d)/alpha = lambda/alpha * log(1 + d/r), r = half a "
-                 "grid cell.",
+                 "shared over the datasets listed, tau per dataset (tau, tau_log, tau_linear: fitted on the 2000 "
+                 "training scanpaths). best_tau_log_val: argmax of validation IG over tau with the log cost fixed "
+                 "(optimistic). weight = lambda/alpha: the map is multiplied by exp(-weight c(d)), c = the RL "
+                 "training's cost (cost_forms).",
         "written_by": "canvit.scanpath.posthoc.saccade_cost (Claude, Claude Opus 5.5)", "source": f"canvit {commit}",
         "computed_at": datetime.now(UTC).isoformat()}
 

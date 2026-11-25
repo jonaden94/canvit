@@ -27,11 +27,19 @@
 ## 1. Why a cost, why this form
 
 - **What the fits show:** at τ = 1 the policy's spatial entropy is already human-level. What it lacks
-  is the distance bias: humans make short saccades and the policy does not. All post-hoc fits use the
-  policy's own predictions times a distance term:
-  - the log cost fits best on all three datasets (log a = −1.80 ± 0.009 for the main checkpoint);
-  - the linear cost adds about 0.03 on top of the log one;
-  - a quadratic cost is worst.
+  is the distance bias: humans make short saccades and the policy does not. The post-hoc fits multiply the
+  policy's own map by exp(−w · c(d)), with c exactly the training's cost below, and fit only w = λ/α (+ τ):
+  - log fits best on all three datasets: w = 1.80 ± 0.01 for the main checkpoint, +1.28 / +0.84 / +1.41
+    bits/fix on CS18 TP / TA / FreeView val;
+  - linear: w = 10.46 ± 0.09, +1.25 / +0.79 / +1.33 (0.03–0.08 below log; the same ranking on the centre
+    bias alone and on all 9 retinas);
+  - quadratic and linear + log were also compared post hoc (2026-11-24) and dropped: quadratic was worst,
+    linear + log added ≤ 0.04 over log. Only the two shapes the training implements are kept (Valentin,
+    2026-11-25).
+- **One definition:** on `scanpath-eval`, `canvit/scanpath/posthoc/cost_forms.py` holds the same two
+  formulas as `SaccadeCost.cost` here (same d in scene units, r = 1/grid, linear = d/2); its test compares
+  both on a grid of d bit for bit when both are importable (checked in a trial merge of the two branches).
+  After the merge, `posthoc` imports the harness function and `cost_forms.py` goes.
 - **Two forms, both physiologically motivated (Valentin, 2026-11-24):**
   - `log`: distance on the log-polar collicular/cortical map. r ≈ 0.84° is close to Schwartz's
     a ≈ 0.75°, and half a 32×32 grid cell is the same order.
