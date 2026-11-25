@@ -1,8 +1,8 @@
 diff --git a/canvit/harness/config.py b/canvit/harness/config.py
-index 43ebddb..b19ce11 100644
+index 43ebddb..82e6ecc 100644
 --- a/canvit/harness/config.py
 +++ b/canvit/harness/config.py
-@@ -138,6 +138,21 @@ class JointPolicyConfig:
+@@ -138,6 +138,29 @@ class JointPolicyConfig:
      ``per_step``). ``ema_abs``: divide by an EMA of the mean absolute reward and clip to +-10
      (Haoze). ``none``: no scaling."""
  
@@ -20,12 +20,20 @@ index 43ebddb..b19ce11 100644
 +    """``standardized``: action t's target = the standardised reward - weight * z_batch(c_t);
 +    unit-free, so the weight keeps its meaning while the terminal reward shrinks ~10x over
 +    training. ``raw``: target = standardise(R - weight * sum_t c_t), the cost in reward units."""
++    saccade_cost_beta_mode: Literal["fixed", "conditioned"] = "fixed"
++    """``fixed`` (stage 1): every trial uses beta = ``saccade_cost_weight``. ``conditioned``
++    (stage 2): each training trial draws beta ~ U[0, saccade_cost_weight] and the policy gets
++    beta as an input next to its FiLM cue (FiLM-conditioned scorers only, i.e. search;
++    ``standardized`` only), so one run covers every beta in that range."""
++    saccade_cost_beta_eval: float = 0.0
++    """``conditioned`` only: the beta given to the policy at validation / deploy (all trials).
++    Override it at ``harness.evaluate`` to score one checkpoint at several betas."""
 +
      # VPG only (objective="vpg"); ignored by qreg/pg. Defaults = autoreg exp12's values.
      vpg_entropy_bonus: float = 5e-3
      """FIXED entropy weight (autoreg ``rl_entropy_weight``). Separate from ``entropy_bonus``
 diff --git a/canvit/harness/policy/build.py b/canvit/harness/policy/build.py
-index f72d62b..4e588ee 100644
+index f72d62b..9f66203 100644
 --- a/canvit/harness/policy/build.py
 +++ b/canvit/harness/policy/build.py
 @@ -35,7 +35,7 @@ from canvit.core.policy import (
@@ -33,28 +41,43 @@ index f72d62b..4e588ee 100644
  )
  from canvit.harness.config import FoveatedScaleConfig, JointPolicyConfig
 -from canvit.harness.policy.joint import JointPolicy
-+from canvit.harness.policy.joint import JointPolicy, SaccadeCost
++from canvit.harness.policy.joint import BETA_FEATURES, JointPolicy, SaccadeCost
  from canvit.harness.policy.rl import PG, VPG, Objective, QReg, resolve_reward
  from canvit.harness.rollout.selector import PolicySelector, RandomSelector
  
-@@ -116,6 +116,16 @@ def build_policy(
+@@ -116,6 +116,31 @@ def build_policy(
      # Reward kind + centring + scaling; refuses what the objective cannot honour.
      reward = resolve_reward(objective=obj, reward=rl.reward, center=rl.reward_center, scale=rl.reward_scale)
  
 +    # Optional saccade cost: defined on the deferred (terminal-reward) PG path only.
++    conditioned = rl.saccade_cost_beta_mode == "conditioned"
 +    saccade_cost = SaccadeCost(form=rl.saccade_cost, weight=rl.saccade_cost_weight,
-+                               combine=rl.saccade_cost_combine, r=1.0 / rl.centers_per_axis)
++                               combine=rl.saccade_cost_combine, r=1.0 / rl.centers_per_axis,
++                               conditioned=conditioned, beta_eval=rl.saccade_cost_beta_eval)
 +    if saccade_cost.active and not (isinstance(obj, PG) and reward.kind == "terminal"):
 +        raise ValueError(
 +            f"saccade_cost={rl.saccade_cost!r} is implemented for objective='pg' with "
 +            f"reward='terminal' only (got objective={rl.objective!r}, reward={reward.kind!r}).")
 +    if not saccade_cost.active and rl.saccade_cost_weight != 0.0:
 +        raise ValueError("saccade_cost_weight is set but saccade_cost='none': choose 'log' or 'linear'.")
++    if conditioned:
++        # Stage 2: beta rides on the FiLM cue, so only a FiLM-conditioned scorer (search) can see it.
++        if not saccade_cost.active or rl.saccade_cost_weight <= 0.0 or rl.saccade_cost_combine != "standardized":
++            raise ValueError(
++                "saccade_cost_beta_mode='conditioned' needs a cost form, saccade_cost_weight > 0 (the upper "
++                "end of beta ~ U[0, weight]) and saccade_cost_combine='standardized'.")
++        if film_cond_dim is None:
++            raise ValueError("saccade_cost_beta_mode='conditioned' needs a FiLM-conditioned scorer "
++                             "(the search task); this task's policy has no conditioning input.")
++        film_cond_dim = film_cond_dim + BETA_FEATURES
++    elif rl.saccade_cost_beta_eval != 0.0:
++        raise ValueError("saccade_cost_beta_eval is set but saccade_cost_beta_mode='fixed': it only "
++                         "applies to a beta-conditioned policy.")
 +
      # VPG is defined for the FOVEATED action space (autoreg_tryout only ever ran a foveated
      # model). It runs on uniform and is internally consistent there, but it is not the same
      # problem: the action space gains a SCALE dimension the original never had, and t0
-@@ -197,7 +207,7 @@ def build_policy(
+@@ -197,7 +222,7 @@ def build_policy(
          rl_weight=rl.rl_weight, keep_random_branch=rl.keep_random_branch,
          target_momentum=rl.target_momentum, device=device,
          prime_target=rl.prime_on_policy, prime_warmup=rl.policy_warmup_steps,
@@ -64,7 +87,7 @@ index f72d62b..4e588ee 100644
      if isinstance(obj, PG) and obj.entropy_target is not None:
          alpha0 = obj.entropy_bonus if obj.alpha_init is None else obj.alpha_init
 diff --git a/canvit/harness/policy/joint.py b/canvit/harness/policy/joint.py
-index a8af05a..496b9fa 100644
+index a8af05a..847b03f 100644
 --- a/canvit/harness/policy/joint.py
 +++ b/canvit/harness/policy/joint.py
 @@ -23,6 +23,7 @@ groups): distillation has no task probe, unlike the ADE20K policy trainer.
@@ -75,7 +98,7 @@ index a8af05a..496b9fa 100644
  
  import torch
  import torch.distributed as dist
-@@ -49,6 +50,52 @@ from canvit.harness.rollout.selector import PolicySelector, RandomSelector
+@@ -49,6 +50,73 @@ from canvit.harness.rollout.selector import PolicySelector, RandomSelector
  from canvit.harness.rollout.viewpoint import ViewpointType
  
  
@@ -100,17 +123,38 @@ index a8af05a..496b9fa 100644
 +    std_eps: float = 1e-2
 +    """Floor on the batch std of c_t in the ``standardized`` combination (cost units; the log
 +    cost's batch std is ~1, the linear one's ~0.2)."""
++    conditioned: bool = False
++    """Stage 2 (``saccade_cost_beta_mode='conditioned'``): each trial draws its own
++    beta ~ U[0, weight], the policy sees :meth:`features` (beta) next to its FiLM cue, and
++    action t's target is lowered by beta_b * z_batch(c_t). False: one fixed beta = ``weight``."""
++    beta_eval: float = 0.0
++    """``conditioned`` only: the beta every trial gets at validation / deploy."""
 +
 +    @property
 +    def active(self) -> bool:
 +        """Saccade lengths are measured (and logged). ``weight == 0`` leaves the target unchanged."""
 +        return self.form != "none"
 +
++    def sample_beta(self, batch_size: int, device: torch.device) -> Tensor:
++        """``conditioned``: one beta per trial, U[0, weight], held for the whole trajectory."""
++        assert self.conditioned
++        return self.weight * torch.rand(batch_size, device=device)
++
++    @staticmethod
++    def features(beta: Tensor) -> Tensor:
++        """[B] -> [B, BETA_FEATURES], appended to the policy's FiLM cue. beta = 0 is a real point."""
++        beta = beta.float()
++        return torch.stack([beta, torch.log1p(beta / 0.1)], dim=-1)
++
 +    def cost(self, d: Tensor) -> Tensor:
 +        if self.form == "log":
 +            return torch.log1p(d / self.r)
 +        assert self.form == "linear", f"no cost for form={self.form!r}"
 +        return d / 2.0
++
++
++BETA_FEATURES = 2
++"""Width of :meth:`SaccadeCost.features`: the FiLM cue of a beta-conditioned policy grows by this."""
 +
 +
 +def _batch_z(x: Tensor, mask: Tensor | None, *, eps: float) -> Tensor:
@@ -128,7 +172,7 @@ index a8af05a..496b9fa 100644
  @dataclass
  class JointPolicy:
      """Owns the policy machinery consulted by ``training_step`` when RL is on: the
-@@ -72,6 +119,8 @@ class JointPolicy:
+@@ -72,6 +140,8 @@ class JointPolicy:
      reward: RewardSpec = field(default_factory=lambda: RewardSpec("fractional", "running_mean", "running_std"))
      """The resolved reward (``rl.resolve_reward``). The default is the historical QReg/PG one."""
      ema_abs: dict[int, Tensor] = field(default_factory=dict)  # per-depth state of reward_scale='ema_abs'
@@ -137,17 +181,17 @@ index a8af05a..496b9fa 100644
      _rollout_entropies: list = field(default_factory=list)  # entropy_update='per_rollout' accumulator
  
      def branch_selector(self, t0_type: ViewpointType) -> tuple[object, bool]:
-@@ -209,7 +258,8 @@ class JointPolicy:
+@@ -209,7 +279,8 @@ class JointPolicy:
          return self.scorer.vhead(feats.float().mean(dim=(2, 3))).squeeze(-1)
  
      def trajectory_loss(self, *, scores: Tensor, flat_idx: Tensor, values: Tensor | None,
 -                        reward: Tensor, mask: Tensor | None = None) -> Tensor:
 +                        reward: Tensor, mask: Tensor | None = None,
-+                        saccade_len: Tensor | None = None) -> Tensor:
++                        saccade_len: Tensor | None = None, saccade_beta: Tensor | None = None) -> Tensor:
          """The weighted policy loss for a WHOLE trajectory (the deferred, terminal-reward
          path). ``scores`` [B, T, A] carries grad; ``reward`` [B] is the detached terminal
          reward, given to every one of the T actions. ``mask`` [B] (PG only): the trials that
-@@ -221,9 +271,22 @@ class JointPolicy:
+@@ -221,9 +292,25 @@ class JointPolicy:
          PG (``values=None``): per action step t, the reward is centred/scaled under the
          resolved ``RewardSpec`` (depth t+1, the depth the inline path would use) and fed to
          :func:`pg_loss`; the result is the MEAN over the T steps, the same scale as the
@@ -157,7 +201,9 @@ index a8af05a..496b9fa 100644
 +        ``saccade_len`` [B, T] (detached; only with an active ``saccade_cost``, PG only): the
 +        length of each action's saccade. Action t's target is lowered by its OWN cost c_t
 +        (``standardized``) or the reward by the trajectory's summed cost (``raw``); see
-+        :class:`SaccadeCost`. Absent => the historical computation, unchanged."""
++        :class:`SaccadeCost`. Absent => the historical computation, unchanged.
++        ``saccade_beta`` [B] (``conditioned`` cost only): each trial's own beta, in place of
++        the scalar ``weight``; a constant beta gives the fixed-beta target exactly."""
          obj = self.objective
          self._require_pg_for_mask(mask)
 +        sc = self.saccade_cost
@@ -166,21 +212,23 @@ index a8af05a..496b9fa 100644
 +            if not isinstance(obj, PG):
 +                raise NotImplementedError("the saccade cost is implemented for objective='pg' only")
 +            cost = sc.cost(saccade_len.float())
++            assert (saccade_beta is not None) == sc.conditioned, "a conditioned cost needs the per-trial beta"
 +            if sc.combine == "raw" and sc.weight != 0.0:
 +                reward = reward - sc.weight * cost.sum(dim=1)
          if isinstance(obj, VPG):
              assert values is not None
              loss, metrics = vpg_loss(
-@@ -238,6 +301,8 @@ class JointPolicy:
+@@ -238,6 +325,9 @@ class JointPolicy:
          losses, entropies = [], []
          for t in range(n_steps):
              target = self._standardize(t + 1, reward, mask)
 +            if cost is not None and sc.combine == "standardized" and sc.weight != 0.0:
-+                target = target - sc.weight * _batch_z(cost[:, t], mask, eps=sc.std_eps)
++                beta = sc.weight if saccade_beta is None else saccade_beta
++                target = target - beta * _batch_z(cost[:, t], mask, eps=sc.std_eps)
              if mask is None:
                  loss_t, ent_t, _ = pg_loss(scores[:, t], flat_idx[:, t], target, alpha=self._alpha(obj),
                                             crit_all=None)
-@@ -253,6 +318,10 @@ class JointPolicy:
+@@ -253,6 +343,10 @@ class JointPolicy:
          ent_mean = torch.stack(entropies).mean()
          self.last_step = {"policy_entropy": ent_mean,
                            "alpha": torch.as_tensor(self._alpha(obj)).detach().float()}
@@ -192,10 +240,10 @@ index a8af05a..496b9fa 100644
  
      def glimpse_loss(self, *, depth: int, scores: Tensor, flat_idx: Tensor, reward: Tensor,
 diff --git a/canvit/harness/rollout/engine.py b/canvit/harness/rollout/engine.py
-index 973581e..12de18f 100644
+index 973581e..8d5dcf4 100644
 --- a/canvit/harness/rollout/engine.py
 +++ b/canvit/harness/rollout/engine.py
-@@ -269,6 +269,11 @@ def run_rollout(
+@@ -269,6 +269,17 @@ def run_rollout(
          # Empty for the historical inline-credit objectives (QReg/PG).
          defer = is_policy and joint is not None and joint.defers_credit
          traj: list[dict[str, Tensor]] = []
@@ -204,10 +252,16 @@ index 973581e..12de18f 100644
 +        # FULL view sits at the scene centre). Off => nothing is measured, the path is unchanged.
 +        measure_saccades = defer and joint is not None and joint.saccade_cost.active
 +        prev_centre: Tensor | None = None
++        # Stage 2 (beta-conditioned policy): the task's per-trial beta [B], drawn at bind.
++        beta_kw: dict[str, Tensor] = {}
++        if measure_saccades and joint is not None and joint.saccade_cost.conditioned:
++            beta = getattr(task, "saccade_beta", None)
++            assert beta is not None, "a beta-conditioned saccade cost needs the task's per-trial saccade_beta"
++            beta_kw = {"saccade_beta": beta}
  
          # Optional per-glimpse task metrics (distill's scene/cls sub-losses), summed
          # here and averaged over the branch below. Absent hook => untouched fast path.
-@@ -304,6 +309,8 @@ def run_rollout(
+@@ -304,6 +315,8 @@ def run_rollout(
              L = task.step_loss(gout.readout)
          _viz_capture(branch_idx, gout, vp0_named, vp0, L)
          _acc(L)
@@ -216,7 +270,7 @@ index 973581e..12de18f 100644
          if is_policy and not defer:  # seed the reward denominator with the FULL-anchor loss (no policy loss at t0)
              prev_pi_loss = task.per_image_loss(gout.readout).detach()
  
-@@ -345,6 +352,11 @@ def run_rollout(
+@@ -345,6 +358,11 @@ def run_rollout(
                  assert joint is not None and aux is not None
                  traj.append({"scores": aux["scores"], "flat_idx": aux["flat_idx"],
                               "value": joint.state_value(aux["feats"]) if joint.needs_value else None})
@@ -228,21 +282,21 @@ index 973581e..12de18f 100644
              elif is_policy:
                  assert joint is not None and prev_pi_loss is not None and aux is not None
                  cur_pi = task.per_image_loss(gout.readout).detach()
-@@ -392,6 +404,8 @@ def run_rollout(
+@@ -392,6 +410,8 @@ def run_rollout(
                      flat_idx=torch.stack([a["flat_idx"] for a in traj], dim=1),
                      values=torch.stack([a["value"] for a in traj], dim=1) if joint.needs_value else None,
                      reward=reward, **mask_kw,
 +                    **({"saccade_len": torch.stack([a["saccade_len"] for a in traj], dim=1)}
-+                       if measure_saccades else {}),
++                       if measure_saccades else {}), **beta_kw,
                  ) * n_glimpses
                  chunk_loss = chunk_loss + ploss
                  pol_acc["loss"] = pol_acc["loss"] + ploss.detach() / n_glimpses
 diff --git a/canvit/harness/tests/test_saccade_cost.py b/canvit/harness/tests/test_saccade_cost.py
 new file mode 100644
-index 0000000..c9fff9c
+index 0000000..fdef2f8
 --- /dev/null
 +++ b/canvit/harness/tests/test_saccade_cost.py
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,212 @@
 +"""The optional per-saccade cost on the terminal-reward PG target (``JointPolicyConfig.saccade_cost*``).
 +
 +Off (the default) and weight 0 must reproduce the historical trajectory loss bit for bit; a
@@ -386,15 +440,383 @@ index 0000000..c9fff9c
 +def test_a_weight_without_a_form_is_refused(seg):
 +    with pytest.raises(ValueError, match="saccade_cost='none'"):
 +        _build(seg, _rl(saccade_cost_weight=0.1), scorer_input_norm="none")
++
++
++# --------------------------------------------------------------------------- #
++# Stage 2: a beta-conditioned policy (per-trial beta). Written by Claude (AI, Claude Opus 5.5), 2026-11-25.
++# --------------------------------------------------------------------------- #
++@pytest.mark.parametrize("with_mask", [False, True])
++@pytest.mark.parametrize("form", ["log", "linear"])
++def test_a_constant_per_trial_beta_is_the_fixed_beta_bit_for_bit(with_mask, form):
++    scores, flat_idx, reward, saccade_len, mask = _batch()
++    kw = {"flat_idx": flat_idx, "reward": reward, "saccade_len": saccade_len} | ({"mask": mask} if with_mask else {})
++    ref_loss, ref_grad = _loss_and_grad(_jp(SaccadeCost(form, 0.3)), scores, **kw)
++    cond = _jp(SaccadeCost(form, 1.0, conditioned=True))  # weight = beta_max: unused when beta is given
++    loss, grad = _loss_and_grad(cond, scores, saccade_beta=torch.full((B,), 0.3), **kw)
++    assert torch.equal(loss, ref_loss) and torch.equal(grad, ref_grad)
++
++
++def test_each_trial_is_shifted_by_its_own_beta(monkeypatch):
++    scores, flat_idx, reward, saccade_len, _ = _batch()
++    kw = {"scores": scores, "flat_idx": flat_idx, "reward": reward, "saccade_len": saccade_len}
++    base = _targets(monkeypatch, _jp(SaccadeCost("log", 0.0)), **kw)
++    unit = _targets(monkeypatch, _jp(SaccadeCost("log", 1.0)), **kw) - base  # -z_batch(c_t)
++    beta = torch.linspace(0.0, 1.0, B)
++    got = _targets(monkeypatch, _jp(SaccadeCost("log", 1.0, conditioned=True)), saccade_beta=beta, **kw) - base
++    assert torch.allclose(got, beta[:, None] * unit, atol=1e-6)
++    assert torch.equal(got[0], torch.zeros(T))  # beta = 0: the cost-free target
++
++
++def test_a_conditioned_cost_needs_the_per_trial_beta():
++    scores, flat_idx, reward, saccade_len, _ = _batch()
++    with pytest.raises(AssertionError, match="per-trial beta"):
++        _jp(SaccadeCost("log", 1.0, conditioned=True)).trajectory_loss(
++            scores=scores, flat_idx=flat_idx, values=None, reward=reward, saccade_len=saccade_len)
++
++
++def test_beta_features_and_sampling():
++    f = SaccadeCost.features(torch.tensor([0.0, 0.1, 1.0]))
++    assert f.shape == (3, joint_mod.BETA_FEATURES)
++    assert torch.equal(f[0], torch.zeros(2))
++    assert torch.allclose(f[1], torch.tensor([0.1, 0.6931472]))  # log1p(1) = log 2
++    torch.manual_seed(0)
++    b = SaccadeCost("log", 0.7, conditioned=True).sample_beta(1000, torch.device("cpu"))
++    assert b.shape == (1000,) and 0.0 <= float(b.min()) and float(b.max()) <= 0.7 and float(b.std()) > 0.1
++
++
++def test_rollout_with_a_constant_task_beta_trains_as_the_fixed_beta(seg):
++    """Through run_rollout: the engine hands the task's ``saccade_beta`` to the loss; a constant
++    beta reproduces the stage-1 scorer gradient exactly (same scorer, only the cost path differs)."""
++    from canvit.harness.tests.test_task_digests import _B
++    fixed, _ = _rollout_grads(seg, _rl(saccade_cost="log", saccade_cost_weight=0.3))
++    torch.manual_seed(1)
++    jp = _build(seg, _rl(saccade_cost="log", saccade_cost_weight=0.3), scorer_input_norm="none")
++    jp.saccade_cost = replace(jp.saccade_cost, weight=1.0, conditioned=True)  # the unconditioned scorer is kept
++    task = _MaskedTask(seg, mask=None, bump=torch.ones(_B))
++    task.saccade_beta = torch.full((_B,), 0.3)
++    _rollout(seg, jp, task)
++    cond = torch.cat([p.grad.flatten() for p in jp.scorer.parameters() if p.grad is not None])
++    assert torch.equal(fixed, cond)
++
++
++@pytest.mark.parametrize("kw, match", [
++    ({"saccade_cost_beta_mode": "conditioned", "saccade_cost": "log", "saccade_cost_weight": 1.0}, "FiLM"),
++    ({"saccade_cost_beta_mode": "conditioned", "saccade_cost": "log"}, "weight > 0"),
++    ({"saccade_cost_beta_mode": "conditioned", "saccade_cost": "log", "saccade_cost_weight": 1.0,
++      "saccade_cost_combine": "raw"}, "standardized"),
++    ({"saccade_cost": "log", "saccade_cost_weight": 0.3, "saccade_cost_beta_eval": 0.3}, "beta_mode='fixed'"),
++])
++def test_incoherent_stage2_settings_are_refused(seg, kw, match):
++    with pytest.raises(ValueError, match=match):
++        _build(seg, _rl(**kw), scorer_input_norm="none")
 diff --git a/canvit/search/config.py b/canvit/search/config.py
-index 3a07425..65a3742 100644
+index 3a07425..9086453 100644
 --- a/canvit/search/config.py
 +++ b/canvit/search/config.py
-@@ -199,4 +199,7 @@ def search_policy_config() -> JointPolicyConfig:
+@@ -199,4 +199,9 @@ def search_policy_config() -> JointPolicyConfig:
          entropy_alpha_min=1e-6,
          entropy_alpha_max=0.1,
          entropy_update="per_rollout",
-+        # Saccade cost off (the default). The proposed sweep: --rl.saccade-cost {log,linear}
-+        # --rl.saccade-cost-weight {0,0.1,0.3,1.0} (combine 'standardized').
++        # Saccade cost off (the default). Stage 1 (fixed beta): --rl.saccade-cost {log,linear}
++        # --rl.saccade-cost-weight {0,0.1,0.3,1.0} (combine 'standardized'). Stage 2 (one
++        # beta-conditioned policy per form): --rl.saccade-cost-beta-mode conditioned
++        # --rl.saccade-cost-weight 1.0 (beta ~ U[0, 1]) [--rl.saccade-cost-beta-eval 0.3].
 +        saccade_cost="none",
      )
+diff --git a/canvit/search/task.py b/canvit/search/task.py
+index 7735912..e279a60 100644
+--- a/canvit/search/task.py
++++ b/canvit/search/task.py
+@@ -52,15 +52,16 @@ class BoundSearchTask:
+     """Per-batch :class:`RolloutTask`: binds this batch's targets and boxes.
+ 
+     Optional engine hooks, present only when they apply: ``step_weight`` (``supervise='last'``),
+-    ``policy_cond`` (a policy is trained) and ``reward_mask`` (``condition='both'``: only the
+-    target-present trials carry a policy reward, Haoze's ``valid_mask``).
++    ``policy_cond`` (a policy is trained), ``reward_mask`` (``condition='both'``: only the
++    target-present trials carry a policy reward, Haoze's ``valid_mask``) and ``saccade_beta``
++    (a beta-conditioned saccade cost: each trial's beta [B], already inside ``policy_cond``).
+ 
+     Losses (Haoze's, with ``condition='both'``): the heatmap KL averaged over the
+     target-present trials only, plus ``presence_weight`` x the presence loss over all trials."""
+ 
+     def __init__(self, *, model: Any, targets: Tensor, boxes: Tensor, canvas_grid: int,
+                  cfg: SearchConfig, policy_embed: Callable[[Tensor], Tensor] | None = None,
+-                 present: Tensor | None = None):
++                 present: Tensor | None = None, saccade_beta: Tensor | None = None):
+         self.model = model
+         self.cfg = cfg
+         self.targets = targets
+@@ -76,6 +77,8 @@ class BoundSearchTask:
+             self.step_weight = self._last_only
+         if policy_embed is not None:
+             self.policy_cond = lambda: policy_embed(targets)
++        if saccade_beta is not None:
++            self.saccade_beta = saccade_beta
+ 
+     @staticmethod
+     def _last_only(t: int, n_glimpses: int) -> float:
+@@ -260,6 +263,20 @@ class SearchRunTask:
+             return lambda t: core.head.policy_embedding(t, detach=self.cfg.detach_policy_embedding)
+         return lambda t: jp.scorer.target_embed(t)
+ 
++    def _policy_cond(self, model, targets: Tensor, beta: Tensor | None = None) -> Tensor:
++        """The scorer's FiLM input for ``targets``: the cue embedding, plus, for a
++        beta-conditioned saccade cost, the features of each row's beta (None: the eval beta
++        ``saccade_cost_beta_eval`` for every row)."""
++        embed = self._policy_embed(model)
++        assert embed is not None and self._joint is not None
++        cue = embed(targets)
++        sc = self._joint.saccade_cost
++        if not sc.conditioned:
++            return cue
++        if beta is None:
++            beta = torch.full((len(targets),), sc.beta_eval, device=cue.device)
++        return torch.cat([cue, sc.features(beta).to(cue.dtype)], dim=-1)
++
+     def policy_feature_groups(self):
+         return POLICY_FEATURE_GROUPS
+ 
+@@ -285,10 +302,16 @@ class SearchRunTask:
+         return batch["image"].to(device, non_blocking=True)
+ 
+     def bind(self, batch, device, *, model, head):
++        targets = batch["target"].to(device)
++        policy_embed, beta = self._policy_embed(model), None
++        jp = self._joint
++        if jp is not None and jp.saccade_cost.conditioned:  # stage 2: one beta per trial
++            beta = jp.saccade_cost.sample_beta(len(targets), device)
++            policy_embed = lambda t: self._policy_cond(model, t, beta)  # noqa: E731
+         bound = BoundSearchTask(
+-            model=getattr(model, "module", model), targets=batch["target"].to(device),
++            model=getattr(model, "module", model), targets=targets,
+             boxes=batch["boxes"].to(device), canvas_grid=self.canvas_grid(model), cfg=self.cfg,
+-            policy_embed=self._policy_embed(model), present=batch["present"].to(device))
++            policy_embed=policy_embed, present=batch["present"].to(device), saccade_beta=beta)
+         self._bound = bound  # this step's targets, for viz_frame
+         return bound
+ 
+@@ -307,7 +330,8 @@ class SearchRunTask:
+         k_tp = min(len(tp), max(n // 2, n - len(ta)))
+         return torch.cat([tp[:k_tp], ta[:n - k_tp]])
+ 
+-    def _policy_logits(self, model, joint, state: RecurrentState, targets: Tensor, idx: Tensor) -> Tensor:
++    def _policy_logits(self, model, joint, state: RecurrentState, targets: Tensor, idx: Tensor,
++                       beta: Tensor | None = None) -> Tensor:
+         """[n, Gp, Gp] scorer logits on ``state`` for the batch rows ``idx``: the
+         distribution the policy draws the NEXT fixation from. The scorer is deterministic
+         (no BatchNorm, no dropout), so this equals the selector's own forward. The encoder's
+@@ -320,16 +344,15 @@ class SearchRunTask:
+         enc.prev = tuple(None if x is None else x if x.shape[0] == 1 else x[idx] for x in prev)
+         try:
+             with torch.no_grad():
+-                embed = self._policy_embed(model)
+-                assert embed is not None
+-                scores = joint.scorer(enc(st).float(), cond=embed(targets[idx]))
++                cond = self._policy_cond(model, targets[idx], None if beta is None else beta[idx])
++                scores = joint.scorer(enc(st).float(), cond=cond)
+         finally:
+             enc.prev = prev
+         g = int(round(scores[0].numel() ** 0.5))
+         return scores.reshape(len(idx), g, g).float()
+ 
+     def _viz_capture(self, model, *, hidden, logits, presence, state, centers, targets, joint,
+-                     idx: Tensor) -> dict:
++                     idx: Tensor, beta: Tensor | None = None) -> dict:
+         """One glimpse of the figure for the batch rows ``idx`` (``_viz_index``), on CPU.
+         ``logits`` / ``presence`` are already restricted to those rows."""
+         return {"idx": idx.cpu(),
+@@ -337,7 +360,7 @@ class SearchRunTask:
+                 "logits": logits.detach().float().cpu(),
+                 "presence": presence.detach().float().cpu() if presence is not None else None,
+                 "canvas": hidden[idx].detach().float().cpu(),
+-                "policy_next": (self._policy_logits(model, joint, state, targets, idx).cpu()
++                "policy_next": (self._policy_logits(model, joint, state, targets, idx, beta).cpu()
+                                 if joint is not None else None)}
+ 
+     def _episode(self, frames: list[dict], *, images, boxes, targets, present):
+@@ -374,7 +397,8 @@ class SearchRunTask:
+         with torch.no_grad():
+             logits, pres = core.head(gout.readout[idx].float(), bound.targets[idx])
+         return self._viz_capture(core, hidden=gout.readout, logits=logits, presence=pres, state=gout.state,
+-                                 centers=viewpoint.centers, targets=bound.targets, joint=self._joint, idx=idx)
++                                 centers=viewpoint.centers, targets=bound.targets, joint=self._joint, idx=idx,
++                                 beta=getattr(bound, "saccade_beta", None))
+ 
+     def render_viz(self, viz, *, batch, run_dir, step):
+         """Training-rollout figure -> ``{run_dir}/visualization/search_train/``."""
+@@ -439,10 +463,9 @@ class SearchRunTask:
+             return out.state
+ 
+         if joint is not None:
+-            embed = self._policy_embed(model)
+-            assert embed is not None
+             deploy_rollout_viewpoints(joint=joint, advance=advance, t0_type=ViewpointType.FULL,
+-                                      batch_size=B, device=images.device, n=T, cond=lambda: embed(targets))
++                                      batch_size=B, device=images.device, n=T,
++                                      cond=lambda: self._policy_cond(model, targets))
+         else:
+             assert choose is not None
+             sel = self._random_selector()
+@@ -646,11 +669,19 @@ class SearchRunTask:
+ 
+     def checkpoint_metadata(self, model):
+         from canvit.checkpoint import downstream_pretrain_view_scale
+-        return {"task": "search", "scene_size": self.cfg.scene_size, "n_timesteps": self.cfg.n_timesteps,
++        meta = {"task": "search", "scene_size": self.cfg.scene_size, "n_timesteps": self.cfg.n_timesteps,
+                 "model_repo": str(self.cfg.model_repo),
+                 "pretrain_view_scale": downstream_pretrain_view_scale(
+                     patcher_name=getattr(model.canvit.cfg, "patcher_name", None),
+                     foveated_scale=self.cfg.foveated_scale)}
++        rl = self.rl
++        if rl.saccade_cost != "none":  # absent when off: the historical metadata
++            meta["saccade_cost"] = {
++                "form": rl.saccade_cost, "weight": rl.saccade_cost_weight, "combine": rl.saccade_cost_combine,
++                "beta_mode": rl.saccade_cost_beta_mode, "beta_eval": rl.saccade_cost_beta_eval,
++                "r": 1.0 / rl.centers_per_axis,
++                "beta_features": "[beta, log1p(beta / 0.1)] appended to the FiLM cue (conditioned only)"}
++        return meta
+ 
+ 
+ __all__ = ["BoundSearchTask", "SearchRunTask", "POLICY_FEATURE_GROUPS"]
+diff --git a/canvit/search/tests/test_saccade_cost_search.py b/canvit/search/tests/test_saccade_cost_search.py
+new file mode 100644
+index 0000000..7b898d9
+--- /dev/null
++++ b/canvit/search/tests/test_saccade_cost_search.py
+@@ -0,0 +1,135 @@
++"""Stage 2 of the saccade cost on the search task: a beta-conditioned policy (beta drawn per
++trial, appended to the FiLM cue), the eval beta, and the checkpoint round trip. Off (the
++default) keeps the cue, the scorer and the metadata as before. Tiny foveated ViT-S on the
++synthetic COCO-Search18 from conftest, CPU.
++
++Written by Claude (AI, Claude Opus 5.5), 2026-11-25."""
++
++from contextlib import nullcontext
++from dataclasses import replace
++
++import pytest
++import torch
++
++from canvit.harness.cli import command_from_run_config, run_config_of
++from canvit.harness.evaluate import evaluate, parse
++from canvit.harness.policy.joint import BETA_FEATURES, SaccadeCost
++from canvit.harness.run import RunSettings, run
++
++from .test_search_eval import _argv, _RecordingTinyTask
++from .test_search_task import _cfg, _rl, _run, _TinyTask
++
++STAGE2 = {"saccade_cost": "log", "saccade_cost_weight": 1.0, "saccade_cost_beta_mode": "conditioned"}
++STAGE2_ARGV = ["--rl.saccade-cost", "log", "--rl.saccade-cost-weight", "1.0",
++               "--rl.saccade-cost-beta-mode", "conditioned", "--rl.saccade-cost-beta-eval", "0.3"]
++
++
++def _built(root, **rl):
++    task = _TinyTask(_cfg(root), rl=_rl(**rl))
++    model, _ = task.build_model(torch.device("cpu"))
++    joint = task.build_policy(model, device=torch.device("cpu"), canvas_grid=32,
++                              generator=torch.Generator().manual_seed(0))
++    return task, model, joint
++
++
++def _batch(task):
++    return next(iter(task.build_val_loader()))
++
++
++def test_off_keeps_the_cue_the_scorer_and_the_metadata(fake_cs18):
++    root, _ = fake_cs18
++    task, model, joint = _built(root)
++    assert joint.scorer.film_cond_dim == 8 and not joint.saccade_cost.active
++    b = _batch(task)
++    assert torch.equal(task._policy_cond(model, b["target"]), task._policy_embed(model)(b["target"]))
++    bound = task.bind(b, torch.device("cpu"), model=model, head=model.head)
++    assert not hasattr(bound, "saccade_beta")
++    assert "saccade_cost" not in task.checkpoint_metadata(model)
++
++
++def test_conditioned_policy_sees_its_trials_beta_next_to_the_cue(fake_cs18):
++    root, _ = fake_cs18
++    task, model, joint = _built(root, **STAGE2, saccade_cost_beta_eval=0.3)
++    assert joint.scorer.film_cond_dim == 8 + BETA_FEATURES
++    b = _batch(task)
++    torch.manual_seed(0)
++    bound = task.bind(b, torch.device("cpu"), model=model, head=model.head)
++    beta = bound.saccade_beta
++    assert beta.shape == (len(b["target"]),) and bool(((beta >= 0) & (beta <= 1.0)).all())
++    cond = bound.policy_cond()
++    assert torch.equal(cond[:, :8], task._policy_embed(model)(b["target"]))
++    assert torch.equal(cond[:, 8:], SaccadeCost.features(beta))
++    # validation / deploy: every trial gets the eval beta
++    ev = task._policy_cond(model, b["target"])
++    assert torch.equal(ev[:, 8:], SaccadeCost.features(torch.full((len(b["target"]),), 0.3)))
++
++
++def test_the_eval_beta_steers_the_deployed_policy(fake_cs18):
++    """With the FiLM generators off their zero init, a different eval beta gives different
++    policy maps on the same canvas (beta actually reaches the scorer)."""
++    root, _ = fake_cs18
++    task, model, joint = _built(root, **STAGE2)
++    torch.manual_seed(1)
++    with torch.no_grad():
++        for p in joint.scorer.parameters():
++            p.add_(0.1 * torch.randn_like(p))
++    model.canvit.eval()
++    b = _batch(task)
++    maps = {}
++    for beta_eval in (0.0, 1.0):
++        joint.saccade_cost = replace(joint.saccade_cost, beta_eval=beta_eval)
++        record: list = []
++        with torch.no_grad():
++            task._rollout_metrics(model=model, images=b["image"], targets=b["target"], boxes=b["boxes"],
++                                  T=2, cg=32, amp=nullcontext(), joint=joint, record=record)
++        maps[beta_eval] = record[0]["policy_next"]
++    assert not torch.allclose(maps[0.0], maps[1.0])
++
++
++def test_conditioned_search_trains_end_to_end(fake_cs18):
++    root, _ = fake_cs18
++    task = _TinyTask(_cfg(root), rl=_rl(**STAGE2))
++    last = _run(task)
++    assert torch.isfinite(torch.tensor(last["total_loss"]))
++    assert task._joint.scorer.film_in.gen.net[0].in_features == 8 + BETA_FEATURES
++    assert task._joint.scorer.film_in.gen.net[-1].weight.abs().sum() > 0  # trained off its zero init
++
++
++@pytest.fixture(scope="module")
++def trained_stage2(fake_cs18, tmp_path_factory):
++    """Train the tiny conditioned search model 2 steps from a command line (best.pt at step 2)."""
++    root, _ = fake_cs18
++    run_dir = tmp_path_factory.mktemp("logs") / "g" / "tiny_beta"
++    argv = _argv(root, run_dir) + STAGE2_ARGV
++    cmd, _ = command_from_run_config({"argv": argv})
++    task = _RecordingTinyTask(_cfg(root), rl=_rl(**STAGE2, saccade_cost_beta_eval=0.3))
++    assert task.rl == cmd.rl
++    settings = RunSettings(n_steps=2, eval_every=2, log_every=1, grad_clip=1.0, amp=False, seed=0,
++                           device="cpu", tracker="none", run_dir=run_dir, run_config=run_config_of(cmd, argv))
++    run(task=task, spec=task.default_spec(), settings=settings)
++    return run_dir, task.last_eval
++
++
++def test_stage2_checkpoint_records_the_cost_and_reproduces_its_validation(trained_stage2):
++    run_dir, trained_metrics = trained_stage2
++    ckpt = run_dir / "checkpoints" / "best.pt"
++    meta = torch.load(ckpt, map_location="cpu", weights_only=False)["metadata"]
++    assert meta["saccade_cost"] | {"beta_features": None} == {
++        "form": "log", "weight": 1.0, "combine": "standardized", "beta_mode": "conditioned", "beta_eval": 0.3,
++        "r": 1 / 32, "beta_features": None}
++    assert meta["run_config"]["resolved"]["rl"]["saccade_cost_beta_mode"] == "conditioned"
++    cmd, source = parse(["search", "--opts.ckpt", str(ckpt), "--opts.device", "cpu"])
++    assert source["drift"] == [] and cmd.rl.saccade_cost_beta_mode == "conditioned"
++    task, name = cmd.build()
++    record = evaluate(task, cmd.cfg, cmd.opts, task_name=name)
++    assert record["metrics"] == {k: float(v) for k, v in trained_metrics.items()}
++
++
++def test_stage2_checkpoint_is_scored_at_another_eval_beta(trained_stage2):
++    run_dir, _ = trained_stage2
++    ckpt = str(run_dir / "checkpoints" / "best.pt")
++    cmd, _ = parse(["search", "--opts.ckpt", ckpt, "--opts.device", "cpu", "--rl.saccade-cost-beta-eval", "0.8"])
++    assert cmd.rl.saccade_cost_beta_eval == 0.8 and cmd.rl.saccade_cost_weight == 1.0
++    task, name = cmd.build()
++    record = evaluate(task, cmd.cfg, cmd.opts, task_name=name)
++    assert any(k.endswith("_policy") for k in record["metrics"])
