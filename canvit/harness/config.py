@@ -138,6 +138,29 @@ class JointPolicyConfig:
     ``per_step``). ``ema_abs``: divide by an EMA of the mean absolute reward and clip to +-10
     (Haoze). ``none``: no scaling."""
 
+    # Optional per-saccade cost (objective='pg' with reward='terminal' only; refused elsewhere).
+    # d = Euclidean distance between consecutive glimpse centres in [-1, 1] units (scene width 2;
+    # the first saccade starts at t0's scene centre). "none" (default) leaves every run unchanged.
+    saccade_cost: Literal["none", "log", "linear"] = "none"
+    """``log``: c(d) = log(1 + d / r), r = half a policy-grid cell (1 / centers_per_axis) — the
+    form that fits human saccade lengths best post hoc. ``linear``: c(d) = d / 2, the fraction of
+    the scene width. ``none``: no cost, nothing measured."""
+    saccade_cost_weight: float = 0.0
+    """beta (``standardized``) or lambda (``raw``). 0 with a form set: saccade lengths and costs
+    are logged (policy/saccade_len, policy/saccade_cost) but the target is unchanged."""
+    saccade_cost_combine: Literal["standardized", "raw"] = "standardized"
+    """``standardized``: action t's target = the standardised reward - weight * z_batch(c_t);
+    unit-free, so the weight keeps its meaning while the terminal reward shrinks ~10x over
+    training. ``raw``: target = standardise(R - weight * sum_t c_t), the cost in reward units."""
+    saccade_cost_beta_mode: Literal["fixed", "conditioned"] = "fixed"
+    """``fixed`` (stage 1): every trial uses beta = ``saccade_cost_weight``. ``conditioned``
+    (stage 2): each training trial draws beta ~ U[0, saccade_cost_weight] and the policy gets
+    beta as an input next to its FiLM cue (FiLM-conditioned scorers only, i.e. search;
+    ``standardized`` only), so one run covers every beta in that range."""
+    saccade_cost_beta_eval: float = 0.0
+    """``conditioned`` only: the beta given to the policy at validation / deploy (all trials).
+    Override it at ``harness.evaluate`` to score one checkpoint at several betas."""
+
     # VPG only (objective="vpg"); ignored by qreg/pg. Defaults = autoreg exp12's values.
     vpg_entropy_bonus: float = 5e-3
     """FIXED entropy weight (autoreg ``rl_entropy_weight``). Separate from ``entropy_bonus``
