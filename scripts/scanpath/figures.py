@@ -1353,14 +1353,16 @@ def retina_figure(results: Path, recs: list[dict], out: Path) -> dict[str, str]:
 
 
 COST_SETS = {"tp": "COCO-Search18 TP", "ta": "COCO-Search18 TA", "fv": "COCO-FreeView"}
-COST_COLS = ["data", r"IG@$\tau$ ($\tau$)", "+ log cost: IG (gain)", r"$\tau$", "+ linear+log: IG (gain)", r"$\tau$",
-             r"best $\tau$ log (val)"]
+COST_COLS = ["data", r"policy, fitted $\tau$: IG ($\tau$)", "+ log cost: IG (gain)", r"$\tau$",
+             "+ linear cost: IG (gain)", r"$\tau$", r"best $\tau$ log (val)"]
 
 
 def saccade_cost_rows(results_dir: Path) -> tuple[str, list[list[str]], str] | None:
     """helper_2's post-hoc saccade cost for one checkpoint, <records dir>/saccade_cost.json written by
-    ``python -m canvit.scanpath.posthoc.saccade_cost`` (schema agreed 2026-11-24; all IG on validation, over the centre
-    bias, bits/fix): (key line, table rows per focus set, one line with the shared cost fit); None without it."""
+    ``python -m canvit.scanpath.posthoc.saccade_cost`` (schema of 2026-11-25: the two training cost shapes, log and
+    linear, cost_forms.py; all IG on validation, over the centre bias, bits/fix): (key line, table rows per focus
+    set, one line with the fitted weights); None without it. Every number here is post hoc (fitted tau + a cost);
+    the raw tau = 1 numbers are in the page's main table."""
     f = results_dir / "saccade_cost.json"
     if not f.exists():
         return None
@@ -1375,11 +1377,12 @@ def saccade_cost_rows(results_dir: Path) -> tuple[str, list[list[str]], str] | N
             continue
         rows.append([title, f"{v(d, 'ig_tau', '.2f')} ({v(d, 'tau', '.1f')})",
                      f"{v(d, 'ig_log', '.2f')} ({v(d, 'gain_log', '+.2f')})", v(d, "tau_log", ".1f"),
-                     f"{v(d, 'ig_linlog', '.2f')} ({v(d, 'gain_linlog', '+.2f')})", v(d, "tau_linlog", ".1f"),
+                     f"{v(d, 'ig_linear', '.2f')} ({v(d, 'gain_linear', '+.2f')})", v(d, "tau_linear", ".1f"),
                      v(d, "best_tau_log_val", ".1f")])
-    lg, ll = sc["fit"].get("log", {}), sc["fit"].get("linlog", {})
-    fit = (f"shared fit: log a = {v(lg, 'a', '.3g')} ± {v(lg, 'a_se', '.2g')}; linear+log a = {v(ll, 'a', '.3g')} "
-           f"± {v(ll, 'a_se', '.2g')}, b = {v(ll, 'b_per_deg', '.3g')} ± {v(ll, 'b_se', '.2g')} per deg")
+    lg, li = sc["fit"].get("log", {}), sc["fit"].get("linear", {})
+    fit = (f"fitted weight λ/α (shared over the sets): log cost {v(lg, 'weight', '.3g')} ± "
+           f"{v(lg, 'weight_se', '.2g')}; "
+           f"linear cost {v(li, 'weight', '.3g')} ± {v(li, 'weight_se', '.2g')} (per scene width)")
     return sc["key_line"], rows, fit
 
 
@@ -1427,7 +1430,7 @@ def checkpoint_summary(e: dict, recs: list[dict], out: Path, results: Path | Non
     if cost is None:
         ax.text(0.01, 0.5, "saccade cost: not run", fontsize=FS - 1, va="center")
     else:
-        sf_cost.suptitle(f"post-hoc saccade cost: {cost[0]}", x=0.01, ha="left", fontsize=FS)
+        sf_cost.suptitle(f"post hoc (fitted τ + saccade cost): {cost[0]}", x=0.01, ha="left", fontsize=FS)
         tb = ax.table(cellText=cost[1], colLabels=COST_COLS, bbox=[0, 0.22, 1, 0.78], cellLoc="right",
                       edges="horizontal")
         ax.text(0.0, 0.0, cost[2], fontsize=FS - 2, transform=ax.transAxes)
