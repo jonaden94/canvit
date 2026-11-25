@@ -271,7 +271,8 @@ class HumanEval:
         for rows in torch.arange(len(S["image"])).split(max(1, self.batch_size // 4) if K else self.batch_size):
             b = self._batch(s, rows)
             human = b["fix"].nan_to_num(0.0)
-            logits = ep._episode(b, n, lambda t, sc: clamp(human[:, t], b["content"]), all_cues=K, heatmap=False)[0]["policy"]
+            logits = ep._episode(b, n, lambda t, sc: clamp(human[:, t], b["content"]), all_cues=K,
+                                 heatmap=False)[0]["policy"]
             g = int(round(logits.shape[-1] ** 0.5))
             if maps is None:
                 maps = self._grid_maps(g)
