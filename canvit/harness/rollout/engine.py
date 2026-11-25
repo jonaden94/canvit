@@ -315,6 +315,7 @@ def run_rollout(
         # SAC: deferred to the episode end like VPG, but with the per-glimpse reward.
         step_rewards = defer and joint is not None and joint.needs_step_rewards
         traj: list[dict[str, Tensor]] = []
+        sac_prev: dict[str, Tensor] = {}  # SAC: the previous policy step, for its critic term
 
         # Optional per-glimpse task metrics (distill's scene/cls sub-losses), summed
         # here and averaged over the branch below. Absent hook => untouched fast path.
@@ -385,23 +386,32 @@ def run_rollout(
                 aux = sel.last_aux  # type: ignore[attr-defined]
                 assert aux is not None, "policy selector produced no aux for a RANDOM glimpse"
             if is_policy and step_rewards:
-                # SAC: the actor term needs only the critics at the state the action was taken
-                # from (`state`, not yet advanced), so it joins THIS chunk's backward (with the
-                # inline objectives' 1/(n-1) normalisation: a mean over the policy glimpses).
-                # Buffered for the critics' episode loss below: the detached log-probabilities,
-                # the critics' input, the taken cell and the measured reward.
+                # SAC, all inline (memory independent of the trajectory length). The actor term
+                # needs only the critics at the state the action was taken from (`state`, not yet
+                # advanced); the critic term of the PREVIOUS step needs this state as s_{t+1}, so
+                # it is built now, one glimpse late; the last step's (y = r) at the last glimpse.
+                # Both with the inline objectives' n/(n-1) factor: a mean over the policy steps.
                 assert joint is not None and aux is not None and prev_pi_loss is not None
+                scale = n_glimpses / (n_glimpses - 1)
                 feats_t = joint.critic_feats(state)
+                logp_t = torch.log_softmax(aux["scores"].detach().float(), dim=1)
                 cur_pi = task.per_image_loss(gout.readout).detach()
-                actor = joint.sac_actor_step(scores=aux["scores"], feats=feats_t)
-                term = actor * (n_glimpses / (n_glimpses - 1))
+                raw_r = joint.inline_reward(prev_pi_loss, cur_pi)
+                prev_pi_loss = cur_pi
+                term = joint.sac_actor_step(scores=aux["scores"], feats=feats_t) * scale
+                if sac_prev:
+                    term = term + joint.sac_critic_term(**sac_prev, next_feats=feats_t, next_logp=logp_t) * scale
+                sac_prev = {"feats": feats_t, "flat_idx": aux["flat_idx"], "r": joint.sac_reward(raw_r)}
+                if t == n_glimpses - 1:
+                    term = term + joint.sac_critic_term(**sac_prev) * scale
                 chunk_loss = chunk_loss + term
                 if split_grads is not None:
                     chunk_pol = term if chunk_pol is None else chunk_pol + term
-                traj.append({"logp": torch.log_softmax(aux["scores"].detach().float(), dim=1),
-                             "flat_idx": aux["flat_idx"], "feats": feats_t,
-                             "reward": joint.inline_reward(prev_pi_loss, cur_pi)})
-                prev_pi_loss = cur_pi
+                pol_acc["loss"] = pol_acc["loss"] + term.detach() / scale
+                pol_acc["reward"] = pol_acc["reward"] + _masked_mean(raw_r, rmask).detach()
+                pol_acc["n"] += 1
+                if t == n_glimpses - 1:
+                    joint.sac_end_rollout()
             elif is_policy and defer:
                 # VPG: buffer this action's logits + V(s_t); the reward is only known at
                 # the LAST glimpse, so the loss is built below (still inside the loop, so
@@ -447,21 +457,7 @@ def run_rollout(
                 pol_acc["reward"] = pol_acc["reward"] + _masked_mean(reward, rmask).detach()
                 pol_acc["n"] += 1
 
-            if step_rewards and traj and t == n_glimpses - 1:
-                assert joint is not None
-                rewards = torch.stack([a["reward"] for a in traj], dim=1)  # [B, T]
-                # A mean over (B, T), like VPG's below: pre-multiply so chunk_loss's division
-                # by n_glimpses cancels.
-                ploss = joint.sac_critic_step(
-                    logp=torch.stack([a["logp"] for a in traj], dim=1),
-                    flat_idx=torch.stack([a["flat_idx"] for a in traj], dim=1),
-                    feats=[a["feats"] for a in traj], rewards=rewards,
-                ) * n_glimpses
-                chunk_loss = chunk_loss + ploss  # the critics' parameters only; no actor graph
-                pol_acc["loss"] = pol_acc["loss"] + ploss.detach() / n_glimpses + joint.last_step["actor_loss"]
-                pol_acc["reward"] = pol_acc["reward"] + rewards.mean()
-                pol_acc["n"] += 1
-            elif defer and traj and t == n_glimpses - 1:
+            if defer and not step_rewards and traj and t == n_glimpses - 1:
                 # Terminal reward: R = -(per-image task loss of the LAST glimpse), the
                 # analogue of autoreg's R = -CE(final logits). Built HERE, before the
                 # chunk backward, rather than after the loop: with

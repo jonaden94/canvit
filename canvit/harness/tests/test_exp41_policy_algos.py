@@ -301,3 +301,33 @@ def test_every_objective_under_distills_chunked_tbptt(tokens, rl_kw):
         assert all(p.grad is None for p in joint.target_net.parameters())
     trunk = [p for n, p in m.named_parameters() if not n.startswith(("policy_",))]
     assert _no_grad(trunk)
+
+
+def test_inline_sac_critic_terms_equal_the_episode_critic_loss():
+    """The engine builds the critic term of step t one glimpse late (with s_{t+1}); their mean
+    over the steps must equal rl.sac_critic_loss on the whole episode (gamma > 0)."""
+    from canvit.harness.policy.rl import sac_critic_loss
+    torch.manual_seed(0)
+    joint = _build(_frozen(tokens=False), objective="sac", sac_gamma=0.9)
+    with torch.no_grad():  # targets != critics
+        for p in joint.target_net.parameters():
+            p.add_(0.01 * torch.randn_like(p))
+    T, A = 3, joint.policy_selector.vp_flat.shape[0]
+    m = _frozen(tokens=False)
+    st = m.init_state(batch_size=_B, canvas_grid_size=_G)
+    feats = []
+    for _ in range(T):
+        st.canvas.normal_()
+        feats.append(joint.critic_feats(st))
+    idx = torch.randint(A, (_B, T))
+    r = torch.randn(_B, T)
+    logp = torch.log_softmax(torch.randn(_B, T, A), dim=2)
+    terms = [joint.sac_critic_term(feats=feats[t], flat_idx=idx[:, t], r=r[:, t],
+                                   next_feats=feats[t + 1] if t + 1 < T else None,
+                                   next_logp=logp[:, t + 1] if t + 1 < T else None) for t in range(T)]
+    q1, q2 = joint.critic(torch.cat(feats, 0))
+    t1, t2 = joint.target_net(torch.cat(feats[1:], 0))
+    bta = lambda q, n: q.reshape(n, _B, A).transpose(0, 1)  # noqa: E731
+    ref, _ = sac_critic_loss(logp, bta(q1, T), bta(q2, T), bta(t1, T - 1), bta(t2, T - 1), idx, r,
+                             alpha=joint.log_alpha.exp(), gamma=0.9)
+    torch.testing.assert_close(torch.stack(terms).mean(), ref, rtol=1e-5, atol=1e-6)
