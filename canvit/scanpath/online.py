@@ -88,17 +88,21 @@ def build(cs18, fv, *, fit_cs18: dict, fit_fv: dict, scene: int, frame, n_images
     fv_index = {stem(p): i for i, p in enumerate(st_f.filenames)}
     rng = np.random.default_rng(seed)
     chosen: dict[str, np.ndarray] = {}
+    taken: set[str] = set()  # a picture can be several COCO-Search18 stimuli (one per cue): draw each picture once
     for cond in ("tp", "ta"):
         n_of = np.unique(np.asarray(select(fx_s, condition=cond, limit=None).scanpaths.n))
-        n_of = np.array([n for n in n_of if stem(st_s.filenames[n]) in fv_index])
+        n_of = np.array([n for n in n_of if stem(st_s.filenames[n]) in fv_index and stem(st_s.filenames[n]) not in
+                         taken])
         chosen[cond] = np.sort(rng.choice(n_of, min(n_images, len(n_of)), replace=False))
+        taken |= {stem(st_s.filenames[n]) for n in chosen[cond]}
     images = np.concatenate([chosen["tp"], chosen["ta"]])  # cache image i = COCO-Search18 stimulus images[i]
-    if len(set(images)) != len(images):
-        raise ValueError("an image was drawn for both conditions")
+    if len({stem(st_s.filenames[n]) for n in images}) != len(images):
+        raise ValueError("a picture was drawn twice (two cues): its FreeView scanpaths would count twice")
     mean, std = (torch.tensor(v)[:, None, None] for v in (IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD))
     out: dict[str, Any] = {"version": VERSION, "scene": scene, "frame": frame, "fine": FINE, "ppd": ppd,
                            "kde_deg": kde_deg, "seed": seed, "sets": {},
-                           "stems": [stem(st_s.filenames[n]) for n in images]}
+                           "stems": [stem(st_s.filenames[n]) for n in images],
+                           "cs18_stimulus": [int(n) for n in images]}
     n_img = len(images)
     out["frac"] = torch.zeros(n_img, FINE * FINE)
     pix = torch.zeros(n_img, 3, scene, scene, dtype=torch.uint8)
