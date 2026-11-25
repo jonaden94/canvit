@@ -1237,8 +1237,9 @@ def entry_x(e: dict, x: str) -> tuple[float, float] | None:
     return (float(v), 0.0) if isinstance(v, (int, float)) else None
 
 
-COMPARE_ROWS = [("igtau", "IG over centre bias\n" + r"at fitted $\tau$ (bits/fix)"),
-                ("ig1", "IG over centre bias\n" + r"at $\tau$ = 1 (bits/fix)"), ("auc", "AUC")]
+# raw first (manager, 2026-11-25): tau = 1 as trained is the headline row; the fitted tau is a labelled correction
+COMPARE_ROWS = [("ig1", "IG over centre bias\n" + r"at $\tau$ = 1, as trained (bits/fix)"),
+                ("igtau", "IG over centre bias\n" + r"at fitted $\tau$, post hoc (bits/fix)"), ("auc", "AUC")]
 X_LABELS = {"found3": "targets found within 3 fixations (policy)", "cmf": "cortical magnification",
             "res": "retina resolution", "step": "training step", "entropy_target": "policy entropy target (nats)"}
 
