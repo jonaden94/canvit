@@ -66,6 +66,10 @@ class PolicyEpisode:
     device: torch.device
     amp: bool = True
     provenance: dict | None = None  # where the task came from (load); for the record
+    saccade_beta: float | None = None
+    """A beta-conditioned search policy (saccade cost, ``saccade_cost_beta_mode='conditioned'``): the beta every
+    trial is evaluated at. None = the run's own ``saccade_cost_beta_eval`` (what its validation and deploy use);
+    see :meth:`resolved_saccade_beta`."""
 
     @property
     def is_search(self) -> bool:
@@ -113,6 +117,24 @@ class PolicyEpisode:
         return cls(task=task, model=model, joint=joint, device=device, amp=getattr(task.cfg, "amp", True),
                    provenance=provenance)
 
+    def resolved_saccade_beta(self) -> float | None:
+        """The beta the policy is conditioned on (None: the policy takes no beta). Refuses a beta for a policy
+        that was not trained conditioned on one."""
+        sc = getattr(self.joint, "saccade_cost", None)
+        if sc is None or not sc.conditioned:
+            if self.saccade_beta is not None:
+                raise ValueError("--cfg.saccade-beta is for a beta-conditioned search policy "
+                                 "(--rl.saccade-cost-beta-mode conditioned); this checkpoint's policy takes no beta")
+            return None
+        return float(sc.beta_eval if self.saccade_beta is None else self.saccade_beta)
+
+    def _policy_cond(self, cue: Tensor) -> Tensor:
+        """The scorer's FiLM input for ``cue`` [N], built by the search task's own conditioning hook (cue
+        embedding, plus the beta features of a beta-conditioned policy), so it matches the trained scorer."""
+        beta = self.resolved_saccade_beta()
+        rows = None if beta is None else torch.full((len(cue),), beta, device=cue.device)
+        return self.task._policy_cond(self.model, cue, rows)
+
     def _amp(self):
         if self.device.type == "cuda" and self.amp:  # the training loop's rule, as search's evaluate
             dt = torch.bfloat16 if torch.cuda.get_device_capability(self.device) >= (8, 0) else torch.float16
@@ -150,7 +172,7 @@ class PolicyEpisode:
         sel = deploy_selector(self.joint) if self.joint is not None else self.task._random_selector()
         ctx = sel.start_rollout(t0_type=ViewpointType.FULL, batch_size=B, device=images.device)
         if self.joint is not None and self.is_search:
-            embed = self.task._policy_embed(model)
+            embed = self._policy_cond
             ctx.cond = lambda: embed(cue)
         out: dict[str, list[Tensor]] = ({"heatmap": []} if self.is_search else {}) | (
             {"policy": []} if self.joint is not None else {})

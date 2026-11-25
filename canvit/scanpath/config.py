@@ -74,6 +74,10 @@ class ScanpathConfig:
     """A multi-retina backbone's retina to evaluate through, overriding the run config's ``--cfg.retina`` (None: the
     trained one). The task head and policy were trained through the run's retina only: any other is out of
     distribution for them."""
+    saccade_beta: float | None = None
+    """A beta-conditioned search policy (trained with ``--rl.saccade-cost-beta-mode conditioned``): the saccade-cost
+    weight beta it is evaluated at, for every trial. None = the run's own ``saccade_cost_beta_eval``. Refused for a
+    policy that takes no beta. Recorded in the protocol (``checkpoint.saccade_beta``)."""
     shard: tuple[int, int] | None = None
     """``i N``: GPU stage only -- run the CanViT model on the i-th of N contiguous blocks of the evaluated scanpaths
     and write its predictions to ``save_predictions`` (no scoring). Shard 0 also writes the training-subset

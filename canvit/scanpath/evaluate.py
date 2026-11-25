@@ -232,6 +232,11 @@ def build_model(cfg: ScanpathConfig, stimuli, centre_bias, device: torch.device)
         raise ValueError(f"the {ep.task.name} run's scene is {task_scene} px but --cfg.scene-size is "
                          f"{cfg.scene_size}: the human fixations must be letterboxed into the scene the model was "
                          "trained on")
+    ep.saccade_beta = cfg.saccade_beta
+    beta = ep.resolved_saccade_beta()  # validates; None: the policy takes no beta
+    if beta is not None and ep.provenance is not None:  # rides into the predictions' meta and the record
+        ep.provenance["saccade_beta"] = {"beta": beta, "source": "--cfg.saccade-beta" if cfg.saccade_beta is not None
+                                         else "the run's saccade_cost_beta_eval"}
     return CanViTModel(ep, readout, cue_mixture=ep.is_search and _task_names(stimuli) is None)
 
 

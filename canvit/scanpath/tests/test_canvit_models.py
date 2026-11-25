@@ -13,8 +13,8 @@ from canvit.search.tests.test_search_task import _cfg, _rl, _TinyTask
 B, S, CG = 2, 224, 32
 
 
-def _episode(root, *, policy=True):
-    task = _TinyTask(_cfg(root, condition="tp"), rl=_rl())
+def _episode(root, *, policy=True, **rl):
+    task = _TinyTask(_cfg(root, condition="tp"), rl=_rl(**rl))
     model, _ = task.build_model(torch.device("cpu"))
     model.eval()
     joint = None
@@ -46,10 +46,10 @@ def _deploy(ep, images, cue, n):
             state = ep.model.init_state(batch_size=B, canvas_grid_size=CG)
         return ep.model.canvit(image=images, state=state, viewpoint=vp).state
 
-    embed = ep.task._policy_embed(ep.model)
-    try:
+    try:  # the cue exactly as the search task's own deploy rollout builds it (evaluate)
         taken = deploy_rollout_viewpoints(joint=ep.joint, advance=advance, t0_type=ViewpointType.FULL,
-                                          batch_size=B, device=images.device, n=n, cond=lambda: embed(cue))
+                                          batch_size=B, device=images.device, n=n,
+                                          cond=lambda: ep.task._policy_cond(ep.model, cue))
     finally:
         hook.remove()
     return torch.stack([vp.centers.flip(-1) for vp in taken], 1), scores
@@ -67,6 +67,33 @@ def test_forcing_the_policys_own_choices_reproduces_the_deploy_rollout(fake_cs18
     # and the deployed choice is the argmax of what we score (cell centres of the 32x32 grid)
     cell = ((centres[:, 1:] + 1) / 2 * CG).floor().long()
     assert torch.equal(forced.argmax(-1), cell[..., 1] * CG + cell[..., 0])
+
+
+BETA_CONDITIONED = {"saccade_cost": "log", "saccade_cost_weight": 1.0, "saccade_cost_beta_mode": "conditioned",
+                    "saccade_cost_beta_eval": 0.3}
+
+
+def test_a_beta_conditioned_policy_reproduces_its_deploy_rollout_at_its_beta(fake_cs18):
+    """A beta-conditioned search policy (saccade cost, stage 2): the episode builds the cue through the task's own
+    conditioning hook, so forcing its own choices at the run's beta_eval reproduces its deploy rollout, a given beta
+    changes the prediction, and a beta for a policy that takes none is refused."""
+    ep = _episode(fake_cs18[0], **BETA_CONDITIONED)
+    assert ep.resolved_saccade_beta() == 0.3  # default: the run's beta_eval
+    batch = _batch(torch.zeros(B, 3, 2))
+    centres, deploy_scores = _deploy(ep, batch["image"], batch["cue"], n=3)  # the task's deploy, at beta_eval
+    batch["fix"] = centres
+    forced = ep.run(batch, n=2)["policy"]
+    for t in range(2):
+        assert torch.equal(forced[:, t], deploy_scores[t])
+    ep.saccade_beta = 0.3
+    assert torch.equal(ep.run(batch, n=2)["policy"], forced)  # explicit = default, bit for bit
+    ep.saccade_beta = 0.9
+    assert not torch.allclose(ep.run(batch, n=2)["policy"], forced)  # beta reaches the scorer
+    plain = _episode(fake_cs18[0])
+    assert plain.resolved_saccade_beta() is None
+    plain.saccade_beta = 0.3
+    with pytest.raises(ValueError, match="takes no beta"):
+        plain.run(batch, n=2)
 
 
 def test_sampling_at_temperature_zero_is_the_deploy_rollout(fake_cs18):
