@@ -263,11 +263,11 @@ class HumanEval:
         n = min(self.max_fixations, S["fix"].shape[1] - 1)
         ig, ll, H, img_of, amp, amp_h = [], [], [], [], [], []
         maps = None
-        # the cue mixture runs the scorer (and _episode the search head) for all K cues: a quarter of the batch
+        # the cue mixture runs the scorer for all K cues: a quarter of the batch (the search head is skipped)
         for rows in torch.arange(len(S["image"])).split(max(1, self.batch_size // 4) if K else self.batch_size):
             b = self._batch(s, rows)
             human = b["fix"].nan_to_num(0.0)
-            logits = ep._episode(b, n, lambda t, sc: clamp(human[:, t], b["content"]), all_cues=K)[0]["policy"]
+            logits = ep._episode(b, n, lambda t, sc: clamp(human[:, t], b["content"]), all_cues=K, heatmap=False)[0]["policy"]
             g = int(round(logits.shape[-1] ** 0.5))
             if maps is None:
                 maps = self._grid_maps(g)
@@ -290,7 +290,7 @@ class HumanEval:
                 idx = torch.multinomial(lq.exp(), 1, generator=gen).squeeze(1)
                 c = (torch.arange(g, device=self.device, dtype=torch.float32) + 0.5) * (2.0 / g) - 1.0
                 return clamp(torch.stack([c[idx % g], c[idx // g]], -1), b["content"])
-            own = ep._episode(b, m, draw, all_cues=K)[1]
+            own = ep._episode(b, m, draw, all_cues=K, heatmap=False)[1]
             d = deg_of[b["img"]].to(self.device)[:, None]
             amp.append(((own[:, 1:] - own[:, :-1]).norm(dim=-1) * d).flatten())
             hf = b["fix"][:, :m]

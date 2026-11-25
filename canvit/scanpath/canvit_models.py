@@ -142,7 +142,8 @@ class PolicyEpisode:
         return nullcontext()
 
     @torch.no_grad()
-    def _episode(self, batch: dict, n: int, next_xy, *, all_cues: int = 0) -> tuple[dict[str, Tensor], Tensor]:
+    def _episode(self, batch: dict, n: int, next_xy, *, all_cues: int = 0,
+                 heatmap: bool = True) -> tuple[dict[str, Tensor], Tensor]:
         """The deploy rollout over glimpses 0..n-1, except that glimpse t >= 1 lands at
         ``next_xy(t, scores)`` ([B, 2] scene (x, y)), where ``scores`` [B, G*G] are the policy's scores for
         fixation t (None without a policy). Returns the ``policy`` (if loaded) and ``heatmap`` logits, each
@@ -153,7 +154,11 @@ class PolicyEpisode:
         [B, K, G*G] scores of all cues. The cue enters the policy only as the scorer's ``cond`` (the encoder's
         features, and the backbone state, do not depend on it) and the heatmap only through the head, so the
         backbone runs once and the scorer and head run on the same features for each cue. The selector runs
-        with cue 0, but its choice is never used: ``next_xy`` places every glimpse t >= 1."""
+        with cue 0, but its choice is never used: ``next_xy`` places every glimpse t >= 1.
+
+        ``heatmap=False`` (search): skip the task head, so only ``policy`` is returned. The policy maps and the
+        centres are unchanged (the head reads the state, never writes it); with ``all_cues`` the head is the
+        dominant cost (online human alignment, sampling)."""
         from canvit.harness.rollout.engine import _to_vp
         from canvit.harness.rollout.eval_viewpoints import deploy_selector
         from canvit.harness.rollout.viewpoint import ViewpointType
@@ -169,12 +174,15 @@ class PolicyEpisode:
             raise ValueError("a search model needs a cue on every trial; this dataset has free-viewing trials")
         if self.joint is None and not self.is_search:
             raise ValueError("no policy loaded: only a search model has a policy-free readout (heatmap)")
+        if self.joint is None and not heatmap:
+            raise ValueError("heatmap=False without a policy leaves nothing to read out")
+        heatmap = heatmap and self.is_search
         sel = deploy_selector(self.joint) if self.joint is not None else self.task._random_selector()
         ctx = sel.start_rollout(t0_type=ViewpointType.FULL, batch_size=B, device=images.device)
         if self.joint is not None and self.is_search:
             embed = self._policy_cond
             ctx.cond = lambda: embed(cue)
-        out: dict[str, list[Tensor]] = ({"heatmap": []} if self.is_search else {}) | (
+        out: dict[str, list[Tensor]] = ({"heatmap": []} if heatmap else {}) | (
             {"policy": []} if self.joint is not None else {})
         centres: list[Tensor] = []
         state = None
@@ -206,11 +214,11 @@ class PolicyEpisode:
                 state = model.init_state(batch_size=B, canvas_grid_size=cg)
             with self._amp():
                 state = backbone(image=images, state=state, viewpoint=vp).state
-            if self.is_search and all_cues:
+            if heatmap and all_cues:
                 hidden = _canvas_hidden(model, state, cg).float().repeat_interleave(all_cues, 0)
                 heat, _ = model.head(hidden, torch.arange(all_cues, device=images.device).repeat(B))
                 out["heatmap"].append(heat.float().reshape(B, all_cues, -1))
-            elif self.is_search:
+            elif heatmap:
                 heat, _ = model.head(_canvas_hidden(model, state, cg).float(), cue)
                 out["heatmap"].append(heat.float().reshape(B, -1))
         return {k: torch.stack(v, 1) for k, v in out.items()}, torch.stack(centres, 1)
@@ -259,7 +267,7 @@ class PolicyEpisode:
             xy = torch.stack([c[idx % g], c[idx // g]], -1)  # cell (row, col) = (idx // g, idx % g)
             return xy if temperature == 0 and not K else clamp_to_content(xy, batch["content"])
 
-        return self._episode(batch, n, draw, all_cues=K)[1]
+        return self._episode(batch, n, draw, all_cues=K, heatmap=False)[1]  # the centres only
 
 
 def _frame(batch: dict, b: int) -> tuple[int, int] | None:

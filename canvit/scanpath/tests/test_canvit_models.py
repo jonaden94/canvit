@@ -96,6 +96,19 @@ def test_a_beta_conditioned_policy_reproduces_its_deploy_rollout_at_its_beta(fak
         plain.run(batch, n=2)
 
 
+def test_skipping_the_heatmap_leaves_the_policy_maps_and_centres_unchanged(fake_cs18):
+    ep = _episode(fake_cs18[0])
+    batch = _batch(torch.zeros(B, 3, 2))
+    human = lambda t, scores: batch["fix"][:, t]  # noqa: E731
+    for k in (0, 3):  # one cue, and several cues (the cue mixture's path)
+        full, c_full = ep._episode(batch, 2, human, all_cues=k)
+        lean, c_lean = ep._episode(batch, 2, human, all_cues=k, heatmap=False)
+        assert set(full) == {"policy", "heatmap"} and set(lean) == {"policy"}
+        assert torch.equal(lean["policy"], full["policy"]) and torch.equal(c_lean, c_full)
+    with pytest.raises(ValueError, match="nothing to read out"):
+        _episode(fake_cs18[0], policy=False)._episode(batch, 2, human, heatmap=False)
+
+
 def test_sampling_at_temperature_zero_is_the_deploy_rollout(fake_cs18):
     ep = _episode(fake_cs18[0])
     batch = _batch(torch.zeros(B, 3, 2))
