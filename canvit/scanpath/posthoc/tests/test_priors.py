@@ -46,7 +46,7 @@ def test_no_prior_is_the_model_at_tau_one():
 def test_cells_off_the_image_get_no_mass():
     b = synthetic(10, logits_scale=1.0)
     b.logcount[:, :G] = -np.inf  # the first row of cells is letterbox padding
-    lp = log_probs({"amp_a": torch.tensor(1.0, dtype=torch.float64)}, features(b)).numpy()
+    lp = log_probs({"amp_w": torch.tensor(1.0, dtype=torch.float64)}, features(b)).numpy()
     assert np.all(np.isneginf(lp[:, :G])) and np.allclose(np.exp(lp).sum(1), 1.0)
 
 
@@ -56,7 +56,7 @@ def test_cell_centres_are_row_major_and_symmetric():
 
 
 def test_fit_recovers_known_prior_parameters():
-    truth = {"amp_a": 1.5, "amp_b": 6.0, "ret_w": -2.0, "ret_log_s": float(np.log(0.15)), "dir_card": 0.8,
+    truth = {"amp_w": 1.5, "ret_w": -2.0, "ret_log_s": float(np.log(0.15)), "dir_card": 0.8,
              "dir_lr": -0.5}
     b = draw(synthetic(4000), truth)
     est = fit(b, ("amplitude", "return", "direction"), with_model=False)
@@ -72,7 +72,7 @@ def test_fit_recovers_the_temperature():
 
 
 def test_fitting_never_lowers_the_training_likelihood():
-    b = draw(synthetic(1500, logits_scale=2.0), {"log_tau": 0.5, "amp_b": 3.0})
+    b = draw(synthetic(1500, logits_scale=2.0), {"log_tau": 0.5, "amp_w": 1.5})
     base = cell_log_probs(b, {"log_tau": 0.0}).mean()
     for priors in ((), ("amplitude",), ("amplitude", "return", "direction", "centre")):
         assert cell_log_probs(b, fit(b, priors)).mean() >= base - 1e-9
@@ -96,3 +96,16 @@ def test_cell_log_mean_matches_the_per_cell_logsumexp():
         for c in np.unique(cell):
             ref[c] = logsumexp(ld[cell == c]) - np.log(count[c])
         assert np.allclose(cell_log_mean(ld, cell, count), ref, rtol=0, atol=1e-10)
+
+
+def test_the_amplitude_prior_is_the_training_log_cost():
+    """log p moves by -amp_w * log(1 + d / r) per cell, r = 1 / G (cost_forms, the RL training's definition)."""
+    from canvit.scanpath.posthoc.cost_forms import saccade_cost
+    b = synthetic(20, logits_scale=1.0)
+    f = features(b)
+    w = torch.tensor(0.7, dtype=torch.float64)
+    shift = (log_probs({"amp_w": w}, f) - log_probs({}, f)).numpy()
+    cur = np.stack([h[-1] for h in b.hist])
+    d = np.linalg.norm(cell_centres(G)[None] - cur[:, None], axis=-1)
+    want = -0.7 * saccade_cost("log", torch.as_tensor(d), 1.0 / G).numpy()
+    np.testing.assert_allclose(shift - shift.mean(1, keepdims=True), want - want.mean(1, keepdims=True), atol=1e-5)

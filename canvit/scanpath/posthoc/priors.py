@@ -4,12 +4,16 @@ Per scored fixation t (history f_0..f_{t-1} in scene coordinates, f_{t-1} the cu
 G x G scene grid with centres c_j; d_j = |c_j - f_{t-1}|, theta_j its direction, 0 = right, pi/2 = up):
 
     log p(j) = log_softmax_j( logits_j / tau + log pixels_j
-                              + amp_a log(d_j + r) - amp_b d_j                     (1) saccade amplitude (gamma)
+                              - amp_w log(1 + d_j / r)                             (1) saccade amplitude (log cost)
                               + ret_w sum_{k<t} exp(-|c_j - f_k|^2 / 2 ret_s^2)    (2) return (+ facilitation)
                               + dir_card cos(4 theta_j) + dir_lr cos(theta_j)       (3) cardinal and right(+)/left(-)
                               + cb_w log centre_bias_j )                            (4) the dataset's centre bias
 
-r = half a cell, so the current cell has a finite amplitude term. Exact at cell level, like
+r = half a cell = 1 / G. Prior (1) is the RL training's log saccade cost (``cost_forms.saccade_cost("log", d, r)``,
+the one definition shared with ``saccade_cost.py``); amp_w > 0 penalises long saccades. Until 2026-11-25 it was
+amp_a log(d_j + r) - amp_b d_j (log + linear); Valentin's decision (two cost shapes, one definition) replaced it
+(helper_3, Claude Opus 5.5): the log term is the same up to a constant, the linear term is gone.
+Exact at cell level, like
 ``models.fit_temperature``: pysaliency's LL is log p(cell) - log(pixels in cell), and the second term does not
 depend on any parameter. Fitted jointly by maximum likelihood on the TRAINING subset's predictions (scipy L-BFGS-B,
 gradients by torch autograd); scored on validation as IG over the centre bias with the same exact shift
@@ -39,15 +43,17 @@ import numpy as np
 import torch
 from scipy.optimize import minimize
 
+from .cost_forms import saccade_cost
+
 log = logging.getLogger(__name__)
 
 PRIORS: dict[str, tuple[str, ...]] = {  # prior -> its parameters
-    "amplitude": ("amp_a", "amp_b"),
+    "amplitude": ("amp_w",),
     "return": ("ret_w", "ret_log_s"),
     "direction": ("dir_card", "dir_lr"),
     "centre": ("cb_w",),
 }
-INIT = {"log_tau": 0.0, "amp_a": 0.0, "amp_b": 0.0, "ret_w": 0.0, "ret_log_s": float(np.log(0.1)), "dir_card": 0.0,
+INIT = {"log_tau": 0.0, "amp_w": 0.0, "ret_w": 0.0, "ret_log_s": float(np.log(0.1)), "dir_card": 0.0,
         "dir_lr": 0.0, "cb_w": 0.0}
 BOUNDS = {"log_tau": (-4.0, 4.0), "ret_log_s": (np.log(0.01), np.log(1.0))}  # others free
 
@@ -85,8 +91,8 @@ def features(b: CellBatch) -> dict[str, torch.Tensor]:
     owner = np.repeat(np.arange(len(b)), [len(h) for h in b.hist])  # history rows -> their fixation
     hx = np.concatenate(b.hist)  # [M, 2]
     d2 = ((cc[None] - hx[:, None]) ** 2).sum(-1)  # [M, C]
-    f32 = {"log_d": np.log(d + 1.0 / grid), "d": d, "cos4": np.cos(4 * theta), "cos1": np.cos(theta), "d2": d2,
-           "log_cb": b.log_cb}
+    cost = saccade_cost("log", torch.as_tensor(d, dtype=torch.float64), 1.0 / grid).numpy()  # training's log cost
+    f32 = {"cost": cost, "cos4": np.cos(4 * theta), "cos1": np.cos(theta), "d2": d2, "log_cb": b.log_cb}
     out = {k: torch.as_tensor(v, dtype=torch.float32) for k, v in f32.items()}
     out |= {"logits": torch.as_tensor(b.logits, dtype=torch.float64),
             "logcount": torch.as_tensor(b.logcount, dtype=torch.float64),
@@ -99,7 +105,7 @@ def log_probs(p: dict[str, torch.Tensor], f: dict[str, torch.Tensor]) -> torch.T
     def g(k):
         return p[k] if k in p else torch.tensor(INIT[k], dtype=torch.float64)
     z = f["logits"] / torch.exp(g("log_tau")) + f["logcount"]
-    z = z + g("amp_a") * f["log_d"] - g("amp_b") * f["d"] + g("dir_card") * f["cos4"] + g("dir_lr") * f["cos1"]
+    z = z - g("amp_w") * f["cost"] + g("dir_card") * f["cos4"] + g("dir_lr") * f["cos1"]
     z = z + g("cb_w") * f["log_cb"]
     if "ret_w" in p:
         bumps = torch.exp(-f["d2"].double() / (2 * torch.exp(2 * g("ret_log_s"))))
