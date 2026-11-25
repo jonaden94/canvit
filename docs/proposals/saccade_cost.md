@@ -39,7 +39,8 @@
 - **One definition:** on `scanpath-eval`, `canvit/scanpath/posthoc/cost_forms.py` holds the same two
   formulas as `SaccadeCost.cost` here (same d in scene units, r = 1/grid, linear = d/2); its test compares
   both on a grid of d bit for bit when both are importable (checked in a trial merge of the two branches).
-  After the merge, `posthoc` imports the harness function and `cost_forms.py` goes.
+  After the merge, `posthoc` imports the harness function and `cost_forms.py` goes (importers:
+  `posthoc/saccade_cost.py`, `posthoc/priors.py` and its test).
 - **Two forms, both physiologically motivated (Valentin, 2026-11-24):**
   - `log`: distance on the log-polar collicular/cortical map. r ≈ 0.84° is close to Schwartz's
     a ≈ 0.75°, and half a 32×32 grid cell is the same order.
