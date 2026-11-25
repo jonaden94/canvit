@@ -8,7 +8,7 @@
 #   3-4 GPU jobs (one A100 each, grete:shared, --qos=2h, < 2 h each; slurm/runs/scanpath/eval_checkpoint.sbatch):
 #     CS18 TP + TA validation | CS18 TP + TA test | COCO-FreeView val | the search eval (search checkpoints only)
 #   1 CPU job after CS18 val + FreeView succeed (standard96s:test, < 1 h): the post-hoc saccade-cost fit
-#     (canvit.scanpath.saccade_cost, helper_2) -> $OUT/saccade_cost.json
+#     (canvit.scanpath.posthoc.saccade_cost, helper_2) -> $OUT/saccade_cost.json
 #   1 CPU job after all of them succeed (the cost job may fail) (standard96s:test, < 1 h): CS18 TP validation cut at the first target fixation
 #     (CUT=1, comparable with the test split) and the summary -> $LOGS_DIR/scanpath_eval/<name>/summaries/<slug>.*
 # Finished records are skipped, so re-running after a failure redoes only what is missing. The jobs run the clone's
@@ -43,7 +43,7 @@ cost=""
 if [ ! -f "$OUT/saccade_cost.json" ]; then  # helper_2's post-hoc saccade-cost fit (val npz only); the summary shows it
   j5=$(run sbatch --job-name="cost_$NAME" --account=nim00018 --partition=standard96s:test --time=00:59:00 \
     --cpus-per-task=16 --mem=64G --dependency="afterok:$j1:$j3" --output="logs/scanpath_eval/slurm/%x-%j.out" \
-    --wrap="source ./.envrc && $PY -m canvit.scanpath.saccade_cost $OUT --processes 6")
+    --wrap="source ./.envrc && $PY -m canvit.scanpath.posthoc.saccade_cost $OUT --processes 6")
   cost=",afterany:$j5"  # the summary renders even if the cost fit fails (its panel then says "not run")
 fi
 j4=$(run sbatch --job-name="sum_$NAME" --account=nim00018 --partition=standard96s:test --time=00:59:00 \

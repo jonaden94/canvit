@@ -16,7 +16,7 @@ c(d)/alpha = -a log(1 + d/r) (+ b d). "strength" of the log form = -a (nats per 
 Analysis and the choice of the form: normative_modelling/external/saccade_cost/ (2026-11-24; same numbers for exp39 s0,
 the log form wins on both the policy and the centre bias). Written by Claude (AI, Claude Opus 5.5), 2026-11-24.
 
-    source .envrc && .venv-cu126/bin/python -m canvit.scanpath.saccade_cost $LOGS_DIR/scanpath_eval/<entry>
+    source .envrc && .venv-cu126/bin/python -m canvit.scanpath.posthoc.saccade_cost $LOGS_DIR/scanpath_eval/<entry>
         # -> <entry>/saccade_cost.json (read by scripts/scanpath/figures.py --summary)
 """
 
@@ -52,9 +52,9 @@ def _batch(path: Path, part: str, analysis: bool = False) -> dict:
     logits, log pixels per cell, the human's cell, image index, and d (deg) from the current fixation to every cell.
     ``analysis``: also the centre bias per cell (``log_cb``, for the no-policy base) and the humans' saccade
     lengths (``amp_deg``)."""
-    from .data import letterbox_geometry, load_dataset
-    from .evaluate import ScanpathConfig, centre_bias_model, select, train_subset
-    from .models import GridScanpathModel
+    from ..data import letterbox_geometry, load_dataset
+    from ..evaluate import ScanpathConfig, centre_bias_model, select, train_subset
+    from ..models import GridScanpathModel
     from .priors import cell_batch, cell_centres
     torch.set_num_threads(1)
     rec = json.loads(path.read_text())
@@ -84,7 +84,7 @@ def _batch(path: Path, part: str, analysis: bool = False) -> dict:
            "n": b.n, "d": (d_scene * deg[:, None]).astype(np.float32), "r": (deg / grid).astype(np.float32),
            "grid": grid}
     if analysis:
-        from .models import without_start_fixations
+        from ..models import without_start_fixations
         sx = without_start_fixations(fx)  # same order as the batch (priors.cell_batch)
         xh = np.array([sx.x_hist[i][int(b.t[i]) - 1] for i in range(len(sx))])
         yh = np.array([sx.y_hist[i][int(b.t[i]) - 1] for i in range(len(sx))])
@@ -263,7 +263,7 @@ def evaluate_entry(entry: Path, processes: int = 6) -> dict:
                  "training scanpaths). best_tau_log_val: argmax of validation IG over tau with the log prior fixed "
                  "(optimistic). lambda_over_alpha = -a: RL cost c(d)/alpha = lambda/alpha * log(1 + d/r), r = half a "
                  "grid cell.",
-        "written_by": "canvit.scanpath.saccade_cost (Claude, Claude Opus 5.5)", "source": f"canvit {commit}",
+        "written_by": "canvit.scanpath.posthoc.saccade_cost (Claude, Claude Opus 5.5)", "source": f"canvit {commit}",
         "computed_at": datetime.now(UTC).isoformat()}
 
 

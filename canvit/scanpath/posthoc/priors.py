@@ -22,7 +22,7 @@ reference in ``evaluate.centre_bias_model``). The priors follow SceneWalk / D'Ag
 Kümmerer (NeurIPS 2025) in spirit, with one simple parametric form each. Written by Claude (AI, Claude Opus 5.5),
 2026-11-23.
 
-    source .envrc && .venv-cu126/bin/python -m canvit.scanpath.priors \
+    source .envrc && .venv-cu126/bin/python -m canvit.scanpath.posthoc.priors \
         $LOGS_DIR/scanpath_eval/<ckpt>/coco_search18_tp_validation.json   # -> <ckpt>/priors/<stem>.json
 """
 
@@ -169,8 +169,8 @@ def cell_batch(model, stimuli, fixations, centre_bias) -> CellBatch:
     """A ``CellBatch`` from a ``GridScanpathModel``'s predictions on ``fixations`` (the scored ones: every
     fixation with a history, in ``models._scored_cells`` order) and the centre bias (a pysaliency model) the
     scores are relative to."""
-    from .data import pixel_to_scene
-    from .models import _pixel_cells, _scored_cells, without_start_fixations
+    from ..data import pixel_to_scene
+    from ..models import _pixel_cells, _scored_cells, without_start_fixations
     logits, cells, logcount, t = _scored_cells(model, stimuli, fixations)
     fx = without_start_fixations(fixations)
     hist, log_cb, cache = [], [], {}
@@ -242,9 +242,9 @@ def annotate(res: dict) -> dict:
 
 
 def main() -> None:
-    from .data import load_dataset
-    from .evaluate import ScanpathConfig, centre_bias_model, select, train_subset
-    from .models import GridScanpathModel
+    from ..data import load_dataset
+    from ..evaluate import ScanpathConfig, centre_bias_model, select, train_subset
+    from ..models import GridScanpathModel
     ap = argparse.ArgumentParser()
     ap.add_argument("records", type=Path, nargs="+", help="CanViT records (<stem>.json with <stem>.npz and "
                                                           "<stem>_train<N>.npz beside them)")

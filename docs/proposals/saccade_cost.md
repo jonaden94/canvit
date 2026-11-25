@@ -12,7 +12,7 @@
 
 - **Problem:** the search policy makes saccades that are too long. Scored on human COCO-Search18 and
   COCO-FreeView scanpaths, a cost on saccade length that we fit afterwards adds +1.18 bits/fix (log cost,
-  mean of CS18 TP val, TA val and FreeView val; `canvit/scanpath/saccade_cost.py`).
+  mean of CS18 TP val, TA val and FreeView val; `canvit/scanpath/posthoc/saccade_cost.py`).
 - **Proposal:** let RL pay for each saccade. `c(d) = log(1 + d/r)`, where `d` is the distance between
   consecutive glimpse centres and `r` is half a policy-grid cell. Option `linear` is `d/W`. The cost enters
   after standardisation: `target_t = z_batch(R) − β · z_batch(c_t)`. Each action carries its own cost.

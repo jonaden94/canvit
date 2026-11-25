@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 import torch
 
-from canvit.scanpath.priors import (
+from canvit.scanpath.posthoc.priors import (
     CellBatch,
     cell_centres,
     cell_log_mean,

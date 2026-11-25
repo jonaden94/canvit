@@ -4,7 +4,7 @@ Written by Claude (AI, Claude Opus 5.5), 2026-11-24."""
 import numpy as np
 import torch
 
-from canvit.scanpath import saccade_cost as sc
+from canvit.scanpath.posthoc import saccade_cost as sc
 
 
 def _data(key: str, a: float, n: int = 4000, cells: int = 64, seed: int = 0) -> dict:

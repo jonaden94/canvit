@@ -679,7 +679,7 @@ def policy_vs_human(recs: list[dict], out: Path, steps=(1, 2, 3, 4), near: float
     return macros
 
 
-# Post-hoc priors (canvit.scanpath.priors): variant key, macro tag, row label. Policy (squares) and heatmap
+# Post-hoc priors (canvit.scanpath.posthoc.priors): variant key, macro tag, row label. Policy (squares) and heatmap
 # (circles) share a row; macros prIG<tag><cond> / prGain<tag><cond> (policy), prHmIG<tag><cond> / prHmGain<tag><cond>
 # (heatmap), cond = TP | TA | FV.
 PRIOR_ROWS = [("canvit_tau", "Tau", r"CanViT@$\tau$"), ("canvit_tau+amplitude", "Amp", "+ amplitude"),
@@ -692,7 +692,7 @@ PRIOR_CONDS = {"tp": ("coco_search18", "tp_validation", "COCO-Search18 TP"),
 
 
 def load_priors(results: Path) -> dict[tuple[str, str], dict]:
-    """{(source, cond): priors JSON} for PRIOR_CONDS (canvit.scanpath.priors, annotated), source policy | heatmap."""
+    """{(source, cond): priors JSON} for PRIOR_CONDS (scanpath.posthoc.priors, annotated), source policy | heatmap."""
     out = {}
     sources = [("policy", "*/priors/*_validation.json")]
     if SHOW_HEATMAP:
@@ -1359,7 +1359,7 @@ COST_COLS = ["data", r"IG@$\tau$ ($\tau$)", "+ log cost: IG (gain)", r"$\tau$", 
 
 def saccade_cost_rows(results_dir: Path) -> tuple[str, list[list[str]], str] | None:
     """helper_2's post-hoc saccade cost for one checkpoint, <records dir>/saccade_cost.json written by
-    ``python -m canvit.scanpath.saccade_cost`` (schema agreed 2026-11-24; all IG on validation, over the centre
+    ``python -m canvit.scanpath.posthoc.saccade_cost`` (schema agreed 2026-11-24; all IG on validation, over the centre
     bias, bits/fix): (key line, table rows per focus set, one line with the shared cost fit); None without it."""
     f = results_dir / "saccade_cost.json"
     if not f.exists():
@@ -1640,7 +1640,7 @@ def temperature_sweep(rec: dict, chunk: int = 20000) -> dict | None:
     from scipy.special import log_softmax
 
     from canvit.scanpath.models import _scored_cells, without_start_fixations
-    from canvit.scanpath.priors import image_average
+    from canvit.scanpath.posthoc.priors import image_average
     cache = rec["path"].parent / "temperature" / f"{rec['path'].stem}.json"
     npz = rec["path"].with_suffix(".npz")
     if cache.exists() and (not npz.exists() or cache.stat().st_mtime > npz.stat().st_mtime):
