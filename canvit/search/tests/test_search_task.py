@@ -423,16 +423,22 @@ def test_resumed_search_run_keeps_the_runs_best_checkpoint(fake_cs18, tmp_path, 
     so best.pt must stay at chunk 1's peak (it used to be replaced: best was per job)."""
     from canvit.harness.infra.checkpoint import load_checkpoint
     root, _ = fake_cs18
-    scores = iter([0.2, 0.8, 0.5, 0.4, 0.3])     # validations at steps 0, 1 | 2, 3, ...
-    monkeypatch.setattr(SearchRunTask, "evaluate", lambda self, **kw: {"found_t2_policy": next(scores)})
+    scores = {0: 0.2, 1: 0.8, 2: 0.5, 3: 0.4, 4: 0.3}   # chunk 1: 0, 1 + end 2 | chunk 2: 3 + end 4
+    evals: list[int] = []
+
+    def fake_eval(self, **kw):
+        evals.append(kw["step"])
+        return {"found_t2_policy": scores[kw["step"]]}
+    monkeypatch.setattr(SearchRunTask, "evaluate", fake_eval)
 
     def chunk(n):
         task = _TinyTask(_cfg(root), rl=_rl())
         s = RunSettings(n_steps=n, eval_every=1, log_every=1, grad_clip=1.0, amp=False, seed=0,
                         device="cpu", tracker="none", ckpt_dir=tmp_path, resume=True)
         run(task=task, spec=task.default_spec(), settings=s)
-    chunk(2)                                       # steps 0-1: best 0.8 at step 1
+    chunk(2)                                       # steps 0-1 + final weights (2): best 0.8 at step 1
     assert load_checkpoint(tmp_path / "best.pt", "cpu")["step"] == 1
-    chunk(2)                                       # resumed, steps 2-3: 0.5, 0.4
+    chunk(2)                                       # resumed at 2 (already validated): 3 + end 4
     assert load_checkpoint(tmp_path / "best.pt", "cpu")["step"] == 1
     assert load_checkpoint(tmp_path / "latest.pt", "cpu")["extra"]["best"]["value"] == 0.8
+    assert evals == [0, 1, 2, 3, 4], "each step validated once; the run's final weights included"

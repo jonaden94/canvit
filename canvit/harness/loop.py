@@ -17,6 +17,7 @@ wired here for the scorer and completed in the DDP stage.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
@@ -204,6 +205,7 @@ def run_training_loop(
     signal_checkpoint: bool = True,  # honor SIGUSR1 -> checkpoint (handler in run())
     best_metric: str | None = None,  # eval key to MAXIMIZE -> writes ckpt_dir/best.pt
     best_init: dict | None = None,   # a resumed run's best so far ({"metric", "value", "step"})
+    validated_step: int | None = None,  # the previous job already validated these weights (read_last_val)
     on_log: Callable[[int, dict], None] | None = None,
     on_eval: Callable[[int], dict] | None = None,
     on_best: Callable[[int, str, float], None] | None = None,
@@ -291,7 +293,13 @@ def run_training_loop(
         # tail (it trains every iterated step and checkpoints after), so the duplicate it
         # guards against cannot occur, and excluding the last step here would instead drop
         # a real validation point.
-        if on_eval is not None and eval_every and step % eval_every == 0:
+        #
+        # Since 2026-11-26 every job also validates its FINAL weights (after the loop), so a
+        # resumed job skips its start validation when the previous job's final validation
+        # completed for exactly these weights (`validated_step`, from last_val.json). If it
+        # did not complete (e.g. the job hit its time limit during it), it validates here.
+        already = step == start_step and validated_step == start_step
+        if on_eval is not None and eval_every and step % eval_every == 0 and not already:
             last["eval"] = on_eval(step)
             _track_best(step, last["eval"])
 
@@ -396,11 +404,46 @@ def run_training_loop(
             _save(step)
             _checkpoint_requested = False
 
-    _save(start_step + n_steps)
+    end = start_step + n_steps
+    _save(end)
+    # Validate the job's final weights, AFTER the end-of-job checkpoint: a time limit hit
+    # during this validation then costs the validation only, never the chunk (the next job
+    # validates these weights at its start instead). Every rank calls on_eval here exactly
+    # as at the loop start; the skip decision of the next job reads one shared file, so
+    # all ranks take the same branch.
+    if on_eval is not None and eval_every and n_steps > 0:
+        last["eval"] = on_eval(end)
+        _track_best(end, last["eval"])
+        if ckpt_dir is not None and rank == 0:
+            best = ({"metric": best_metric, "value": best_so_far, "step": best_step}
+                    if best_metric and best_so_far is not None else None)
+            write_last_val(ckpt_dir, step=end, best=best)
     return last
+
+
+LAST_VAL_FILE = "last_val.json"
+
+
+def write_last_val(ckpt_dir: Path, *, step: int, best: dict | None) -> None:
+    """Record that the weights after ``step`` updates were validated (and the run's best
+    so far, which includes that validation). Atomic: written to a temp file, then renamed."""
+    path = Path(ckpt_dir) / LAST_VAL_FILE
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({"step": int(step), "best": best}))
+    os.replace(tmp, path)
+
+
+def read_last_val(ckpt_dir: Path | None) -> dict | None:
+    """The record :func:`write_last_val` left, or None (no file: an older run, or no job
+    has completed its final validation yet)."""
+    if ckpt_dir is None:
+        return None
+    path = Path(ckpt_dir) / LAST_VAL_FILE
+    return json.loads(path.read_text()) if path.exists() else None
 
 
 __all__ = [
     "apply_requires_grad", "branch_metrics", "cancel_slurm_array", "grad_norms_by_module",
-    "install_sigusr1_handler", "request_checkpoint", "run_training_loop",
+    "install_sigusr1_handler", "read_last_val", "request_checkpoint", "run_training_loop",
+    "write_last_val",
 ]

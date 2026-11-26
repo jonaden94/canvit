@@ -68,6 +68,7 @@ from canvit.harness.loop import (
     apply_requires_grad,
     cancel_slurm_array,
     install_sigusr1_handler,
+    read_last_val,
     run_training_loop,
 )
 from canvit.harness.optim import build_optimizer_and_scheduler
@@ -614,6 +615,16 @@ def run(*, task: RunTask, spec: TrainSpec, settings: RunSettings) -> dict:
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "run_config.json").write_text(json.dumps(settings.run_config, indent=1) + "\n")
 
+    # The previous job validated its final weights (loop.write_last_val): skip that one
+    # validation and take the best from the record, which includes it. Keyed on the step,
+    # so any other resume (a mid-job/signal checkpoint, an older run, a final validation
+    # that did not complete) validates at its start as before. Every rank reads the same file.
+    last_val = None if (forked or prior_ckpt is None) else read_last_val(ckpt_dir)
+    if last_val is not None and last_val.get("step") != start_step:
+        last_val = None
+    if last_val is not None:
+        log.info("RESUME: step %d was validated by the previous job; not validating it again", start_step)
+
     try:
         last = run_training_loop(
             task=task, model=model, head=head, optimizer=optimizer, scheduler=scheduler,
@@ -630,7 +641,9 @@ def run(*, task: RunTask, spec: TrainSpec, settings: RunSettings) -> dict:
             signal_checkpoint=settings.signal_checkpoint,
             best_metric=getattr(task, "best_metric", None),
             # a run forked by resume_from starts its own best (the source run's is not this run's)
-            best_init=None if forked else ((prior_ckpt or {}).get("extra") or {}).get("best"),
+            best_init=None if forked else ((last_val or {}).get("best")
+                                           or ((prior_ckpt or {}).get("extra") or {}).get("best")),
+            validated_step=last_val["step"] if last_val is not None else None,
             on_log=on_log, on_eval=(on_eval if settings.eval_every else None),
             on_best=on_best,
         )
