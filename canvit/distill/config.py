@@ -52,6 +52,10 @@ class Config:
     rl: JointPolicyConfig = field(default_factory=JointPolicyConfig)
     """Joint task+policy training (P4b). OFF by default => byte-identical to
     pre-P4b pretraining. See :class:`JointPolicyConfig`."""
+    policy_scorer_input_norm: Literal["batch", "none"] = "batch"
+    """Input normalisation of the separate policy scorer (U-Net on the canvas; not used by policy
+    tokens): "batch" = its per-channel BatchNorm (the historical default), "none" = without it,
+    as the search task does (no BatchNorm needed there)."""
     chunk_size: int = 2  # BPTT chunk size (glimpses per chunk, gradient flows within)
     continue_prob: float = 0.5  # prob of adding another chunk to trajectory
     enable_scene_patches_loss: bool = True  # Scene (canvas) patch reconstruction loss
@@ -108,6 +112,11 @@ class Config:
     """Continue another run's checkpoint with its full state (RunSettings.resume_from), e.g.
     an LR decay of that run: step count, AdamW and shard schedule continue; the LR is this
     config's. Only used if no checkpoint exists in run_dir."""
+    seed_optimizer: bool = False
+    """With ``seed_ckpt``: also take over the seed's AdamW state for the task (backbone) group
+    (RunSettings.seed_optimizer). The LR schedule is still this run's (use warmup_steps 0)."""
+    seed_exp_avg_sq_scale: float = 1.0
+    """Multiply the taken-over exp_avg_sq by this (RunSettings.seed_exp_avg_sq_scale)."""
     hf_seed_ckpt: str | None = None
     """Seed model weights from HF Hub repo (e.g. '<org>/canvitb16-add-vpe-...'). Downloads
     config.json + model.safetensors, overrides cfg.model with the checkpoint's config.
@@ -184,8 +193,8 @@ class Config:
     val_seed: int = 0
     """Seed selecting the fixed validation subset. Same seed -> same images across
     runs and across world sizes."""
-    viz_every_n_vals: int = 5  # Log viz every N validation runs
-    curve_every_n_vals: int = 5  # Log curves every N validation runs
+    viz_every_n_vals: int = 2  # Log viz every N validation runs (5 until 2026-11-23)
+    curve_every_n_vals: int = 2  # Log curves every N validation runs (5 until 2026-11-23)
     log_spatial_stats: bool = True
     log_patcher_grad_detail: bool = True
     """Break the patcher's per-validation grad-norm logs into sub-components:

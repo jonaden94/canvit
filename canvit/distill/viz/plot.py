@@ -71,6 +71,17 @@ def plot_trajectory(
     return fig
 
 
+def policy_map_grid(m: NDArray[np.floating]) -> NDArray[np.floating]:
+    """A policy's flat action distribution as a ``c x c`` grid over the full field (row = y).
+    Foveated action space: ``c x c`` fixation cells. Uniform: ``n_scale x c x c`` (centre AND
+    scale), summed over scales -- an approximate picture, since each scale's centres span a
+    different safe box."""
+    n_scale = next(s for s in range(1, 17) if m.size % s == 0
+                   and round((m.size // s) ** 0.5) ** 2 == m.size // s)
+    c = round((m.size // n_scale) ** 0.5)
+    return m.reshape(n_scale, c, c).sum(0)
+
+
 def plot_pca_grid(
     *,
     pca: PCA,
@@ -129,8 +140,16 @@ def plot_multistep_pca(
     timestep_predictions: list[TimestepPredictions] | None = None,
     foveated_samples: list[FoveatedVizData | None] | None = None,
     square_samples: list[SquareVizData | None] | None = None,
+    policy_maps: list[NDArray[np.floating]] | None = None,
+    fig_title: str | None = None,
 ) -> Figure:
     """Full multi-row visualization with all diagnostic columns.
+
+    Trajectory column: the fixations so far (points joined by lines); the uniform patcher
+    also draws each glimpse's box (for foveated / square glimpses a box has no meaning). With
+    ``policy_maps`` (``policy_maps[k]`` = the action distribution that chose the glimpse at
+    t = k + 1) the row's map is drawn under the fixations, with its entropy and maximum.
+    ``fig_title``: a figure title (e.g. the retina of a multi-retina training sample).
 
     Row 0 = "init": learned spatial_hidden_init projected through scene_proj, BEFORE any glimpses
     Row 1+ = "t=0, t=1, ...": scene state AFTER processing each glimpse
@@ -386,22 +405,37 @@ def plot_multistep_pca(
 
         ax = axes[row, C_TRAJ]
         ax.imshow(full_img)
-        for i in range(t + 1):
-            box = boxes[i]
-            alpha = 1.0 if i == t else 0.4
-            rect = Rectangle(
-                (box.left, box.top), box.width, box.height,
-                linewidth=2, edgecolor=colors[i], facecolor="none", alpha=alpha,
-            )
-            ax.add_patch(rect)
-            ax.plot(box.center_x, box.center_y, "o", color=colors[i], markersize=5, alpha=alpha)
+        img_h, img_w = full_img.shape[:2]
+        traj_title = f"t={t}"
+        if policy_maps is not None and t >= 1:
+            m = policy_maps[t - 1]
+            # Cells span the normalized field [-1, 1], which the boxes map to pixel
+            # centres [0, W-1] (viewpoint_to_pixel_box).
+            ax.imshow(policy_map_grid(m), extent=(0, img_w - 1, img_h - 1, 0), cmap="magma",
+                      alpha=0.6, interpolation="nearest")
+            ent = float(-(m * np.log(np.clip(m, 1e-12, None))).sum())
+            traj_title += f"  H={ent:.2f}  max={float(m.max()):.3f}"
         for i in range(1, t + 1):
             ax.plot(
                 [boxes[i - 1].center_x, boxes[i].center_x],
                 [boxes[i - 1].center_y, boxes[i].center_y],
                 "-", color=colors[i], linewidth=1.5, alpha=0.7,
             )
-        ax.set_title(f"t={t}")
+        for i in range(t + 1):
+            box = boxes[i]
+            current = i == t
+            if not is_sample:
+                ax.add_patch(Rectangle(
+                    (box.left, box.top), box.width, box.height,
+                    linewidth=2, edgecolor=colors[i], facecolor="none", alpha=1.0 if current else 0.4,
+                ))
+            ax.plot(box.center_x, box.center_y, "o", color=colors[i],
+                    markersize=9 if current else 5, markeredgecolor="white" if current else "none",
+                    alpha=1.0 if current else 0.6)
+        # Axes = the image (a box larger than the image used to shrink it).
+        ax.set_xlim(-0.5, img_w - 0.5)
+        ax.set_ylim(img_h - 0.5, -0.5)
+        ax.set_title(traj_title)
         ax.axis("off")
 
         if is_foveated:
@@ -555,5 +589,7 @@ def plot_multistep_pca(
         axes[row, C_ERROR].axis("off")
         fig.colorbar(im_err, ax=axes[row, C_ERROR], fraction=0.046, pad=0.04)
 
+    if fig_title:
+        fig.suptitle(fig_title, fontsize=24)
     plt.tight_layout()
     return fig

@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from canvit.core.policy.net import N_UNET_ENC
 from canvit.harness.config import FoveatedScaleConfig, JointPolicyConfig
 
 
@@ -87,8 +88,11 @@ class SearchConfig:
     Required (there is no published foveated search backbone to default to)."""
     retina: str | None = None
     """A MULTI-RETINA backbone is used through this one retina, by name as the backbone's patcher
-    lists it (e.g. ``cmf0.75_res65_cps6``). Required for such a backbone, refused for a
-    single-retina one."""
+    lists it (e.g. ``cmf0.75_res65_cps6``), or through ALL of them with ``all`` (as distill
+    trains: each training sample draws its retina, held for its glimpses; validation runs every
+    retina on the same images and reports the mean under the usual keys, so the best checkpoint
+    follows the mean, plus each retina's metrics under ``<retina>/``). Required for such a
+    backbone, refused for a single-retina one."""
     canvas_grid: int | None = None
     """None = scene_size // patch_size (32 for ViT-B/16 at 512 px)."""
     foveated_scale: FoveatedScaleConfig = field(default_factory=_fixed_scale_2)
@@ -96,6 +100,9 @@ class SearchConfig:
     head: Literal["unet", "linear"] = "unet"
     head_width: int = 64
     head_block_layers: int = 2
+    head_levels: int = N_UNET_ENC
+    """Depth of the head's U-Net (resolutions; 6 pools 32x32 down to 1x1, 3 stops at 8x8) --
+    the head's counterpart of ``--cfg.rl.policy-levels``. ``unet`` head only."""
     cond_dim: int = 64
     """Width of the target-class embedding(s) (Haoze: 64)."""
     embedding: Literal["separate", "shared"] = "separate"
@@ -149,6 +156,9 @@ class SearchConfig:
     weight_decay: float = 0.01
     """Task head (Haoze's search config: 0.01; his 0.05 is the COCO-pretraining config's)."""
     warmup_steps: int = 500
+    lr_schedule: Literal["cosine", "constant"] = "cosine"
+    """Task head LR after the warmup: ``cosine`` (Haoze) decays to 0 at ``max_steps``;
+    ``constant`` holds ``peak_lr`` (the policy's schedule)."""
     max_steps: int = 20000
     grad_clip: float = 1.0
 

@@ -46,6 +46,12 @@ matplotlib.use("Agg")
 import torch._functorch.config
 
 torch._functorch.config.backward_pass_autocast = "off"  # type: ignore[attr-defined]
+# The task/policy gradient split (loop: grad_split/*, log steps with policy_grad_to_backbone) runs
+# autograd.grad(..., retain_graph=True) before the chunk's backward. A compiled backward with
+# donated buffers refuses retain_graph (exp40 T3-full, job 17483087, 2026-11-23: "compiled with
+# non-empty donated buffers which requires ... retain_graph=False"). Donation is only a memory
+# optimisation; turning it off changes no numbers.
+torch._functorch.config.donated_buffer = False  # type: ignore[attr-defined]
 
 import logging
 import time
@@ -111,6 +117,14 @@ class RunSettings:
     only while this run has no checkpoint of its own (later array tasks resume their own).
     The LR is then this run's config (base lr, schedule shape), so this is how an LR decay
     continues a run. W&B: a new run forked from the source run at the checkpoint's step."""
+    seed_optimizer: bool = False
+    """With ``seed_ckpt``: also take over the seed's AdamW state (exp_avg, exp_avg_sq, step) for
+    the parameters of the seed's single optimizer group, matched by name, into this run's
+    ``backbone`` group (see :func:`load_seed_optimizer_state`). Other groups (policy) start
+    fresh; lr, weight decay, betas and the schedule stay this run's."""
+    seed_exp_avg_sq_scale: float = 1.0
+    """Multiply the taken-over exp_avg_sq by this: the squared-gradient average grows when the
+    batch shrinks (measured ~3x from exp38's 4x64 to 1x64, 2026-11-24)."""
     compile: bool = False        # torch.compile the model after build (perf)
     run_dir: Path | None = None
     """Root for this run's artifacts (`{run_dir}/checkpoints`, `{run_dir}/visualization`),
@@ -220,6 +234,40 @@ def apply_configured_lr(optimizer: Any, scheduler: Any, configured: list[dict]) 
     for g, base, fn in zip(optimizer.param_groups, scheduler.base_lrs, scheduler.lr_lambdas):
         g["lr"] = base * fn(scheduler.last_epoch)
     scheduler._last_lr = [g["lr"] for g in optimizer.param_groups]
+def load_seed_optimizer_state(optimizer: Any, names: list[str], params: list[Any], seed_payload: dict,
+                              *, exp_avg_sq_scale: float = 1.0) -> int:
+    """Copy a seed checkpoint's AdamW state into ``optimizer`` for ``params`` (named ``names``).
+
+    The seed optimizer must have ONE param group; its params are identified by name through the
+    seed's ``model_state`` order (a state_dict lists parameters in ``named_parameters`` order).
+    The seed's parameters must be exactly ``names`` minus the ones new in this run (absent from
+    the seed's model_state); every shape must match. Returns the number of tensors with state."""
+    o = seed_payload.get("optimizer_state")
+    if not o:
+        raise ValueError("seed_optimizer: the seed checkpoint has no optimizer_state")
+    if len(o["param_groups"]) != 1:
+        raise ValueError(f"seed_optimizer: seed has {len(o['param_groups'])} param groups, expected 1")
+    want = set(names)
+    seed_names = [k for k in seed_payload["model_state"] if k in want]
+    seed_ids = o["param_groups"][0]["params"]
+    if len(seed_names) != len(seed_ids):
+        raise ValueError(f"seed_optimizer: seed group has {len(seed_ids)} params, its model_state "
+                         f"{len(seed_names)} of this run's backbone params")
+    by_name = {n: o["state"][i] for n, i in zip(seed_names, seed_ids) if i in o["state"]}
+    n_loaded = 0
+    for name, p in zip(names, params, strict=True):
+        st = by_name.get(name)
+        if st is None:
+            continue
+        if st["exp_avg"].shape != p.shape:
+            raise ValueError(f"seed_optimizer: {name} shape {tuple(st['exp_avg'].shape)} != {tuple(p.shape)}")
+        optimizer.state[p] = {
+            "step": st["step"].detach().to("cpu", torch.float32).clone(),  # as AdamW keeps it (not fused/capturable)
+            "exp_avg": st["exp_avg"].to(device=p.device, dtype=p.dtype).clone(),
+            "exp_avg_sq": (st["exp_avg_sq"].to(device=p.device, dtype=p.dtype) * exp_avg_sq_scale).clone(),
+        }
+        n_loaded += 1
+    return n_loaded
 
 
 def run(*, task: RunTask, spec: TrainSpec, settings: RunSettings) -> dict:
@@ -309,6 +357,40 @@ def run(*, task: RunTask, spec: TrainSpec, settings: RunSettings) -> dict:
     if spec.train_policy or spec.policy_loss_active:
         gen = torch.Generator(device=device).manual_seed(settings.seed + rank)
         joint = task.build_policy(model, device=device, canvas_grid=canvas_grid, generator=gen)
+        # ONE switch for "does the policy gradient reach the backbone": the spec's
+        # policy_grad_to_backbone. The selector's feats_detached (from rl.feats_detached,
+        # default True) used to be a second, independent switch, so
+        # `--spec.policy-grad-to-backbone True` alone still detached the policy features and no
+        # policy gradient reached the backbone, silently (found 2026-11-22; no launcher had
+        # set either). The spec wins; a policy-token model cannot detach at all.
+        sel = joint.policy_selector
+        core_cfg = getattr(getattr(model, "module", model), "cfg", None)
+        if getattr(core_cfg, "n_policy_tokens", 0):
+            isolated = getattr(core_cfg, "policy_token_mode", None) == "isolated"
+            if isolated and spec.policy_grad_to_backbone:
+                raise ValueError(
+                    "isolated policy tokens read the reconstruction path only detached, so no policy "
+                    "gradient reaches it: use --spec.policy-grad-to-backbone False")
+            if not isolated and not spec.policy_grad_to_backbone:
+                raise ValueError(
+                    "policy tokens are processed by the backbone, so the policy gradient reaches "
+                    "it by construction: use --spec.policy-grad-to-backbone True")
+            if isolated and spec.bptt.mode == "none":
+                # bptt 'none' (a frozen model: --preset policy_only) runs every model forward
+                # under no_grad, and the isolated policy stream lives INSIDE that forward: only
+                # the readout would train, the stream and the token init never. 'full' is the
+                # same cadence (one backward per rollout) with grad on; the frozen trunk still
+                # records no graph (no parameter or input of it requires grad). Found 2026-11-24
+                # before the first exp41 run.
+                from dataclasses import replace as _replace
+                spec = _replace(spec, bptt=_replace(spec.bptt, mode="full"))
+                log.info("isolated policy tokens on a frozen model: bptt 'none' -> 'full' so the "
+                         "policy stream trains (horizon %s)", spec.bptt.horizon)
+        elif hasattr(sel, "feats_detached") and sel.feats_detached != spec.feats_detached:
+            log.warning("policy selector feats_detached=%s overridden to %s to match "
+                        "spec.policy_grad_to_backbone=%s", sel.feats_detached, spec.feats_detached,
+                        spec.policy_grad_to_backbone)
+            sel.feats_detached = spec.feats_detached
         # A terminal-reward objective cannot honor every spec cell; fail before training.
         from canvit.harness.policy import check_credit_regime
         check_credit_regime(joint=joint, spec=spec)
@@ -340,7 +422,25 @@ def run(*, task: RunTask, spec: TrainSpec, settings: RunSettings) -> dict:
         log.info("SEED mode: loading weights from %s (fresh opt/sched, step 0)", settings.seed_ckpt)
         seed_payload = load_checkpoint(settings.seed_ckpt, device)
         # weights only: no optimizer/scheduler => the run starts a fresh schedule.
-        restore_into(seed_payload, model=model, joint=joint, path=settings.seed_ckpt, device=device)
+        # A model with policy tokens seeded from one without: only those params start fresh.
+        core = getattr(model, "module", model)
+        new_params = (("policy_token_init", "policy_readout.", "policy_stream.")
+                      if getattr(getattr(core, "cfg", None), "n_policy_tokens", 0) else ())
+        restore_into(seed_payload, model=model, joint=joint, path=settings.seed_ckpt, device=device,
+                     new_param_prefixes=new_params)
+        stream = getattr(core, "policy_stream", None)
+        if stream is not None and not any(k.startswith("policy_stream.") for k in seed_payload["model_state"]):
+            # An isolated stream seeded from a model without one starts as a copy of the
+            # (now pretrained) trunk: at step 0 it computes what read-only tokens would.
+            stream.copy_from_trunk(core)
+            log.info("SEED: isolated policy stream initialised from the seeded trunk")
+        if settings.seed_optimizer:
+            named = {id(p): n for n, p in core.named_parameters()}
+            n = load_seed_optimizer_state(
+                optimizer, [named[id(p)] for p in param_groups["backbone"]],
+                list(param_groups["backbone"]), seed_payload, exp_avg_sq_scale=settings.seed_exp_avg_sq_scale)
+            log.info("SEED: AdamW state of %d backbone tensors taken over (exp_avg_sq x %g)",
+                     n, settings.seed_exp_avg_sq_scale)
         start_step = 0
     else:
         log.info("FRESH mode: no checkpoint, starting from scratch")
@@ -352,11 +452,17 @@ def run(*, task: RunTask, spec: TrainSpec, settings: RunSettings) -> dict:
     # stats are model buffers filled there from one shard (train/loop.py 583-585), and
     # after the resume/seed restore so the loaded state is what gets broadcast.
     if is_dist:
-        ddp.broadcast_parameters(model, joint.scorer if joint is not None else None)
+        ddp.broadcast_parameters(model, joint.scorer if joint is not None else None,
+                                 *((joint.critic, joint.target_net) if joint is not None else ()))
         log.info("DDP: broadcast parameters + buffers from rank 0")
     train_batches = _infinite(train_loader)
     selector = task.build_selector(device=device, canvas_grid=canvas_grid, is_foveated=is_foveated)
     branches = task.branches()
+    if joint is not None and joint.second_branch is not None:
+        if joint.keep_random_branch:
+            raise ValueError("rl.second_branch replaces rl.keep_random_branch; set only one")
+        branches = joint.branches(branches)
+        log.info("branches (rl.second_branch=%s): %s", joint.second_branch, [b.name for b in branches])
 
     amp_ctx: Any = nullcontext()
     if settings.amp and use_cuda:
@@ -437,12 +543,19 @@ def run(*, task: RunTask, spec: TrainSpec, settings: RunSettings) -> dict:
         # Validation is rank-0 only over the fixed subset (identical samples regardless of
         # world size — the same choice train/loop.py 692-696 makes); the others wait at the
         # barrier. Safe because evaluate() runs under no_grad with no collectives.
-        if is_dist and rank != 0:
+        # Exception: a task with `distributed_eval = True` (distill) is called on EVERY rank;
+        # it splits the fixed subset by rank and all-reduces inside, and only rank 0 logs.
+        distributed = is_dist and getattr(task, "distributed_eval", False)
+        if is_dist and rank != 0 and not distributed:
             ddp.barrier()
             return {}
         t_val = time.perf_counter()
+        extra = {"rank": rank, "world_size": world_size} if distributed else {}
         metrics = task.evaluate(model=model, head=head, val_loader=val_loader, device=device,
-                                step=step, tracker=tracker, run_dir=run_dir, joint=joint)
+                                step=step, tracker=tracker, run_dir=run_dir, joint=joint, **extra)
+        if is_dist and rank != 0:  # distributed eval: rank 0 holds the same metrics and logs them
+            ddp.barrier()
+            return {}
         val_seconds = time.perf_counter() - t_val
         log.info("step %d  eval (%.1fs): %s", step, val_seconds, metrics)
         if tracker is not None:
@@ -516,6 +629,8 @@ def run(*, task: RunTask, spec: TrainSpec, settings: RunSettings) -> dict:
             grad_norm_deep_prefixes=settings.grad_norm_deep_prefixes,
             signal_checkpoint=settings.signal_checkpoint,
             best_metric=getattr(task, "best_metric", None),
+            # a run forked by resume_from starts its own best (the source run's is not this run's)
+            best_init=None if forked else ((prior_ckpt or {}).get("extra") or {}).get("best"),
             on_log=on_log, on_eval=(on_eval if settings.eval_every else None),
             on_best=on_best,
         )

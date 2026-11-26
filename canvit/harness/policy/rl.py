@@ -23,6 +23,10 @@ class QReg:
 
     prime_on_policy: float = 0.5  # fraction of state-advancing glimpses taken by the net's argmax (DAgger)
     dueling: bool = True  # Q(s,a) = V(s) + mean-zero A(s,a); argmax (deploy) unchanged
+    extra_candidates: int = 0
+    """Dense QReg (ported from branch policy-algos 8f14161, 2026-11-24): per policy glimpse, K
+    uniformly random extra cells are glimpsed from the SAME state (no grad, states discarded),
+    and the net regresses their measured rewards too (K+1 labels per state). 0 = the recipe."""
 
 
 @dataclass(frozen=True)
@@ -104,7 +108,34 @@ class VPG:
     lets advantage normalization absorb the level."""
 
 
-Objective = QReg | PG | VPG
+@dataclass(frozen=True)
+class SAC:
+    """Discrete soft actor-critic: SAC-Discrete, Christodoulou 2019 (arXiv 1910.07207),
+    Algorithm 1 (ported from branch policy-algos 1a0bb3b, 2026-11-24).
+
+    * actor: the policy (scorer or policy tokens); pi(.|s) = softmax(scores) over the
+      candidate cells, SAMPLED during training, argmax at deploy (as PG);
+    * critics: two canvas U-Nets (``ViewpointScorer``, no dueling head), each Q(s, .) over
+      every cell, with Polyak-averaged target copies; the soft value is the exact expectation
+      V(s) = pi(s)^T [min_i Qbar_i(s) - alpha log pi(s)] (eq. 10);
+    * critic loss 1/2 (Q_i(s_t, a_t) - y_t)^2, y_t = r_t + gamma V(s_{t+1}) (the last glimpse
+      ends the episode: y = r); actor loss pi(s)^T [alpha log pi(s) - min_i Q_i(s)] (eq. 12);
+      alpha by a dual step on log(alpha) toward ``target_entropy`` (eq. 11).
+
+    Departures from Algorithm 1, as on policy-algos: NO replay buffer (each rollout's
+    transitions get one update, the data and update budget of PG), rewards divided by a
+    running std (no mean shift), Polyak-averaged targets instead of hard copies."""
+
+    gamma: float = 0.99
+    target_tau: float = 0.005
+    target_entropy: float = 1.0  # nats; build_policy resolves None to the paper's 0.98 * log|A|
+    alpha_init: float = 1.0
+    alpha_lr: float = 0.05
+
+
+SAC_ALPHA_MIN = 1e-4  # SAC has no entropy floor; this only keeps log(alpha) finite
+
+Objective = QReg | PG | VPG | SAC
 
 RewardKind = Literal["fractional", "difference", "terminal"]
 RewardCenter = Literal["none", "running_mean", "batch_mean"]
@@ -138,6 +169,12 @@ def resolve_reward(*, objective: Objective, reward: str = "default", center: str
             raise ValueError("objective='vpg' owns its baseline (learned V(s)) and its advantage "
                              "normalisation; reward_center / reward_scale must stay 'default'.")
         return RewardSpec(kind="terminal", center="none", scale="none")
+    if isinstance(objective, SAC):
+        if reward not in ("default", "fractional") or center != "default" or scale != "default":
+            raise ValueError("objective='sac' takes the per-glimpse fractional reward and scales it "
+                             "itself (running std, no mean shift); reward / reward_center / "
+                             "reward_scale must stay 'default'.")
+        return RewardSpec(kind="fractional", center="none", scale="running_std")
     kind = "fractional" if reward == "default" else reward
     c = "running_mean" if center == "default" else center
     if scale != "default":
@@ -186,6 +223,16 @@ class RunningNorm:
         if subtract_only:
             return x - mean
         return (x - mean) / (sq - mean**2).clamp_min(1e-4).sqrt()
+
+    @torch.no_grad()
+    def rescale(self, x: Tensor) -> Tensor:
+        """Update the same EMA, but return ``x / std`` with NO mean shift (SAC)."""
+        self.count += 1
+        self.mean = self.m * self.mean + (1 - self.m) * x.mean()
+        self.sq = self.m * self.sq + (1 - self.m) * (x * x).mean()
+        bc = 1 - self.m**self.count
+        mean, sq = self.mean / bc, self.sq / bc
+        return x / (sq - mean**2).clamp_min(1e-8).sqrt()
 
 
 @torch.no_grad()
@@ -309,4 +356,63 @@ def vpg_loss(
         "value_mean": values.detach().mean(),
         "adv_std": adv.detach().std(),
         "taken_logp": logp.detach().mean(),
+    }
+
+
+def sac_actor_loss(scores: Tensor, qmin: Tensor, *, alpha: Tensor | float) -> tuple[Tensor, Tensor]:
+    """SAC-Discrete actor objective at ONE state, eq. (12): pi^T [alpha log pi - min_i Q_i],
+    meaned over the batch. scores [B, A] (grad), qmin [B, A] the critics' min (no grad).
+    Returns (loss, entropy). Needs only the critics at s_t, so it is built per glimpse and
+    leaves with that glimpse's TBPTT chunk."""
+    logp = F.log_softmax(scores, dim=1)
+    p = logp.exp()
+    return (p * (alpha * logp - qmin)).sum(dim=1).mean(), -(p * logp).sum(dim=1).mean()
+
+
+def sac_critic_loss(
+    logp: Tensor, q1: Tensor, q2: Tensor, q1_tgt_next: Tensor, q2_tgt_next: Tensor,
+    flat_idx: Tensor, r: Tensor, *, alpha: Tensor | float, gamma: float,
+) -> tuple[Tensor, Tensor]:
+    """Twin-critic loss over a WHOLE episode, eq. (10): 1/2 sum_i (Q_i(s_t, a_t) - y_t)^2,
+    y_t = r_t + gamma pi(s_{t+1})^T [min_i Qbar_i(s_{t+1}) - alpha log pi(s_{t+1})] (the last
+    glimpse ends the episode: y = r), meaned over (b, t). logp [B, T, A] the policy's
+    log-probabilities (no grad), q1/q2 [B, T, A] (grad), q*_tgt_next [B, T-1, A] the TARGET
+    critics at s_1..s_{T-1}, flat_idx [B, T], r [B, T]. Returns (loss, y)."""
+    with torch.no_grad():
+        p = logp.exp()
+        v_next = (p[:, 1:] * (torch.min(q1_tgt_next, q2_tgt_next) - alpha * logp[:, 1:])).sum(dim=2)
+        y = r.clone()
+        y[:, :-1] += gamma * v_next
+    qa1 = q1.gather(2, flat_idx[..., None]).squeeze(2)
+    qa2 = q2.gather(2, flat_idx[..., None]).squeeze(2)
+    return 0.5 * (F.mse_loss(qa1, y) + F.mse_loss(qa2, y)), y
+
+
+def sac_loss(
+    scores: Tensor,
+    q1: Tensor,
+    q2: Tensor,
+    q1_tgt_next: Tensor,
+    q2_tgt_next: Tensor,
+    flat_idx: Tensor,
+    r: Tensor,
+    *,
+    alpha: Tensor | float,
+    gamma: float,
+) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
+    """SAC-Discrete actor + twin-critic loss over a WHOLE episode, meaned over (b, t): the sum
+    of :func:`sac_actor_loss` (meaned over t) and :func:`sac_critic_loss` -- the training path
+    builds the two parts separately (actor per glimpse, critics at the episode end).
+
+    scores [B, T, A] (grad -> actor), q1/q2 [B, T, A] (grad -> critics), q*_tgt_next
+    [B, T-1, A] the TARGET critics at s_1..s_{T-1} (no grad), flat_idx [B, T] the taken
+    cells, r [B, T] the (scaled) rewards. The episode ends after the last glimpse."""
+    B, T, A = scores.shape
+    qmin = torch.min(q1, q2).detach()
+    actor, entropy = sac_actor_loss(scores.reshape(B * T, A), qmin.reshape(B * T, A), alpha=alpha)
+    critic, y = sac_critic_loss(F.log_softmax(scores.detach(), dim=2), q1, q2, q1_tgt_next, q2_tgt_next,
+                                flat_idx, r, alpha=alpha, gamma=gamma)
+    return actor + critic, entropy, {
+        "policy_entropy": entropy.detach(), "critic_loss": critic.detach(),
+        "actor_loss": actor.detach(), "td_target": y.mean(),
     }

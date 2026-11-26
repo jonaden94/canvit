@@ -113,11 +113,14 @@ def test_policy_grad_into_frozen_backbone_errors():
     assert any("routing policy loss into a frozen backbone" in x for x in errs)
 
 
-def test_coupled_policy_backbone_under_ddp_errors():
+def test_coupled_policy_backbone_allowed_under_ddp():
+    """Was refused under DDP until 2026-11-22; the loop syncs every trainable grad by hand,
+    so the policy gradient into the backbone is averaged like the task gradient (2-GPU
+    cross-rank identity verified, see spec.py)."""
     spec = TrainSpec.joint(policy_grad_to_backbone=True,
                            optim={"backbone": go(lr=1e-4), "head": go(), "policy": go(lr=2e-4)})
-    assert check_spec(spec, HEAD_POLICY, is_dist=False).ok  # single-GPU: fine
-    assert any("under DDP is unsupported" in x for x in check_spec(spec, HEAD_POLICY, is_dist=True).errors)
+    assert check_spec(spec, HEAD_POLICY, is_dist=False).ok
+    assert check_spec(spec, HEAD_POLICY, is_dist=True).ok
 
 
 def test_task_without_ddp_support_refuses_multi_gpu():
