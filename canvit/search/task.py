@@ -126,6 +126,9 @@ class SearchRunTask:
         self._joint = None
         self._bound: BoundSearchTask | None = None
         self.classes: list[str] | None = None
+        self._start_step = 0  # release: where the trial stream resumes (resume_start_step)
+        self._resume_saved: dict | None = None
+        self._world_size: int | None = None
 
     @property
     def best_metric(self) -> str:
@@ -165,6 +168,10 @@ class SearchRunTask:
 
     # --- construction ------------------------------------------------------
     def _classes(self) -> list[str]:
+        if self.cfg.dataset == "release":
+            raise NotImplementedError(
+                "dataset='release' is text-cued (owner 2026-11-25: no class-index cue); the search model has no "
+                "text encoder yet, so it cannot be built on the release. Only its loaders exist so far.")
         if self.classes is None:
             from .data import coco_search18_classes
             self.classes = coco_search18_classes(self.cfg.data_root)
@@ -211,6 +218,9 @@ class SearchRunTask:
         return [ViewpointType.FULL]  # t0 = the centred fixation, as in the human trials and Haoze
 
     def build_val_loader(self):
+        if self.cfg.dataset == "release":
+            from .release import make_release_val_loader
+            return make_release_val_loader(self.cfg)
         from .data import make_search_val_loader
         loader, self.classes = make_search_val_loader(self.cfg)
         return loader
@@ -218,9 +228,29 @@ class SearchRunTask:
     def build_loaders(self, *, world_size, rank):
         if world_size > 1:
             raise RuntimeError("search does not support DDP yet: its loader cannot shard by rank.")
+        if self.cfg.dataset == "release":
+            from .release import make_release_loaders
+            self._check_release_resume(world_size)
+            self._world_size = world_size
+            return make_release_loaders(self.cfg, world_size=world_size, rank=rank, start_step=self._start_step)
         from .data import make_search_loaders
         train, val, self.classes = make_search_loaders(self.cfg)
         return train, val
+
+    def _release_schedule(self, world_size: int) -> dict:
+        """What fixes the release's trial stream: a resume continues it only under the same values."""
+        from .release import release_meta
+        return {"release": release_meta(self.cfg.release_dir)["name"], "seed": self.cfg.seed,
+                "ddp_world_size": world_size, "batch_size": self.cfg.batch_size}
+
+    def _check_release_resume(self, world_size: int) -> None:
+        if self._resume_saved is None:
+            return
+        current = self._release_schedule(world_size)
+        saved = {k: self._resume_saved.get(k) for k in current}
+        if saved != current:
+            raise RuntimeError(f"search release resume: the trial stream was {saved}, this run gives {current}; "
+                               "resuming would skip or repeat trials. Seed from the checkpoint to start a new stream.")
 
     def _random_selector(self) -> RandomSelector:
         return RandomSelector(is_foveated=True, foveated_scale=self.cfg.foveated_scale, min_viewpoint_scale=0.05)
@@ -275,9 +305,15 @@ class SearchRunTask:
         return groups
 
     def resume_start_step(self, payload, scheduler):
+        if self.cfg.dataset == "release":
+            # The release's trial stream resumes at position step x batch_size (release.EpochStream).
+            self._resume_saved = (payload.get("metadata") or {}).get("resume_state") or {}
+            self._start_step = scheduler.last_epoch
         return scheduler.last_epoch
 
     def resume_state(self):
+        if self.cfg.dataset == "release" and self._world_size is not None:
+            return self._release_schedule(self._world_size)
         return {}
 
     # --- per-batch ---------------------------------------------------------
@@ -515,6 +551,11 @@ class SearchRunTask:
         keys = ("kl", "tpos", "tneg", "fpos", *crit, *(f"correct_{c}" for c in crit))
         sums = {p: {k: [0.0] * T for k in keys} for p in policies}
         n_tp = n_ta = 0
+        # Release val only (batch["band"]): the last glimpse's metrics per class-size band (release spec 5).
+        from .release import BANDS
+        band_sums = {p: [dict.fromkeys(("n", "n_tp", "presence_ok", *crit, *(f"correct_{c}" for c in crit)), 0.0)
+                         for _ in BANDS] for p in policies}
+        has_bands = False
         has_presence = False
         do_viz = run_dir is not None and bool(self.cfg.viz_every) and step % self.cfg.viz_every == 0
         n = 0
@@ -562,6 +603,10 @@ class SearchRunTask:
                         s["tpos"][t] += (said & present).float().sum().item()
                         s["tneg"][t] += (~said & ~present).float().sum().item()
                         s["fpos"][t] += (said & ~present).float().sum().item()
+                    if "band" in batch:
+                        has_bands = True
+                        self._accumulate_bands(band_sums[p], batch["band"].to(device), present=present,
+                                               pres=pres[T - 1], chk=chk, reached=reached, crit=crit, last=T - 1)
                     if record:
                         try:  # a diagnostic: a plotting failure must never abort validation
                             self._save_episode(record, batch=batch, run_dir=run_dir,
@@ -591,6 +636,18 @@ class SearchRunTask:
                     full[f"specificity_t{t}_{p}"] = tneg / max(n_ta, 1)
                     full[f"precision_t{t}_{p}"] = prec
                     full[f"f1_t{t}_{p}"] = 2 * prec * rec / (prec + rec) if prec + rec > 0 else 0.0
+        band_keys: list[str] = []
+        if has_bands:
+            for p in policies:
+                for name, bs in zip(BANDS, band_sums[p]):
+                    for c in crit:
+                        full[f"{c}_t{T - 1}_{p}_band{name}"] = bs[c] / max(bs["n_tp"], 1)
+                        full[f"correct_{c}_t{T - 1}_{p}_band{name}"] = bs[f"correct_{c}"] / max(bs["n"], 1)
+                    if has_presence:
+                        full[f"presence_acc_t{T - 1}_{p}_band{name}"] = bs["presence_ok"] / max(bs["n"], 1)
+                    full[f"n_trials_band{name}"] = bs["n"]
+            band_keys = [k for k in full if "_band" in k and k.split("_t")[0] in ("found", "correct_found",
+                                                                                  "presence_acc", "n")]
         if run_dir is not None:
             import json
             from pathlib import Path
@@ -601,8 +658,27 @@ class SearchRunTask:
             tracker.log_metrics({f"overview/{k}": v for k, v in self._overview(full, T, pct).items()}, step=step)
         per_glimpse = {"loss", "found", "hit", "correct_found", "presence_acc"}
         # ordered by metric, then fixation rule, then glimpse (W&B shows panels in log order)
-        return {f"{k}_t{t}_{p}": full[f"{k}_t{t}_{p}"]
-                for k in names for p in policies for t in range(T) if k in per_glimpse or t == T - 1}
+        out = {f"{k}_t{t}_{p}": full[f"{k}_t{t}_{p}"]
+               for k in names for p in policies for t in range(T) if k in per_glimpse or t == T - 1}
+        return out | {k: full[k] for k in band_keys}
+
+    @staticmethod
+    def _accumulate_bands(bsums: list[dict], band: Tensor, *, present: Tensor, pres: Tensor | None,
+                          chk: dict, reached: dict, crit: dict, last: int) -> None:
+        """Per class-size band, the counts behind the last glimpse's ``found`` / ``hit`` (both criteria),
+        ``correct_*`` and ``presence_acc``, by the same rules as the overall metrics in ``evaluate``."""
+        said = pres > 0 if pres is not None else None
+        for g, bs in enumerate(bsums):
+            m = band == g
+            bs["n"] += m.sum().item()
+            bs["n_tp"] += (m & present).sum().item()
+            for c, (k, cumulative) in crit.items():
+                ok = (reached[c] if cumulative else chk[k][last]) & present
+                bs[c] += (ok & m).sum().item()
+                corr = ok if said is None else (ok & said) | (~said & ~present)
+                bs[f"correct_{c}"] += (corr & m).sum().item()
+            if said is not None:
+                bs["presence_ok"] += ((said == present) & m).sum().item()
 
     @staticmethod
     def _overview(full: dict[str, float], T: int, pct: str) -> dict[str, float]:

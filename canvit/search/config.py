@@ -68,6 +68,17 @@ class SearchAugConfig:
 @dataclass
 class SearchConfig:
     # --- data ------------------------------------------------------------------
+    dataset: Literal["coco_search18", "release"] = "coco_search18"
+    """``coco_search18``: the class-cued COCO-Search18 path (``data_root``, ``split``, ``condition``).
+    ``release``: a curated search release of get_datasets (``release_dir``; ``release.py``): text-cued
+    trials, half of them target-absent; its training order is fixed by (``seed``, epoch, position)."""
+    release_dir: Path = Path("/user/henrich1/u25995/jonathan/datasets/visual_search/search_release/basic-v1")
+    """``dataset='release'``: the release folder (its ``README.md`` is the spec). A new release = a new folder."""
+    visual_prompts: bool = False
+    """Samples also carry the trial's visual prompt (``vp_feat`` [14, 768], ``vp_cov`` [14], ``vp_valid``; spec
+    section 7 of a release with visual prompts, read from ``release_dir``). ``release``: the sampler's / val's
+    ``vp_idx``. ``coco_search18``: evaluation only, a fixed prompt per trial from ``release_dir``'s ``vp_test``
+    (training on COCO-Search18 with it is refused). Off: samples exactly as without visual prompts."""
     data_root: Path = field(default_factory=_default_data_root)
     """COCO-Search18 root in the restructured layout: ``images/<name>.jpg`` (flat) +
     ``fixations/*.json`` (``data.py``). The padded release (Haoze's setting), not ``_nopadding``."""

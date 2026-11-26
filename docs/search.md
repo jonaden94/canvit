@@ -47,10 +47,56 @@ python -m canvit.harness.evaluate search --opts.ckpt <run>/checkpoints/best.pt -
   deduplicated over the 10 subjects: 2163 train / 326 val pairs.
 - **Target-absent:** `fixations/coco_search18_fixations_TA_trainval.json`: 2163 / 326 pairs.
   Only for split 1.
-- **Batches:** a batch dict holds `image`, `target` (cue), `boxes` (xyxy in [-1, 1], NaN padded)
-  and `present`.
+- **Batches:** a batch dict holds `image`, `target` (cue), `boxes` (xyxy in [-1, 1], NaN padded),
+  `present` and `text` (the category name, for the text-cued path).
 - **Augmentation:** default is h-flip plus a random crop that always keeps the whole target
   box. The rest is optional.
+- **Unpadded COCO-Search18** (`datasets/visual_search/coco_search18_nopadding`, the COCO originals
+  with mapped boxes) has the same layout and loads through the same adapter with
+  `--cfg.data-root <that folder>`; it is letterboxed like every other picture.
+
+### Curated release (`--cfg.dataset release`, `release.py`): loader only, no model yet
+
+The visual-search training set built by get_datasets, read from a frozen release folder
+(`--cfg.release-dir`, default `datasets/visual_search/search_release/basic-v1`; the spec is the
+folder's `README.md`). The cue of a trial is its **text** (`batch["text"]`, a list of str); there
+is no class index. The search model has no text encoder yet, so building a model on the release
+is refused; only the loaders exist.
+
+- **Pictures:** one `os.pread` per picture from the pack shards, PIL `draft` (decoded no smaller
+  than the scene needs), the release's orientation fix. Same scene transform as COCO-Search18.
+- **Training order:** the release's reference epoch sampler, vendored as `release_sampler.py`
+  (reproduces the reference epochs row for row; `test_release.py`). An epoch (~349k trials, half
+  target-absent) is built in the main process (~9 GB of RAM, ~16 s); the epochs follow each other
+  as one endless stream, fixed by `--cfg.seed`. A resume at step s continues at trial
+  s x batch_size of that stream. Each rank takes `trials[rank::world]` (DDP itself is still off
+  for search).
+- **Workers** are spawned, not forked (a forked worker would copy the 9 GB sampler). Throughput
+  with the default augmentation at 512 px: ~30 samples/s per worker, 390 with 16 workers.
+- **Validation:** all of `val.parquet` (7,364 present + 7,364 absent trials); the last glimpse's
+  `found`, `correct_found` and `presence_acc` also per class-size band
+  (`..._band{lt10,10-99,100-299,300-999,1k-10k,ge10k}`, n = training examples of the class).
+
+### Visual prompts (`--cfg.visual-prompts`): loader only
+
+On a release with visual prompts (from `basic-v2` on; spec section 7 of its README), every sample also carries
+the trial's visual prompt: `vp_feat` [14, 768] (DINOv3 ViT-B cell features of another instance of the prompt, from
+another picture: 1x1, 2x2 and 3x3 grids on its mask's box), `vp_cov` [14] (mask coverage per cell) and `vp_valid`
+(about 77 % of trials have one; otherwise zeros). Training trials take the sampler's `vp_idx`, val the fixed one of
+`val.parquet`. `vp_features.npy` is read by mmap in each worker. On COCO-Search18 the flag is for evaluation only:
+each trial gets a fixed prompt of its category from the release's `vp_test` (the box with the smallest
+`blake2b(f"{image}|{category}|{box_id}", digest_size=8)`); training on COCO-Search18 with it is refused. Off (the
+default), samples are exactly as before.
+
+### Text encoder (`text_encoder.py`): built, not wired into the model yet
+
+`TextEncoder()(batch["text"]) -> [B, 768]`: Talk2DINO for DINOv3 ViT-B, frozen. CLIP ViT-B/16's text tower
+(OpenAI's weights via the transformers port `openai/clip-vit-base-patch16`, HF cache) and Talk2DINO's projection
+(`dino_stuff/Talk2DINO/weights/dinov3_vitb_mlp_infonce.pth`, sha256-checked) to the DINOv3 ViT-B patch-feature
+space (Talk2DINO was trained against the same DINOv3 weights as our teacher). Computed every step in fp32 without
+gradients, ~7 ms per batch of 16-64 texts on an A100; `cache=True` keeps each distinct text's vector. Not
+normalised. COCO-Search18 batches carry `text` = the category name, so the zero-shot test uses the same path.
+How the vector conditions the head and the policy is not decided yet.
 
 ## Task head (`head.py`)
 
@@ -129,6 +175,9 @@ Task config, `--cfg.<name>` (dashes, e.g. `--cfg.presence-loss ce`):
 | option | default | choices / meaning |
 |---|---|---|
 | `model_repo` | required | the foveated backbone |
+| `dataset` | `coco_search18` | `release` = the curated release (`release_dir`); loader only so far |
+| `release_dir` | `.../search_release/basic-v1` | the release folder |
+| `visual_prompts` | False | samples carry `vp_feat` / `vp_cov` / `vp_valid` (release with visual prompts; COCO-Search18: eval only) |
 | `retina` | None | a multi-retina backbone is used through this one retina (fixed for training and eval), by name, e.g. `cmf0.75_res65_cps6`; required for such a backbone, refused otherwise. The same option exists for `ade20k` and `in1k` |
 | `condition` | `both` | `tp` = target-present only (no presence head) |
 | `split` | 1 | 2 = the dataset's split2 (needs `condition tp`) |
@@ -181,6 +230,7 @@ for search.
 ## Refused combinations (error with the reason)
 
 - `vpg` for search; a non-foveated backbone; more than 1 GPU.
+- A model on `dataset release` (text cue, no text encoder yet).
 - `reward fractional/difference` with `supervise last`.
 - `condition both` with `split 2`.
 - PG with a BatchNorm policy network plus eval-mode selection.

@@ -6,6 +6,7 @@ Every sample is a dict:
     target:  long  []         class index into ``classes`` (the cue)
     boxes:   float [N, 4]     target boxes, scene-normalised [-1, 1] xyxy
     present: bool  []         target present (N >= 1) or absent (N == 0)
+    text:    str              the category name (the text cue of the prompt-cued path)
 
 A new search dataset needs only an adapter that produces this; nothing downstream (head,
 loss, policy, eval) reads anything dataset-specific.
@@ -57,6 +58,8 @@ class SearchRecord:
     path: Path
     target: int
     bbox_xywh: tuple[float, float, float, float] | None  # image pixels; None = target absent
+    text: str = ""  # the category name: the text cue of the prompt-cued (zero-shot) path
+    vp_idx: int = -1  # zero-shot test with visual prompts: a fixed vp_test box of the category (release.py)
 
 
 COCO_SEARCH18_CLASSES = (
@@ -102,7 +105,7 @@ def load_coco_search18(root: Path, *, split: int, part: str, classes: list[str])
             raise ValueError(f"{path.name}: {key} has two different target boxes {prev} vs {bbox}")
     pairs = sorted(by_pair.items())
     paths = _image_paths(root, [k for k, _ in pairs], "target-present")
-    records = [SearchRecord(path=path, target=cls_idx[task], bbox_xywh=bbox)  # type: ignore[arg-type]
+    records = [SearchRecord(path=path, target=cls_idx[task], bbox_xywh=bbox, text=task)  # type: ignore[arg-type]
                for path, ((_, task), bbox) in zip(paths, pairs)]
     log.info("COCO-Search18 split%d %s: %d trials -> %d (image, target) pairs",
              split, part, len(trials), len(records))
@@ -122,7 +125,7 @@ def load_coco_search18_ta(root: Path, *, split: int, part: str, classes: list[st
     cls_idx = {c: i for i, c in enumerate(classes)}
     pairs = sorted({(tr["name"], tr["task"]) for tr in trials})
     paths = _image_paths(root, pairs, "target-absent")
-    records = [SearchRecord(path=path, target=cls_idx[task], bbox_xywh=None)
+    records = [SearchRecord(path=path, target=cls_idx[task], bbox_xywh=None, text=task)
                for path, (_, task) in zip(paths, pairs)]
     log.info("COCO-Search18 TA %s: %d trials -> %d (image, target) pairs", part, len(trials), len(records))
     return records
@@ -191,10 +194,12 @@ def letterbox_hw(h: int, w: int, scene: int) -> tuple[int, int]:
 class SearchDataset(Dataset):
     """Records -> the sample contract. ``aug=None`` = validation (deterministic)."""
 
-    def __init__(self, records: list[SearchRecord], *, scene_size: int, aug: SearchAugConfig | None):
+    def __init__(self, records: list[SearchRecord], *, scene_size: int, aug: SearchAugConfig | None,
+                 visual_prompts=None):
         self.records = records
         self.scene = scene_size
         self.aug = aug
+        self.visual_prompts = visual_prompts  # release.VisualPrompts: adds vp_feat / vp_cov / vp_valid
 
     def __len__(self) -> int:
         return len(self.records)
@@ -230,6 +235,15 @@ class SearchDataset(Dataset):
         rec = self.records[i]
         img, boxes = self._load(rec)
         img, boxes = self._transform(img, boxes)
+        image, b = self._scene(img, boxes)
+        out = {"image": image, "target": torch.tensor(rec.target, dtype=torch.long),
+               "boxes": b, "present": torch.tensor(rec.bbox_xywh is not None), "text": rec.text}
+        if self.visual_prompts is not None:
+            out.update(self.visual_prompts.sample(rec.vp_idx))
+        return out
+
+    def _scene(self, img, boxes) -> tuple[Tensor, Tensor]:
+        """The transformed image and boxes -> the normalised, letterboxed scene and scene-normalised boxes."""
         ch, cw = img.shape[-2:]
         top, left = (self.scene - ch) // 2, (self.scene - cw) // 2
         # Letterbox: zero (black) padding, as the dataset's own 1680x1050 padding and Haoze's.
@@ -239,23 +253,47 @@ class SearchDataset(Dataset):
         b[:, [1, 3]] = (b[:, [1, 3]].clamp(0, ch) + top) / self.scene * 2 - 1
         image = TF.normalize(TF.to_dtype(img, torch.float32, scale=True),
                              mean=list(IMAGENET_DEFAULT_MEAN), std=list(IMAGENET_DEFAULT_STD))
-        return {"image": image.as_subclass(Tensor), "target": torch.tensor(rec.target, dtype=torch.long),
-                "boxes": b, "present": torch.tensor(rec.bbox_xywh is not None)}
+        return image.as_subclass(Tensor), b
 
 
 def collate_search(batch: list[dict]) -> dict:
     """Stack images/targets/present; pad ``boxes`` to the batch max with NaN rows (at least
-    one row, so an all-absent batch still has a ``[B, 1, 4]`` tensor)."""
+    one row, so an all-absent batch still has a ``[B, 1, 4]`` tensor). Optional keys, present
+    only when the dataset gives them: ``target`` (COCO-Search18's class cue), ``text`` (a list
+    of str: the release's prompt text, COCO-Search18's category name), ``band`` (release val:
+    class-size band) and the visual prompt's ``vp_feat`` / ``vp_cov`` / ``vp_valid``."""
     n = max(1, max(s["boxes"].shape[0] for s in batch))
     boxes = torch.full((len(batch), n, 4), math.nan)
     for i, s in enumerate(batch):
         boxes[i, : s["boxes"].shape[0]] = s["boxes"]
-    return {"image": torch.stack([s["image"] for s in batch]),
-            "target": torch.stack([s["target"] for s in batch]), "boxes": boxes,
-            "present": torch.stack([s["present"] for s in batch])}
+    out = {"image": torch.stack([s["image"] for s in batch])}
+    if "target" in batch[0]:
+        out["target"] = torch.stack([s["target"] for s in batch])
+    out.update(boxes=boxes, present=torch.stack([s["present"] for s in batch]))
+    if "text" in batch[0]:
+        out["text"] = [s["text"] for s in batch]
+    for k in ("band", "vp_feat", "vp_cov", "vp_valid"):
+        if k in batch[0]:
+            out[k] = torch.stack([s[k] for s in batch])
+    return out
+
+
+def _with_test_prompts(cfg: SearchConfig, recs: list[SearchRecord]):
+    """Zero-shot test with visual prompts: each record's fixed ``vp_test`` prompt (``release.coco_test_prompts``)
+    and the reader of the release's features. ``(recs, None)`` with visual prompts off."""
+    if not cfg.visual_prompts:
+        return recs, None
+    from dataclasses import replace
+
+    from .release import VisualPrompts, coco_test_prompts
+    vps = coco_test_prompts(cfg.release_dir, [(r.path.name, r.text) for r in recs])
+    return [replace(r, vp_idx=v) for r, v in zip(recs, vps)], VisualPrompts(cfg.release_dir)
 
 
 def make_search_loaders(cfg: SearchConfig) -> tuple[DataLoader, DataLoader, list[str]]:
+    if cfg.visual_prompts:
+        raise ValueError("COCO-Search18 has visual prompts for the zero-shot TEST only (the release's vp_test); "
+                         "training on it with --cfg.visual-prompts is refused. Evaluate with harness.evaluate.")
     classes = coco_search18_classes(cfg.data_root)
     train = SearchDataset(load_records(cfg, "train", classes), scene_size=cfg.scene_size, aug=cfg.aug)
     val = SearchDataset(load_records(cfg, "valid", classes), scene_size=cfg.scene_size, aug=None)
@@ -268,6 +306,7 @@ def make_search_loaders(cfg: SearchConfig) -> tuple[DataLoader, DataLoader, list
 
 def make_search_val_loader(cfg: SearchConfig) -> tuple[DataLoader, list[str]]:
     classes = coco_search18_classes(cfg.data_root)
-    val = SearchDataset(load_records(cfg, "valid", classes), scene_size=cfg.scene_size, aug=None)
+    recs, vp = _with_test_prompts(cfg, load_records(cfg, "valid", classes))
+    val = SearchDataset(recs, scene_size=cfg.scene_size, aug=None, visual_prompts=vp)
     return (DataLoader(val, batch_size=cfg.eval_batch_size, shuffle=False, num_workers=cfg.num_workers,
                        pin_memory=True, collate_fn=collate_search), classes)
