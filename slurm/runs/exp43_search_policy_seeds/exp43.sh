@@ -13,14 +13,19 @@
 #     target-present trials + presence focal loss, supervised at EVERY glimpse (needed for the
 #     per-glimpse reward); reward on target-present trials only; 4 glimpses; Haoze's
 #     augmentations; head AdamW = the policy's (lr 4e-4 constant, betas 0.9/0.999, wd 1e-4, no
-#     warmup); 10,000 steps, validation every 500 (random / greedy /
-#     policy fixations, 9 retinas each; best.pt = found_t3_policy averaged over the retinas).
+#     warmup); 5,000 steps (was 10,000; 2026-11-26), validation every 500 and of the final weights
+#     (random / greedy / policy fixations, 9 retinas each; best.pt = found_t3_policy averaged over
+#     the retinas); a resumable checkpoint at every validation (search default, keep 1) and a
+#     spare array task, so a time limit costs at most one interval and never restarts the run.
 #   vs Valentin's model (exp39 mr-r0-base-s0): backbone 253,952 -> 360,448; one retina -> all 9;
 #     head + policy 64/2/6 -> 64/3/3; terminal -> per-glimpse reward; supervise last -> every;
 #     entropy 2.11 -> 4.0; policy and head optimizer -> exp42's; batch 16 -> 64; 20k -> 10k
 #     steps; fp32 V100 -> bf16 A100.
 #
 # 2026-11-25 evening: + PG arms with entropy target 5.0 and 6.0 (ENT=5.0|6.0), else identical.
+# 2026-11-26: all 20 runs completed to 5,000 steps (main with validate-at-end + ckpt-at-eval):
+#   runs that had step-5000.pt got a validation-only job, step-4501 runs were resumed to 5,000,
+#   runs without a resumable checkpoint were rerun (record: canvit_claude plan + STATUS).
 # Submit: [ENT=5.0] ARM=pg SEED=1 TRAIN_COMMIT=<sha> bash slurm/runs/exp43_search_policy_seeds/exp43.sh
 set -euo pipefail
 
@@ -31,11 +36,11 @@ SEED="${SEED:-1}"
 ENT="${ENT:-4.0}"             # PG entropy target; 4.0 = the original arms (names unchanged)
 SUFFIX=""; [ "$ENT" != "4.0" ] && SUFFIX="-e$ENT"
 RUN_NAME=exp43-search-$ARM$SUFFIX-s$SEED
-STEPS_PER_JOB="${STEPS_PER_JOB:?STEPS_PER_JOB=5000 (smoke 2026-11-25: 0.82 s per step, 110 s per 9-retina validation)}"
-MAX_STEPS="${MAX_STEPS:-10000}"   # 2026-11-26 reruns: MAX_STEPS=4501 STEPS_PER_JOB=4501 (one job; LR constant, so = the first 4,500 steps of 10k; last validation at 4,500)
+MAX_STEPS="${MAX_STEPS:-5000}"
+STEPS_PER_JOB="${STEPS_PER_JOB:-5000}"   # ~2 h 30 min on production A100s (val 250-300 s, not the smoke's 110 s)
 N_JOBS=$(( (MAX_STEPS + STEPS_PER_JOB - 1) / STEPS_PER_JOB ))
-ARRAY="${ARRAY:-0-$((N_JOBS - 1))%1}"
-TIME="${TIME:-0-02:00:00}"
+ARRAY="${ARRAY:-0-${N_JOBS}%1}"          # one spare task: resumes after a time limit, else exits at once
+TIME="${TIME:-0-03:00:00}"
 MEM=64G
 NGPU=1                        # search is single-GPU only
 TASK=search
