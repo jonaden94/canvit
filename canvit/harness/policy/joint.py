@@ -58,8 +58,8 @@ class SaccadeCost:
     consecutive glimpse centres in the [-1, 1] centre units (scene width = 2).
 
     ``log``: c(d) = log(1 + d / r); r defaults to half a policy-grid cell (= 1 / centers_per_axis),
-    ``--rl.saccade-cost-r`` fixes it independent of the grid.
-    ``linear``: c(d) = d / 2, the fraction of the scene width. ``none``: no cost (default).
+    ``--rl.saccade-cost-r`` fixes it independent of the grid; a large r makes it linear in d.
+    ``none``: no cost (default).
 
     ``combine='standardized'``: target_t = std(R) - weight * z_batch(c_t), where std(R) is
     the reward as the resolved ``RewardSpec`` centres/scales it; unit-free, so ``weight``
@@ -67,13 +67,13 @@ class SaccadeCost:
     reward units, target_t = std(R - weight * sum_t c_t) for a terminal reward and
     target_t = std(r_t - weight * c_t) for a per-glimpse reward r_t."""
 
-    form: Literal["none", "log", "linear"] = "none"
+    form: Literal["none", "log"] = "none"
     weight: float = 0.0
     combine: Literal["standardized", "raw"] = "standardized"
     r: float = 1.0 / 32
     std_eps: float = 1e-2
     """Floor on the batch std of c_t in the ``standardized`` combination (cost units; the log
-    cost's batch std is ~1, the linear one's ~0.2)."""
+    cost's batch std is ~1 at r = 1/32)."""
     conditioned: bool = False
     """Stage 2 (``saccade_cost_beta_mode='conditioned'``): each trial draws its own
     beta ~ U[0, weight], the policy sees :meth:`features` (beta) next to its FiLM cue, and
@@ -98,10 +98,8 @@ class SaccadeCost:
         return torch.stack([beta, torch.log1p(beta / 0.1)], dim=-1)
 
     def cost(self, d: Tensor) -> Tensor:
-        if self.form == "log":
-            return torch.log1p(d / self.r)
-        assert self.form == "linear", f"no cost for form={self.form!r}"
-        return d / 2.0
+        assert self.form == "log", f"no cost for form={self.form!r}"
+        return torch.log1p(d / self.r)
 
 
 BETA_FEATURES = 2

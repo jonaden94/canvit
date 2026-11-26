@@ -141,12 +141,12 @@ class JointPolicyConfig:
     # Optional per-saccade cost (objective='pg' with any reward, 'qreg'; refused for 'vpg').
     # d = Euclidean distance between consecutive glimpse centres in [-1, 1] units (scene width 2;
     # the first saccade starts at t0's scene centre). "none" (default) leaves every run unchanged.
-    saccade_cost: Literal["none", "log", "linear"] = "none"
+    saccade_cost: Literal["none", "log"] = "none"
     """``log``: c(d) = log(1 + d / r), r = ``saccade_cost_r`` (default: half a policy-grid cell) — the
-    form that fits human saccade lengths best post hoc. ``linear``: c(d) = d / 2, the fraction of
-    the scene width. ``none``: no cost, nothing measured."""
+    form that fits human saccade lengths best post hoc; with a large r it is linear in d (the
+    separate ``linear`` form was dropped 2026-11-26, Valentin). ``none``: no cost, nothing measured."""
     saccade_cost_r: float | None = None
-    """``log`` only: r in scene units ([-1, 1], scene width 2). None (default) = half a policy-grid
+    """r of the ``log`` cost in scene units ([-1, 1], scene width 2). None (default) = half a policy-grid
     cell, 1 / centers_per_axis (1/32 on a 32x32 grid, 1/8 on 8x8); set it to keep the cost's
     shape fixed across grids."""
     saccade_cost_weight: float = 0.0

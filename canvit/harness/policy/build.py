@@ -132,7 +132,7 @@ def build_policy(
             f"saccade_cost={rl.saccade_cost!r} is implemented for objective='pg' (any reward) and "
             f"'qreg', not {rl.objective!r}: VPG's learned V(s) baseline predicts the terminal reward only.")
     if not saccade_cost.active and rl.saccade_cost_weight != 0.0:
-        raise ValueError("saccade_cost_weight is set but saccade_cost='none': choose 'log' or 'linear'.")
+        raise ValueError("saccade_cost_weight is set but saccade_cost='none': choose 'log'.")
     if conditioned:
         # Stage 2: beta rides on the FiLM cue, so only a FiLM-conditioned scorer (search) can see it.
         if not saccade_cost.active or rl.saccade_cost_weight <= 0.0 or rl.saccade_cost_combine != "standardized":

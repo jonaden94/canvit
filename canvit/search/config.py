@@ -199,9 +199,9 @@ def search_policy_config() -> JointPolicyConfig:
         entropy_alpha_min=1e-6,
         entropy_alpha_max=0.1,
         entropy_update="per_rollout",
-        # Saccade cost off (the default). Stage 1 (fixed beta): --rl.saccade-cost {log,linear}
-        # --rl.saccade-cost-weight {0,0.1,0.3,1.0} (combine 'standardized'). Stage 2 (one
-        # beta-conditioned policy per form): --rl.saccade-cost-beta-mode conditioned
+        # Saccade cost off (the default). Stage 1 (fixed beta): --rl.saccade-cost log
+        # [--rl.saccade-cost-r R] --rl.saccade-cost-weight {0,0.1,0.3,1.0} (combine 'standardized').
+        # Stage 2 (one beta-conditioned policy): --rl.saccade-cost-beta-mode conditioned
         # --rl.saccade-cost-weight 1.0 (beta ~ U[0, 1]) [--rl.saccade-cost-beta-eval 0.3].
         saccade_cost="none",
     )

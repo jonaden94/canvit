@@ -44,7 +44,7 @@ def _loss_and_grad(jp: JointPolicy, scores: torch.Tensor, **kw):
 
 
 @pytest.mark.parametrize("with_mask", [False, True])
-@pytest.mark.parametrize("form", ["log", "linear"])
+@pytest.mark.parametrize("form", ["log"])  # the linear form was dropped 2026-11-26 (Valentin)
 def test_no_cost_or_zero_weight_is_the_historical_loss_bit_for_bit(with_mask, form):
     scores, flat_idx, reward, saccade_len, mask = _batch()
     kw = {"flat_idx": flat_idx, "reward": reward} | ({"mask": mask} if with_mask else {})
@@ -67,7 +67,7 @@ def _targets(monkeypatch, jp: JointPolicy, **kw) -> torch.Tensor:
     return torch.stack(seen, dim=1)  # [B, T]
 
 
-@pytest.mark.parametrize("form", ["log", "linear"])
+@pytest.mark.parametrize("form", ["log"])  # the linear form was dropped 2026-11-26 (Valentin)
 def test_a_positive_weight_lowers_the_target_of_long_saccades(monkeypatch, form):
     scores, flat_idx, reward, saccade_len, _ = _batch()
     kw = {"scores": scores, "flat_idx": flat_idx, "reward": reward, "saccade_len": saccade_len}
@@ -95,7 +95,8 @@ def test_cost_forms():
     d = torch.tensor([0.0, 1 / 32, 2.0])
     assert torch.allclose(SaccadeCost("log", r=1 / 32).cost(d), torch.log1p(d * 32))
     assert torch.allclose(SaccadeCost("log", r=1 / 32).cost(d)[1], torch.tensor(2.0).log())  # d = r -> log 2
-    assert torch.allclose(SaccadeCost("linear").cost(d), torch.tensor([0.0, 1 / 64, 1.0]))
+    # a large r makes the log cost linear in d: r * log1p(d / r) -> d
+    assert torch.allclose(1e4 * SaccadeCost("log", r=1e4).cost(d), d, atol=1e-3)
 
 
 # --------------------------------------------------------------------------- #
@@ -132,7 +133,7 @@ def test_rollout_with_zero_weight_trains_exactly_as_without_and_logs_saccades(se
 @pytest.mark.parametrize("kw, match", [
     # VPG: its learned V(s) predicts the terminal reward; a per-step cost has no value target yet.
     ({"objective": "vpg", "reward_center": "default", "reward_scale": "default"}, "not 'vpg'"),
-    ({"saccade_cost": "linear"}, "saccade_cost_r is the log cost's scale"),  # r with linear
+    ({"saccade_cost": "none", "saccade_cost_weight": 0.0}, "saccade_cost_r is the log cost's scale"),  # r, no cost
     ({"saccade_cost_r": 0.0}, "saccade_cost_r is the log cost's scale"),
 ])
 def test_the_cost_is_refused_where_it_is_not_defined(seg, kw, match):
@@ -152,7 +153,7 @@ def test_a_weight_without_a_form_is_refused(seg):
 # Stage 2: a beta-conditioned policy (per-trial beta). Written by Claude (AI, Claude Opus 5.5), 2026-11-25.
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("with_mask", [False, True])
-@pytest.mark.parametrize("form", ["log", "linear"])
+@pytest.mark.parametrize("form", ["log"])  # the linear form was dropped 2026-11-26 (Valentin)
 def test_a_constant_per_trial_beta_is_the_fixed_beta_bit_for_bit(with_mask, form):
     scores, flat_idx, reward, saccade_len, mask = _batch()
     kw = {"flat_idx": flat_idx, "reward": reward, "saccade_len": saccade_len} | ({"mask": mask} if with_mask else {})
@@ -270,7 +271,7 @@ def _glimpse_targets(monkeypatch, jp: JointPolicy, **kw) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("objective, with_mask", [("pg", False), ("pg", True), ("qreg", False)])
-@pytest.mark.parametrize("form", ["log", "linear"])
+@pytest.mark.parametrize("form", ["log"])  # the linear form was dropped 2026-11-26 (Valentin)
 def test_glimpse_path_zero_weight_is_the_historical_loss_bit_for_bit(objective, with_mask, form):
     scores, flat_idx, reward, saccade_len, mask = _glimpse_batch()
     kw = {"flat_idx": flat_idx, "reward": reward} | ({"mask": mask} if with_mask else {})
@@ -284,7 +285,7 @@ def test_glimpse_path_zero_weight_is_the_historical_loss_bit_for_bit(objective, 
 
 
 @pytest.mark.parametrize("objective", ["pg", "qreg"])
-@pytest.mark.parametrize("form", ["log", "linear"])
+@pytest.mark.parametrize("form", ["log"])  # the linear form was dropped 2026-11-26 (Valentin)
 def test_glimpse_path_a_positive_weight_lowers_long_saccade_targets(monkeypatch, objective, form):
     scores, flat_idx, reward, saccade_len, _ = _glimpse_batch()
     kw = {"scores": scores, "flat_idx": flat_idx, "reward": reward, "saccade_len": saccade_len}
