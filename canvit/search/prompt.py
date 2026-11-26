@@ -14,6 +14,8 @@ Owner decisions of 2026-11-26 (``canvit_claude/canvit/search/04-prompt-condition
   confirmed by the owner): the local stream reads the tokens through a Flamingo-style gated cross-attention before
   every block, ``x + tanh(alpha) * XAttn(LN(x), tokens)`` with ``alpha`` = 0 at init, rather than by appending
   them to the self-attention sequence; only the gate makes "the pretrained model starts unchanged" exact.
+  ``token_mode='prefix'`` (owner 2026-11-26): LLaMA-Adapter instead (``PromptPrefix``), the block's own
+  self-attention also attends to the tokens through a separate, zero-gated softmax.
 - Both attach to ``canvit.backbone.blocks`` through forward hooks (``PromptConditioning.attach``): ``canvit.core`` is
   not edited, the backbone's checkpoint keys stay, and the prompt's parameters live under ``prompt.*`` of the search
   model. The batch's prompt is set as a context (``with conditioning.use(prompt): ...``) around the backbone calls;
@@ -163,11 +165,53 @@ class GatedPromptXAttn(nn.Module):
         return x + torch.tanh(self.alpha).to(x.dtype) * self.out(att.transpose(1, 2).reshape(b, n, d)).to(x.dtype)
 
 
-class PromptConditioning(nn.Module):
-    """AdaLN (``adaln``) and gated prompt tokens (``tokens``), per backbone block, attached by forward hooks."""
+class PromptPrefix(nn.Module):
+    """LLaMA-Adapter-style prompt prefix for ONE backbone block (Zhang et al. 2023, zero-init attention).
 
-    def __init__(self, *, dim: int, num_heads: int, n_blocks: int, adaln: bool, tokens: TokenOption):
+    The block's self-attention queries also attend to the prompt tokens, in a SEPARATE softmax, scaled per head by
+    a gate initialised at 0 and added to the attention output before its output projection:
+    ``proj(Attn(q, k, v) + g * Attn(q, k_p, v_p))``. The tokens are not sequence tokens (nothing updates them).
+    ``k_p, v_p`` = the block's OWN (live) k / v projections of ``LN(A tokens)``, with ``A`` a per-block Linear
+    (identity at init) and a fresh LayerNorm: LLaMA-Adapter's per-layer prompt through the layer's projections,
+    here starting from the shared prompt tokens. No RoPE on the prompt keys (they have no position)."""
+
+    def __init__(self, *, dim: int, num_heads: int):
         super().__init__()
+        self.adapt = nn.Linear(dim, dim)
+        nn.init.eye_(self.adapt.weight)
+        nn.init.zeros_(self.adapt.bias)
+        self.norm = nn.LayerNorm(dim)
+        self.gate = nn.Parameter(torch.zeros(num_heads))
+
+    def forward(self, attn: nn.Module, x: Tensor, rope, tokens: Tensor, mask: Tensor) -> Tensor:
+        """The term to add to ``attn``'s output for its input ``x`` (= ``proj`` of the gated prefix attention,
+        without proj's bias). Every row has at least one unmasked token (``PromptEncoder``)."""
+        from canvit.core.rope import rope_apply_with_prefix
+        b, n, d = x.shape
+        h, dh = attn.num_heads, attn.head_dim  # type: ignore[attr-defined]
+        w, bias = attn.qkv.weight, attn.qkv.bias  # type: ignore[attr-defined]
+        q = F.linear(x, w[:d], bias[:d]).reshape(b, n, h, dh).transpose(1, 2)
+        q = rope_apply_with_prefix(x=q, rope=rope)  # the queries exactly as the block's own attention uses them
+        t = self.norm(self.adapt(tokens)).to(x.dtype)
+        m = t.shape[1]
+        k = F.linear(t, w[d:2 * d]).reshape(b, m, h, dh).transpose(1, 2)  # k has no bias in this backbone
+        v = F.linear(t, w[2 * d:], bias[2 * d:]).reshape(b, m, h, dh).transpose(1, 2)
+        o = F.scaled_dot_product_attention(q, k.to(q.dtype), v.to(q.dtype), attn_mask=mask[:, None, None, :],
+                                           scale=attn.scale)  # type: ignore[attr-defined]
+        o = o * self.gate.to(o.dtype)[None, :, None, None]
+        return F.linear(o.transpose(1, 2).reshape(b, n, d), attn.proj.weight)  # type: ignore[attr-defined]
+
+
+class PromptConditioning(nn.Module):
+    """AdaLN (``adaln``) and gated prompt tokens (``tokens``), per backbone block, attached by forward hooks.
+    ``token_mode``: 'xattn' = Flamingo gated cross-attention before the block (``GatedPromptXAttn``), 'prefix' =
+    LLaMA-Adapter prefix inside the block's self-attention (``PromptPrefix``)."""
+
+    def __init__(self, *, dim: int, num_heads: int, n_blocks: int, adaln: bool, tokens: TokenOption,
+                 token_mode: Literal["xattn", "prefix"] = "xattn"):
+        super().__init__()
+        if token_mode not in ("xattn", "prefix"):
+            raise ValueError(f"token_mode {token_mode!r}: 'xattn' or 'prefix'")
         self.encoder = PromptEncoder(dim=dim, tokens=tokens)
         self.adaln = nn.ModuleList([nn.Linear(dim, 4 * dim) for _ in range(n_blocks)]) if adaln else None
         if self.adaln is not None:
@@ -175,7 +219,9 @@ class PromptConditioning(nn.Module):
                 nn.init.zeros_(lin.weight)
                 nn.init.zeros_(lin.bias)
         self.xattn = (nn.ModuleList([GatedPromptXAttn(dim=dim, num_heads=num_heads) for _ in range(n_blocks)])
-                      if tokens != "none" else None)
+                      if tokens != "none" and token_mode == "xattn" else None)
+        self.prefix = (nn.ModuleList([PromptPrefix(dim=dim, num_heads=num_heads) for _ in range(n_blocks)])
+                       if tokens != "none" and token_mode == "prefix" else None)
         self._ctx: Prompt | None = None
         self._handles: list = []
 
@@ -199,6 +245,8 @@ class PromptConditioning(nn.Module):
                 self._handles.append(blk.norm2.register_forward_hook(self._adaln_hook(i, 1)))
             if self.xattn is not None:
                 self._handles.append(blk.register_forward_pre_hook(self._xattn_hook(i)))
+            if self.prefix is not None:
+                self._handles.append(blk.attn.register_forward_hook(self._prefix_hook(i)))
 
     def _adaln_hook(self, i: int, which: int):
         def hook(_module, _inputs, out: Tensor):
@@ -216,6 +264,17 @@ class PromptConditioning(nn.Module):
                 return None
             assert self.xattn is not None and ctx.token_mask is not None
             return (self.xattn[i](args[0], ctx.tokens, ctx.token_mask), *args[1:])
+        return hook
+
+
+    def _prefix_hook(self, i: int):
+        def hook(attn, args, out: Tensor):
+            ctx = self._ctx
+            if ctx is None or ctx.tokens is None:
+                return None
+            assert self.prefix is not None and ctx.token_mask is not None
+            x, rope = args[0], args[1]  # SelfAttention.forward(x, rope)
+            return out + self.prefix[i](attn, x, rope, ctx.tokens, ctx.token_mask).to(out.dtype)
         return hook
 
 

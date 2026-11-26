@@ -83,6 +83,10 @@ class PromptConfig:
     """PROPOSAL (not decided by the owner). Prompt tokens read by gated cross-attention (tanh gate, 0 at init)
     before every backbone block: none / the 1x1 cell / the 4 cells of 2x2 / the 9 cells of 3x3 (empty cells
     masked); a text prompt is one token."""
+    token_mode: Literal["xattn", "prefix"] = "xattn"
+    """How the prompt tokens enter the backbone: 'xattn' = gated cross-attention before every block; 'prefix' =
+    LLaMA-Adapter style, every block's self-attention also attends to the tokens in a separate softmax scaled by a
+    per-head gate (0 at init). Both leave the pretrained model unchanged at init (``prompt.py``)."""
     condition_heads: bool = True
     """The task head is FiLM-conditioned on the prompt (else on a zero vector: the backbone alone carries it)."""
     condition_policy: bool = True
@@ -106,6 +110,10 @@ class PromptConfig:
     Without it such a run is refused (``task.sdpa_guard``): there the memory-efficient SDPA backward returns
     garbage gradients (~1e12 at block 0; CPU and math-only give ~10, 2026-11-26). Applies to every search run
     (class-cued with a trained backbone too), not only prompt-cued ones."""
+    readout_layers: int = 2
+    """``--cfg.head xattn``: decoder layers (self-attn among the prompt queries, cross-attn to the canvas, MLP)."""
+    readout_heads: int = 8
+    """``--cfg.head xattn``: attention heads per layer."""
     eval_cosine_baseline: bool = False
     """Also report the zero-shot baseline: heatmap = cosine of the canvas's predicted DINOv3 patch features and the
     raw prompt vector (needs the pretraining scene head, kept for it)."""
@@ -151,8 +159,12 @@ class SearchConfig:
     """None = scene_size // patch_size (32 for ViT-B/16 at 512 px)."""
     foveated_scale: FoveatedScaleConfig = field(default_factory=_fixed_scale_2)
     """Must match the backbone's pretraining view scale, or every glimpse is out of distribution."""
-    head: Literal["unet", "linear"] = "unet"
-    head_width: int = 64
+    head: Literal["unet", "linear", "xattn"] = "unet"
+    """``unet`` / ``linear``: the FiLM-conditioned conv head (``head.SearchHead``). ``xattn`` (prompt-cued only): the
+    cross-attention readout ``head.PromptQueryHead``, the prompt as the query of a small decoder over the canvas
+    tokens (``prompt.readout_layers`` / ``readout_heads``)."""
+    head_width: int | None = None
+    """None = 64 (unet / linear) or 256 (xattn)."""
     head_block_layers: int = 2
     cond_dim: int = 64
     """Width of the target-class embedding(s) (Haoze: 64)."""
@@ -234,6 +246,8 @@ class SearchConfig:
 
     def __post_init__(self) -> None:
         prompt = self.prompt.cue == "prompt"
+        if self.head_width is None:
+            self.head_width = 256 if self.head == "xattn" else 64
         if self.n_timesteps is None:
             self.n_timesteps = 10 if prompt else 4
         if self.eval_policies is None:

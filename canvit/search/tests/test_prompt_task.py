@@ -50,15 +50,15 @@ class _TinyPromptTask(SearchRunTask):
 
     def _build_prompt_model(self, device, prior_model_config):
         torch.manual_seed(0)
-        c, p = self.cfg, self.cfg.prompt
+        p = self.cfg.prompt
         keep_scene = p.distill_weight > 0 or p.eval_cosine_baseline
-        kw = {"adaln": p.adaln, "tokens": p.tokens, "condition_heads": p.condition_heads,
+        kw = {"adaln": p.adaln, "tokens": p.tokens, "token_mode": p.token_mode, "condition_heads": p.condition_heads,
               "scene_grid": G if keep_scene else None, "teacher_dim": TEACHER_DIM}
         model = CanViTForVisualSearch(backbone_name="vits16", model_config=_FOVEATED, n_classes=None, prompt_kw=kw,
-                                      cond_dim=c.cond_dim, kind=c.head, width=c.head_width,
-                                      block_layers=c.head_block_layers, presence=c.condition == "both")
+                                      **self._head_kw())
         if keep_scene:
             model.scene["std"].set_stats(torch.randn(64, G * G, TEACHER_DIM))
+        self.built = model
         return model.to(device)
 
     def _text_vectors(self, texts, device):
@@ -175,9 +175,11 @@ def test_refusals():
     with pytest.raises(ValueError, match="at least one"):
         task = SearchRunTask(_cfg(adaln=False, tokens="none", condition_heads=False), rl=_rl())
         task._build_prompt_model(torch.device("cpu"), None)
-    task = SearchRunTask(_cfg(), rl=_rl())
+    assert SearchRunTask(_cfg(), rl=_rl()).caps().supports_ddp  # the release: DDP tested (job 17581598)
+    coco = SearchRunTask(replace(_cfg(), dataset="coco_search18"), rl=_rl())
+    assert not coco.caps().supports_ddp
     with pytest.raises(RuntimeError, match="DDP"):
-        task.build_loaders(world_size=2, rank=0)
+        coco.build_loaders(world_size=2, rank=0)
     with pytest.raises(ValueError, match="release"):
         SearchRunTask(replace(_cfg(), dataset="coco_search18"), rl=_rl()).build_loaders(world_size=1, rank=0)
 
@@ -197,3 +199,95 @@ def test_coco_zero_shot_test_with_prompts(fake_cs18, fake_vp_release):  # noqa: 
     model, head = task.build_model(torch.device("cpu"))
     out = task.evaluate(model=model, head=head, val_loader=loader, device=torch.device("cpu"), step=0)
     assert "text/found_mean_random" in out and "visual/found_mean_random" in out
+
+
+def test_prefix_token_mode_trains():
+    """token_mode 'prefix' through the real task: trains, and the prefix modules are in the head group."""
+    task = _TinyPromptTask(_cfg(visual_share=0.5, token_mode="prefix"), rl=_rl(reward="fractional"))
+    last = _run(task)
+    assert torch.isfinite(torch.tensor(last["total_loss"]))
+    model, head = task.build_model(torch.device("cpu"))
+    assert model.prompt.xattn is None and model.prompt.prefix is not None
+    joint = task.build_policy(model, device=torch.device("cpu"), canvas_grid=G,
+                              generator=torch.Generator().manual_seed(0))
+    groups = task.trainable_param_groups(model=model, head=head, joint=joint, spec=task.default_spec())
+    assert {id(q) for q in model.prompt.prefix.parameters()} <= {id(q) for q in groups["head"]}
+
+
+def _frozen(spec):
+    from canvit.harness.spec import BpttSpec
+    return replace(spec, train_backbone=False, task_grad_to_backbone=False, bptt=BpttSpec(mode="none", horizon=3))
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+def test_xattn_readout_trains(frozen):
+    """--cfg.head xattn through the real task: trains with the backbone fine-tuned and frozen (the readout-only
+    baseline: no AdaLN, no tokens -> the backbone stays bit-identical, the readout moves); its parameters are the
+    head group; no FiLM head_cond is built."""
+    prompt = dict(visual_share=0.5) if not frozen else dict(visual_share=0.5, adaln=False, tokens="none")
+    task = _TinyPromptTask(replace(_cfg(**prompt), head="xattn", head_width=32), rl=_rl(reward="fractional"))
+    spec = _frozen(task.default_spec()) if frozen else task.default_spec()
+    settings = RunSettings(n_steps=2, eval_every=2, log_every=1, grad_clip=1.0, amp=False, seed=0, device="cpu",
+                           tracker="none")
+    last = run(task=task, spec=spec, settings=settings)
+    assert torch.isfinite(torch.tensor(last["total_loss"]))
+    trained = task.built
+    fresh, _ = task.build_model(torch.device("cpu"))  # the same seeded init
+    from canvit.search.head import PromptQueryHead
+    assert isinstance(fresh.head, PromptQueryHead) and fresh.head_cond is None
+    same_bb = all(torch.equal(a, b) for a, b in zip(trained.canvit.state_dict().values(),
+                                                     fresh.canvit.state_dict().values()))
+    assert same_bb == frozen
+    assert not all(torch.equal(a, b) for a, b in zip(trained.head.state_dict().values(),
+                                                     fresh.head.state_dict().values()))
+    joint = task.build_policy(fresh, device=torch.device("cpu"), canvas_grid=G,
+                              generator=torch.Generator().manual_seed(0))
+    groups = task.trainable_param_groups(model=fresh, head=fresh.head, joint=joint, spec=spec)
+    assert {id(q) for q in fresh.head.parameters()} <= {id(q) for q in groups["head"]}
+
+
+def test_xattn_readout_refusals():
+    with pytest.raises(ValueError, match="query"):
+        _TinyPromptTask(replace(_cfg(condition_heads=False), head="xattn"), rl=_rl()).build_model(torch.device("cpu"))
+    with pytest.raises(ValueError, match="Dropout2d"):
+        _TinyPromptTask(replace(_cfg(), head="xattn", dropout=0.1), rl=_rl()).build_model(torch.device("cpu"))
+    from canvit.search.model import CanViTForVisualSearch
+    with pytest.raises(ValueError, match="prompt-cued"):
+        CanViTForVisualSearch(backbone_name="vits16", model_config=_FOVEATED, n_classes=3, kind="xattn")
+
+
+@pytest.mark.parametrize("rows", ["no_visual", "no_text"])
+@pytest.mark.parametrize("ddp", [False, True])
+@pytest.mark.parametrize("variant", ["xattn_tokens_cosine", "prefix_xattn_readout"])
+def test_ddp_every_trainable_parameter_gets_a_grad(rows, ddp, variant):
+    """Under DDP (``_ddp``) every trainable parameter of the model and the scorer has a grad tensor after the step's
+    backward, also those this batch does not use (a batch without visual rows / without text rows; the kept scene
+    head of the cosine baseline): the harness all-reduces only grads that are not None, rank by rank. Single GPU:
+    unchanged, such parameters keep grad None."""
+    cfg = (_cfg(visual_share=0.5, eval_cosine_baseline=True) if variant == "xattn_tokens_cosine"
+           else replace(_cfg(visual_share=0.5, token_mode="prefix"), head="xattn", head_width=32))
+
+    class _Task(_TinyPromptTask):
+        def build_loaders(self, *, world_size, rank):
+            self._ddp = ddp
+
+            def endless():
+                while True:
+                    b = _batch(4, seed=0)
+                    b["vp_valid"] = torch.full((4,), rows == "no_text")
+                    if rows == "no_text":
+                        b["vp_feat"], b["vp_cov"] = torch.randn(4, 14, 768), torch.rand(4, 14) + 0.1
+                    yield b
+            return endless(), []
+
+    task = _Task(cfg, rl=_rl(reward="fractional"))
+    settings = RunSettings(n_steps=1, eval_every=0, log_every=1, grad_clip=1.0, amp=False, seed=0, device="cpu",
+                           tracker="none")
+    run(task=task, spec=task.default_spec(), settings=settings)
+    params = dict(task.built.named_parameters()) | {f"scorer.{k}": v for k, v in task._joint.scorer.named_parameters()}
+    missing = [k for k, p in params.items() if p.requires_grad and p.grad is None]
+    unused = "prompt.encoder.visual.weight" if rows == "no_visual" else "prompt.encoder.text.weight"
+    if ddp:
+        assert missing == []
+    else:
+        assert unused in missing

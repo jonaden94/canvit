@@ -61,10 +61,14 @@ class BoundSearchTask:
 
     def __init__(self, *, model: Any, targets: Any, boxes: Tensor, canvas_grid: int,
                  cfg: SearchConfig, policy_embed: Callable[[Any], Tensor] | None = None,
-                 present: Tensor | None = None, scene_target: Tensor | None = None):
+                 present: Tensor | None = None, scene_target: Tensor | None = None,
+                 grad_touch: list[Tensor] | None = None):
         """``targets``: the batch's cue, class indices [B] or a ``prompt.Prompt`` (prompt-cued search).
-        ``scene_target``: standardized DINOv3 patch features [B, G*G, T] of the scene (distill loss on)."""
+        ``scene_target``: standardized DINOv3 patch features [B, G*G, T] of the scene (distill loss on).
+        ``grad_touch`` (DDP only): parameters that must get a gradient TENSOR in this step's backward, even where
+        this batch does not use them (``SearchRunTask._grad_touch``)."""
         self.model = model
+        self.grad_touch = grad_touch
         self.scene_target = scene_target
         self.cfg = cfg
         self.targets = targets
@@ -123,6 +127,9 @@ class BoundSearchTask:
         if self.scene_target is not None:  # decision 7: the pretraining objective as a second loss
             scene = self.model.predict_scene(readout.float())
             loss = loss + self.cfg.prompt.distill_weight * F.mse_loss(scene.float(), self.scene_target)
+        if self.grad_touch is not None:  # once per step: a zero term that reaches every listed parameter
+            loss = loss + 0.0 * sum(p.sum() for p in self.grad_touch)
+            self.grad_touch = None
         return TaskLoss(combined=loss)
 
 
@@ -173,6 +180,7 @@ class SearchRunTask:
         self._text_encoder = None  # prompt-cued search: Talk2DINO, built on first use
         self._teacher = None  # prompt-cued search with the distill loss: DINOv3, built on first use
         self._n_evals = 0
+        self._ddp = False  # world_size > 1 (build_loaders): every trainable parameter gets a grad tensor per step
 
     @property
     def _prompt_mode(self) -> bool:
@@ -190,8 +198,22 @@ class SearchRunTask:
     # --- capabilities & defaults ------------------------------------------
     def caps(self):
         from canvit.harness.spec import TaskCaps
-        # Map-style dataset behind a shuffling DataLoader, no rank sharding (as ade20k).
-        return TaskCaps(has_head=True, supports_policy=True, supports_ddp=False)
+        # COCO-Search18: a map-style dataset behind a shuffling DataLoader, no rank sharding (as ade20k); the
+        # release's stream is sharded by rank (``_ddp_ok``).
+        return TaskCaps(has_head=True, supports_policy=True, supports_ddp=self._ddp_ok())
+
+    def _ddp_ok(self) -> bool:
+        """Whether this run may train under DDP. Decision 9: only after a test of disjoint rank samples and exact
+        resume for the whole task. Passed 2026-11-26 for the curated release (job 17581598, 2x A100, prompt-cued,
+        visual share 0.9; ``canvit_claude/canvit/search/prompt_conditioning/ddp_check.{py,sbatch}``, record
+        ``canvit_claude/canvit/search/05-prompt-conditioning.md``): each rank trains on rows rank::world of the
+        pruned epoch (disjoint, union = the epoch), parameters stay identical across ranks, no trainable parameter
+        reaches the all-reduce without a grad (``_grad_touch``), and a stopped + resumed run trains on exactly the
+        same trials. The resume is DATA-exact, not RNG-exact (augmentation, policy sampling and the per-rank policy
+        state restart; parameters at 2k differ from an uninterrupted run about as much as two uninterrupted runs
+        differ from each other); the same guarantee as the validated distill DDP. COCO-Search18 has no rank
+        sharding: refused."""
+        return self.cfg.dataset == "release"
 
     def _policy_warmup_steps(self) -> int:
         pol = self.rl
@@ -300,12 +322,24 @@ class SearchRunTask:
             raise ValueError("prompt-cued search needs at least one of: --cfg.prompt.adaln, prompt tokens, "
                              "--cfg.prompt.condition-heads (otherwise the heatmap never sees the prompt)")
         keep_scene = p.distill_weight > 0 or p.eval_cosine_baseline
-        prompt_kw = {"adaln": p.adaln, "tokens": p.tokens, "condition_heads": p.condition_heads,
-                     "scene_grid": c.scene_size // 16 if keep_scene else None}
+        prompt_kw = {"adaln": p.adaln, "tokens": p.tokens, "token_mode": p.token_mode,
+                     "condition_heads": p.condition_heads, "scene_grid": c.scene_size // 16 if keep_scene else None}
         return CanViTForVisualSearch.from_pretrained_backbone(
-            c.model_repo, n_classes=None, prompt_kw=prompt_kw, cond_dim=c.cond_dim, kind=c.head,
-            width=c.head_width, block_layers=c.head_block_layers, dropout=c.dropout,
-            presence=c.condition == "both").to(device)
+            c.model_repo, n_classes=None, prompt_kw=prompt_kw, **self._head_kw()).to(device)
+
+    def _head_kw(self) -> dict:
+        """The head's constructor arguments in prompt-cued search (``head_kw`` of the checkpoint)."""
+        c, p = self.cfg, self.cfg.prompt
+        kw = dict(cond_dim=c.cond_dim, kind=c.head, width=c.head_width, block_layers=c.head_block_layers,
+                  dropout=c.dropout, presence=c.condition == "both")
+        if c.head == "xattn":
+            if not p.condition_heads:
+                raise ValueError("--cfg.head xattn reads the prompt as its query: --cfg.prompt.no-condition-heads "
+                                 "leaves it nothing to read")
+            if c.dropout > 0:
+                raise ValueError("--cfg.dropout is the U-Net head's Dropout2d; the xattn readout has none")
+            kw |= {"readout_layers": p.readout_layers, "readout_heads": p.readout_heads}
+        return kw
 
     def canvas_grid(self, model):
         if self.cfg.canvas_grid is not None:
@@ -327,9 +361,10 @@ class SearchRunTask:
         return loader
 
     def build_loaders(self, *, world_size, rank):
-        if world_size > 1:
-            raise RuntimeError("search does not support DDP yet (decision 9 for prompt-cued search: only after a "
-                               "test of disjoint rank samples and exact resume for the whole task).")
+        if world_size > 1 and not self._ddp_ok():
+            raise RuntimeError("search supports DDP only on the curated release (--cfg.dataset release): the "
+                               "COCO-Search18 loader has no rank sharding (SearchRunTask._ddp_ok).")
+        self._ddp = world_size > 1
         if self._prompt_mode and self.cfg.dataset != "release":
             raise ValueError("prompt-cued TRAINING reads the curated release (--cfg.dataset release); "
                              "COCO-Search18 is its zero-shot test (harness.evaluate).")
@@ -454,9 +489,22 @@ class SearchRunTask:
             model=core, targets=self._cue_of(batch, device, core),
             boxes=batch["boxes"].to(device), canvas_grid=self.canvas_grid(model), cfg=self.cfg,
             policy_embed=self._policy_embed(model), present=batch["present"].to(device),
-            scene_target=self._scene_target(batch, device, core))
+            scene_target=self._scene_target(batch, device, core), grad_touch=self._grad_touch(core))
         self._bound = bound  # this step's targets, for viz_frame
         return bound
+
+    def _grad_touch(self, model) -> list[Tensor] | None:
+        """DDP: every trainable parameter (model and policy scorer) gets a gradient tensor in every step.
+        ``harness`` all-reduces only the grads that are not None, rank by rank, so a parameter one rank's batch
+        does not use (no visual row -> the visual prompt Linear; no text row -> the text one; ...) would make the
+        ranks' all_reduce sequences differ (a hang or mixed-up tensors). A zero term (``BoundSearchTask.step_loss``)
+        gives such parameters an exact zero gradient instead. Single GPU (None): nothing changes."""
+        if not self._ddp:
+            return None
+        params = [p for p in model.parameters() if p.requires_grad]
+        if self._joint is not None:
+            params += [p for p in self._joint.scorer.parameters() if p.requires_grad]
+        return params
 
     # --- prompts (prompt-cued search) ------------------------------------------
     def _text_vectors(self, texts: list[str], device) -> Tensor:

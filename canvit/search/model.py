@@ -28,7 +28,9 @@ PRETRAINING_ONLY_PREFIXES = ("scene_cls_head.", "scene_patches_head.", "cls_stan
 class CanViTForVisualSearch(nn.Module):
     """``prompt_kw`` (prompt-cued search, ``prompt.py``): ``adaln``, ``tokens``, ``condition_heads`` and
     ``scene_grid`` (keep the pretraining scene head + that grid's standardizer, for the distill loss and the
-    cosine baseline; None = drop them). Without it (``n_classes`` given) the class-cued model of COCO-Search18."""
+    cosine baseline; None = drop them). Without it (``n_classes`` given) the class-cued model of COCO-Search18.
+    ``head_kw['kind'] == 'xattn'``: the cross-attention readout ``PromptQueryHead`` (prompt-cued only) instead of
+    the FiLM U-Net ``SearchHead``; ``width``, ``readout_layers``, ``readout_heads``, ``presence`` are its knobs."""
 
     def __init__(self, *, backbone_name: BackboneName, model_config: dict, n_classes: int | None,
                  glimpse_grid_size: int | None = None, prompt_kw: dict | None = None, **head_kw):
@@ -40,15 +42,27 @@ class CanViTForVisualSearch(nn.Module):
         self.canvit.glimpse_grid_size = glimpse_grid_size
         self.head_kw = dict(head_kw)
         self.prompt_kw = dict(prompt_kw) if prompt_kw is not None else None
-        self.head = SearchHead(canvas_dim=self.canvit.canvas_dim, n_classes=n_classes, **head_kw)
+        if head_kw.get("kind") == "xattn":  # the cross-attention readout (prompt-cued search only)
+            from .head import PromptQueryHead
+            if prompt_kw is None:
+                raise ValueError("the cross-attention readout (head 'xattn') needs prompt-cued search: the prompt is "
+                                 "its query")
+            self.head = PromptQueryHead(canvas_dim=self.canvit.canvas_dim, prompt_dim=self.canvit.backbone.embed_dim,
+                                        width=head_kw.get("width", 256), n_layers=head_kw.get("readout_layers", 2),
+                                        n_heads=head_kw.get("readout_heads", 8),
+                                        presence=head_kw.get("presence", False))
+        else:
+            self.head = SearchHead(canvas_dim=self.canvit.canvas_dim, n_classes=n_classes, **head_kw)
         if self.prompt_kw is not None:
             from .prompt import PromptConditioning
             bb = self.canvit.backbone
             self.prompt = PromptConditioning(dim=bb.embed_dim, num_heads=bb.num_heads, n_blocks=bb.n_blocks,
-                                             adaln=self.prompt_kw["adaln"], tokens=self.prompt_kw["tokens"])
+                                             adaln=self.prompt_kw["adaln"], tokens=self.prompt_kw["tokens"],
+                                             token_mode=self.prompt_kw.get("token_mode", "xattn"))
             self.prompt.attach(bb)
             cond_dim = self.head_kw.get("cond_dim", 64)
-            self.head_cond = nn.Linear(bb.embed_dim, cond_dim) if self.prompt_kw["condition_heads"] else None
+            film = self.prompt_kw["condition_heads"] and head_kw.get("kind") != "xattn"  # xattn reads the prompt
+            self.head_cond = nn.Linear(bb.embed_dim, cond_dim) if film else None
             self.scene: nn.ModuleDict | None = None
             if self.prompt_kw.get("scene_grid") is not None:
                 from canvit.core.standardizers import PatchStandardizer
@@ -65,6 +79,8 @@ class CanViTForVisualSearch(nn.Module):
         """The task head on canvas tokens ``x`` [B, G, G, D] for this batch's cue: a class index (class-cued) or a
         ``prompt.Prompt`` (its 1x1 vector FiLM-conditions the head, or a zero vector with condition_heads off)."""
         if self.prompt_kw is None:
+            return self.head(x, cue)
+        if self.head_kw.get("kind") == "xattn":
             return self.head(x, cue)
         if self.head_cond is not None:
             cond = self.head_cond(cue.vec)

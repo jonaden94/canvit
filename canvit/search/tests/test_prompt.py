@@ -67,6 +67,86 @@ def test_gates_at_zero_leave_the_model_bit_identical(tokens):
         assert not torch.equal(plain[0], opened[0])
 
 
+@torch.no_grad()
+def _open_token_gates(cond: PromptConditioning) -> None:
+    for x in cond.xattn or []:
+        x.alpha.fill_(0.5)
+    for pf in cond.prefix or []:
+        pf.gate.fill_(0.5)
+
+
+@pytest.mark.parametrize("tokens", ["1x1", "2x2", "3x3"])
+def test_prefix_tokens_gates_at_zero_bit_identical_and_open_changes(tokens):
+    """LLaMA-Adapter prefix (token_mode 'prefix', no AdaLN so the tokens alone act): per-head gates at 0 leave the
+    canvas, cls and local tokens after 3 glimpses bit-identical; opened gates change the canvas."""
+    canvit = _tiny_canvit()
+    d, heads, n_blocks = canvit.backbone.embed_dim, canvit.backbone.num_heads, canvit.backbone.n_blocks
+    cond = PromptConditioning(dim=d, num_heads=heads, n_blocks=n_blocks, adaln=False, tokens=tokens,
+                              token_mode="prefix")
+    assert cond.xattn is None and cond.prefix is not None
+    images = torch.randn(4, 3, 224, 224, generator=torch.Generator().manual_seed(2))
+    with torch.no_grad():
+        plain = _rollout(canvit, images)
+        cond.attach(canvit.backbone)
+        prompt = _prompt(cond, 4)
+        with cond.use(prompt):
+            gated = _rollout(canvit, images)
+        assert all(torch.equal(a, b) for a, b in zip(plain, gated))
+        _open_token_gates(cond)
+        with cond.use(prompt):
+            opened = _rollout(canvit, images)
+        assert not torch.equal(plain[0], opened[0])
+
+
+@pytest.mark.parametrize("mode", ["xattn", "prefix"])
+def test_masked_prompt_cells_have_no_effect(mode):
+    """With the gates open, changing the tokens of masked (empty) cells changes nothing, bit for bit."""
+    canvit = _tiny_canvit()
+    d, heads, n_blocks = canvit.backbone.embed_dim, canvit.backbone.num_heads, canvit.backbone.n_blocks
+    cond = PromptConditioning(dim=d, num_heads=heads, n_blocks=n_blocks, adaln=False, tokens="2x2",
+                              token_mode=mode)
+    cond.attach(canvit.backbone)
+    _open_token_gates(cond)
+    images = torch.randn(4, 3, 224, 224, generator=torch.Generator().manual_seed(2))
+    with torch.no_grad():
+        prompt = _prompt(cond, 4)
+        assert prompt.token_mask is not None and prompt.tokens is not None
+        assert not bool(prompt.token_mask.all())  # text rows (1 token) and the empty 2x2 cell are masked
+        with cond.use(prompt):
+            ref = _rollout(canvit, images)
+        noisy = prompt.tokens.clone()
+        noisy[~prompt.token_mask] = 1e3 * torch.randn(int((~prompt.token_mask).sum()), d)
+        with cond.use(type(prompt)(vec=prompt.vec, tokens=noisy, token_mask=prompt.token_mask, raw=prompt.raw,
+                                   visual=prompt.visual)):
+            got = _rollout(canvit, images)
+        assert all(torch.equal(a, b) for a, b in zip(ref, got))
+        noisy2 = prompt.tokens.clone()
+        noisy2[prompt.token_mask] += 1.0  # the unmasked tokens do matter
+        with cond.use(type(prompt)(vec=prompt.vec, tokens=noisy2, token_mask=prompt.token_mask, raw=prompt.raw,
+                                   visual=prompt.visual)):
+            moved = _rollout(canvit, images)
+        assert not torch.equal(ref[0], moved[0])
+
+
+@pytest.mark.parametrize("mode", ["xattn", "prefix"])
+def test_closed_token_gates_get_a_gradient(mode):
+    """At init (gates 0) every block's token gate gets a non-zero gradient from a loss on the canvas, so the
+    zero init cannot deadlock (the value path behind the gate is not zero)."""
+    canvit = _tiny_canvit()
+    d, heads, n_blocks = canvit.backbone.embed_dim, canvit.backbone.num_heads, canvit.backbone.n_blocks
+    cond = PromptConditioning(dim=d, num_heads=heads, n_blocks=n_blocks, adaln=False, tokens="2x2",
+                              token_mode=mode)
+    cond.attach(canvit.backbone)
+    gates = [x.alpha for x in cond.xattn] if mode == "xattn" else [pf.gate for pf in cond.prefix]
+    assert all(bool((g == 0).all()) for g in gates)
+    images = torch.randn(4, 3, 224, 224, generator=torch.Generator().manual_seed(2))
+    with cond.use(_prompt(cond, 4)):
+        outs = _rollout(canvit, images, n=2)
+    (outs[3].square().mean() + outs[5].square().mean()).backward()  # canvas and local tokens of glimpse 2
+    for g in gates:
+        assert g.grad is not None and bool((g.grad != 0).all()), g.grad
+
+
 def test_encoder_normalises_and_builds_the_tokens():
     enc = PromptEncoder(dim=16, tokens="2x2")
     seen = []
@@ -144,3 +224,35 @@ def test_sdpa_guard_refuses_backbone_gradients_on_v100():
     with pytest.raises(RuntimeError, match="v100-math-sdpa"):
         sdpa_guard((7, 0), backprop_through_backbone=True, math_sdpa=False)
     assert sdpa_guard((7, 0), backprop_through_backbone=True, math_sdpa=True)
+
+
+@pytest.mark.parametrize("tokens", ["none", "2x2"])
+def test_xattn_readout_shapes_masks_and_prompt_dependence(tokens):
+    """PromptQueryHead: heatmap [B, G, G] and presence [B] for text and visual rows; changing a masked token
+    changes nothing (bit for bit); another prompt changes the heatmap."""
+    from canvit.search.head import PromptQueryHead
+    torch.manual_seed(0)
+    d, g, b = 768, 8, 4
+    enc = PromptEncoder(dim=d, tokens=tokens)
+    head = PromptQueryHead(canvas_dim=48, prompt_dim=d, width=32, n_layers=2, n_heads=8, presence=True).eval()
+    gen = torch.Generator().manual_seed(1)
+    visual = torch.tensor([False, True, False, True])
+    cov = torch.rand(b, 14, generator=gen)
+    cov[:, 2] = 0  # an empty 2x2 cell
+    with torch.no_grad():
+        prompt = enc(visual=visual, text=torch.randn(b, 768, generator=gen),
+                     vp_feat=torch.randn(b, 14, 768, generator=gen), vp_cov=cov)
+        x = torch.randn(b, g, g, 48, generator=gen)
+        heat, pres = head(x, prompt)
+        assert heat.shape == (b, g, g) and pres is not None and pres.shape == (b,)
+        assert torch.isfinite(heat).all() and torch.isfinite(pres).all()
+        if tokens != "none":
+            assert prompt.tokens is not None and prompt.token_mask is not None and not bool(prompt.token_mask.all())
+            noisy = prompt.tokens.clone()
+            noisy[~prompt.token_mask] = 1e3 * torch.randn(int((~prompt.token_mask).sum()), d)
+            h2, p2 = head(x, type(prompt)(vec=prompt.vec, tokens=noisy, token_mask=prompt.token_mask,
+                                          raw=prompt.raw, visual=prompt.visual))
+            assert torch.equal(heat, h2) and torch.equal(pres, p2)
+        rolled = prompt.rows(torch.tensor([1, 2, 3, 0]))
+        h3, _ = head(x, rolled)
+        assert not torch.equal(heat, h3)

@@ -69,8 +69,7 @@ is refused; only the loaders exist.
   (reproduces the reference epochs row for row; `test_release.py`). An epoch (~349k trials, half
   target-absent) is built in the main process (~9 GB of RAM, ~16 s); the epochs follow each other
   as one endless stream, fixed by `--cfg.seed`. A resume at step s continues at trial
-  s x batch_size of that stream. Each rank takes `trials[rank::world]` (DDP itself is still off
-  for search).
+  s x batch_size of that stream. Each rank takes `trials[rank::world]` (DDP: see "Prompt-cued search").
 - **Workers** are spawned, not forked (a forked worker would copy the 9 GB sampler). Throughput
   with the default augmentation at 512 px: ~30 samples/s per worker, 390 with 16 workers.
 - **Validation:** all of `val.parquet` (7,364 present + 7,364 absent trials); the last glimpse's
@@ -97,7 +96,17 @@ Owner decisions of 2026-11-26. Training on the curated release with text and vis
 - **Backbone conditioning:** AdaLN of the prompt's 1x1 vector in every block (zero at init) and prompt tokens
   (`--cfg.prompt.tokens none|1x1|2x2|3x3`, default 2x2) read by a gated cross-attention before every block (tanh
   gate, 0 at init): the pretrained model starts unchanged. Attached by forward hooks; `canvit/core` is unchanged.
+  `--cfg.prompt.token-mode prefix` instead feeds the tokens LLaMA-Adapter style: every block's self-attention also
+  attends to them (keys/values from the block's own k/v projections of a per-block Linear + LayerNorm of the
+  tokens, no RoPE), in a separate softmax scaled by a per-head gate (0 at init) and added before the output
+  projection. The tokens are not sequence tokens; empty cells are masked.
 - **Heads / policy:** FiLM-conditioned on the prompt (`--cfg.prompt.condition-heads/-policy`, on).
+  `--cfg.head xattn` replaces the FiLM U-Net head with a cross-attention readout (`head.PromptQueryHead`): the
+  prompt's vector (and its tokens, if any) are the queries of a small one-way decoder over the canvas tokens
+  (`--cfg.prompt.readout-layers` 2, `--cfg.prompt.readout-heads` 8, `--cfg.head-width` 256; keys carry a 2-D
+  sine-cosine position code); heatmap = the output query's dot product with each projected canvas token, presence
+  from the output query. Same loss, metrics and policy. With `--spec.train-backbone False
+  --spec.task-grad-to-backbone False --cfg.prompt.no-adaln --cfg.prompt.tokens none` it is the readout-only baseline.
 - **Training:** the whole model (backbone fine-tuned, truncated BPTT in chunks of `--cfg.prompt.bptt-chunk`
   glimpses, default 2), the policy with exp43's PG
   settings via `--rl`. One LR (`--cfg.peak-lr`) for all groups unless `--cfg.prompt.{backbone,head,policy}-lr`
@@ -112,7 +121,10 @@ Owner decisions of 2026-11-26. Training on the curated release with text and vis
   baseline (cosine of the predicted DINOv3 features and the prompt), `found_cos_*`.
 - **COCO-Search18 zero-shot test:** `harness.evaluate search` with `--cfg.dataset coco_search18 --cfg.data-root
   .../coco_search18_nopadding`: text = the category name, visual = the release's `vp_test` prompt.
-- DDP is refused.
+- **DDP** on the release (2026-11-26, 2x A100 test job 17581598): ranks train on disjoint shares of each epoch,
+  parameters stay identical, every trainable parameter gets a gradient tensor each step (zero where the rank's
+  batch does not use it). A resume is data-exact (the same trials), not RNG-exact (augmentation, fixation sampling
+  and the per-rank entropy / reward-normaliser state restart). COCO-Search18 training refuses DDP.
 - **Not on a V100** when gradients pass through the backbone (fine-tuning, or any prompt-cued run: the prompt
   modules sit inside it). On sm_70 the default (memory-efficient) attention backward returns garbage gradients,
   ~1e12 at block 0, while CPU and the math kernel give ~10. Such a run is refused unless
@@ -270,4 +282,4 @@ for search.
 - `null_cell` (one softmax over cells + "absent").
 - A policy reward on target-absent trials.
 - A sampled-policy eval rule.
-- DDP.
+- DDP on COCO-Search18 (no rank sharding in its loader).
