@@ -281,7 +281,8 @@ def collate_search(batch: list[dict]) -> dict:
 def _with_test_prompts(cfg: SearchConfig, recs: list[SearchRecord]):
     """Zero-shot test with visual prompts: each record's fixed ``vp_test`` prompt (``release.coco_test_prompts``)
     and the reader of the release's features. ``(recs, None)`` with visual prompts off."""
-    if not cfg.visual_prompts:
+    from .release import uses_visual_prompts
+    if not uses_visual_prompts(cfg):
         return recs, None
     from dataclasses import replace
 
@@ -291,7 +292,7 @@ def _with_test_prompts(cfg: SearchConfig, recs: list[SearchRecord]):
 
 
 def make_search_loaders(cfg: SearchConfig) -> tuple[DataLoader, DataLoader, list[str]]:
-    if cfg.visual_prompts:
+    if cfg.visual_prompts or cfg.prompt.cue == "prompt":
         raise ValueError("COCO-Search18 has visual prompts for the zero-shot TEST only (the release's vp_test); "
                          "training on it with --cfg.visual-prompts is refused. Evaluate with harness.evaluate.")
     classes = coco_search18_classes(cfg.data_root)

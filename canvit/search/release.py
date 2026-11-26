@@ -243,19 +243,36 @@ class ReleaseDataset(SearchDataset):
 # --- training trials (spec 4) -------------------------------------------------------------------------------
 
 class ReleaseEpochs:
-    """The reference sampler (vendored, ``release_sampler.py``) at the release's defaults, in this process."""
+    """The reference sampler (vendored, ``release_sampler.py``) at the release's defaults, in this process.
 
-    def __init__(self, release_dir: Path, *, seed: int):
+    ``visual_share`` (prompt-cued search, ``prompt.assign_prompt_types``): each epoch is pruned to the trials it
+    keeps, and a trial's ``vp_idx`` stays only if it is cued by its visual prompt (-1 = text). The pruned size
+    is known only after building the epoch, so ``size`` builds it then (once per epoch; at a resume, once per
+    earlier epoch)."""
+
+    def __init__(self, release_dir: Path, *, seed: int, visual_share: float | None = None):
         from .release_sampler import SearchSampler
         self.release_dir = Path(release_dir)
         self.seed = seed
+        self.visual_share = visual_share
         self.defaults = release_meta(release_dir)["sampler_defaults"]
         self.sampler = SearchSampler(str(release_dir), **self.defaults)
+        self._pruned: tuple[int, pd.DataFrame] | None = None
+        if visual_share is not None:  # the class-size band of each prompt, for the drop log
+            n_cls = self.sampler.ex["class"].value_counts()
+            pr = pd.read_parquet(self.release_dir / "prompts.parquet", columns=["prompt", "class"])
+            self._prompt_band = dict(zip(pr["prompt"], class_band(pr["class"].map(n_cls).fillna(0).to_numpy(np.int64))))
 
     def size(self, e: int) -> int:
-        """Trials in epoch ``e``, without building it: the epoch's first random draw (stochastic rounding of the
-        expected draws) fixes the present count, and the absent count follows from it. Exact as long as no
-        prompt runs out of negatives; ``trials`` checks it on every epoch it builds."""
+        """Trials in epoch ``e``. Without a visual share (or share 0, nothing dropped): without building it, the
+        epoch's first random draw (stochastic rounding of the expected draws) fixes the present count, and the
+        absent count follows from it -- exact as long as no prompt runs out of negatives, which ``frame`` checks
+        on every epoch it builds. With a share > 0: the pruned epoch's length (built)."""
+        if self.visual_share:
+            return len(self.prompt_frame(e))
+        return self._full_size(e)
+
+    def _full_size(self, e: int) -> int:
         s = self.sampler
         rng = np.random.default_rng([self.seed, e])
         w = s.w
@@ -264,14 +281,41 @@ class ReleaseEpochs:
 
     def frame(self, e: int) -> pd.DataFrame:
         df = self.sampler.epoch(e, seed=self.seed)
-        if len(df) != self.size(e):
-            raise RuntimeError(f"epoch {e} has {len(df)} trials, size() predicted {self.size(e)}: a prompt ran out "
-                               "of negatives, so resume positions computed from size() would be wrong.")
+        if len(df) != self._full_size(e):
+            raise RuntimeError(f"epoch {e} has {len(df)} trials, size() predicted {self._full_size(e)}: a prompt ran "
+                               "out of negatives, so resume positions computed from size() would be wrong.")
         return df
 
+    def prompt_frame(self, e: int) -> pd.DataFrame:
+        """Epoch ``e`` pruned for the visual share: kept trials only, ``vp_idx`` = -1 unless visually cued.
+        Logs f, the kept count and the drops per class-size band."""
+        if self._pruned is not None and self._pruned[0] == e:
+            return self._pruned[1]
+        from .prompt import assign_prompt_types
+        assert self.visual_share is not None
+        df = self.frame(e)
+        has_vp = df["vp_idx"].to_numpy() >= 0 if "vp_idx" in df else np.zeros(len(df), bool)
+        res = assign_prompt_types(has_vp, self.visual_share, seed=self.seed, epoch=e)
+        band = df["prompt"].map(self._prompt_band).to_numpy()
+        drops = {BANDS[b]: int(((band == b) & ~res.keep).sum()) for b in range(len(BANDS))}
+        out = df[res.keep].reset_index(drop=True)
+        vp = np.where(res.visual, df["vp_idx"].to_numpy() if "vp_idx" in df else -1, -1)[res.keep]
+        out["vp_idx"] = vp
+        log.info("search release epoch %d: visual share %.3f, f = %.4f (trials with a visual prompt), kept %d of %d "
+                 "(text-only kept with p = %.4f), visual %d; dropped per class-size band %s", e, self.visual_share,
+                 res.f, len(out), len(df), res.p_keep_text, int((vp >= 0).sum()), drops)
+        self.last_epoch_stats = {"epoch": e, "f": res.f, "kept": len(out), "n": len(df), "drops": drops}
+        self._pruned = (e, out)
+        return out
+
     def trials(self, e: int, *, rank: int, world_size: int, visual_prompts: bool = False) -> list[Trial]:
-        """This rank's share (``rank_share``) of epoch ``e``; ``vp_idx`` only with ``visual_prompts``."""
-        part = rank_share(self.frame(e), rank=rank, world_size=world_size)
+        """This rank's share (``rank_share``) of epoch ``e``; ``vp_idx`` only with ``visual_prompts``. With a
+        visual share: of the pruned epoch, ``vp_idx`` = the visual cue or -1."""
+        if self.visual_share is not None:
+            part = rank_share(self.prompt_frame(e), rank=rank, world_size=world_size)
+            visual_prompts = True
+        else:
+            part = rank_share(self.frame(e), rank=rank, world_size=world_size)
         idx = part["image_idx"].to_numpy(np.int64)
         present = part["present"].to_numpy(bool)
         box = part[["box_x", "box_y", "box_w", "box_h"]].to_numpy(np.float64)
@@ -348,8 +392,15 @@ def _loader_kw(cfg: SearchConfig) -> dict:
     return kw
 
 
+def uses_visual_prompts(cfg: SearchConfig) -> bool:
+    """Samples carry visual prompts: ``visual_prompts``, or prompt-cued search with a visual share > 0."""
+    if cfg.prompt.cue == "prompt":
+        return cfg.prompt.visual_share > 0
+    return cfg.visual_prompts
+
+
 def _visual_prompts(cfg: SearchConfig) -> VisualPrompts | None:
-    return VisualPrompts(cfg.release_dir) if cfg.visual_prompts else None
+    return VisualPrompts(cfg.release_dir) if uses_visual_prompts(cfg) else None
 
 
 def make_release_val_loader(cfg: SearchConfig, pictures: ReleasePictures | None = None,
@@ -357,7 +408,7 @@ def make_release_val_loader(cfg: SearchConfig, pictures: ReleasePictures | None 
     pictures = pictures if pictures is not None else ReleasePictures(cfg.release_dir)
     vp = vp if vp is not None else _visual_prompts(cfg)
     ds = ReleaseDataset(pictures, scene_size=cfg.scene_size, aug=None, visual_prompts=vp)
-    trials = val_trials(cfg.release_dir, visual_prompts=cfg.visual_prompts)
+    trials = val_trials(cfg.release_dir, visual_prompts=uses_visual_prompts(cfg))
     return DataLoader(ds, sampler=trials, batch_size=cfg.eval_batch_size, **_loader_kw(cfg))  # type: ignore[arg-type]
 
 
@@ -370,7 +421,8 @@ def make_release_loaders(cfg: SearchConfig, *, world_size: int = 1, rank: int = 
              cfg.seed, rank, world_size, start_step)
     pictures = ReleasePictures(cfg.release_dir)
     vp = _visual_prompts(cfg)
-    epochs = ReleaseEpochs(cfg.release_dir, seed=cfg.seed)
+    share = cfg.prompt.visual_share if cfg.prompt.cue == "prompt" else None
+    epochs = ReleaseEpochs(cfg.release_dir, seed=cfg.seed, visual_share=share)
     stream = EpochStream(length=lambda e: epochs.size(e) // world_size,
                          trials=lambda e: epochs.trials(e, rank=rank, world_size=world_size,
                                                         visual_prompts=cfg.visual_prompts),

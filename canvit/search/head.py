@@ -30,12 +30,13 @@ class SearchHead(nn.Module):
     ``embed`` is the task's target embedding; with ``embedding='shared'`` the policy reads it
     too (``policy_embedding``)."""
 
-    def __init__(self, *, canvas_dim: int, n_classes: int, cond_dim: int = 64,
+    def __init__(self, *, canvas_dim: int, n_classes: int | None, cond_dim: int = 64,
                  kind: Literal["unet", "linear"] = "unet", width: int = 64, block_layers: int = 2,
                  dropout: float = 0.0, presence: bool = False):
         super().__init__()
         self.kind = kind
-        self.embed = nn.Embedding(n_classes, cond_dim)
+        # None: prompt-cued search, the caller hands the FiLM condition to forward (``cond``).
+        self.embed = nn.Embedding(n_classes, cond_dim) if n_classes is not None else None
         self.ln = nn.LayerNorm(canvas_dim)
         self.proj = nn.Conv2d(canvas_dim, width, 1)
         self.film_in = FiLM(cond_dim, width)
@@ -49,14 +50,16 @@ class SearchHead(nn.Module):
         self.out = nn.Conv2d(width, 1, 1)
         self.presence = nn.Linear(width, 1) if presence else None
 
-    def forward(self, x: Tensor, target: Tensor) -> tuple[Tensor, Tensor | None]:
+    def forward(self, x: Tensor, target: Tensor | None, cond: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
         b, g, g2, _ = x.shape
         assert g == g2, f"square canvas expected, got {g}x{g2}"
         if self.kind == "unet":
             assert g % (2 ** (N_UNET_ENC - 1)) == 0, (
                 f"the U-Net pools {N_UNET_ENC - 1} times; canvas grid {g} must be a multiple of "
                 f"{2 ** (N_UNET_ENC - 1)}")
-        cond = self.embed(target)
+        if cond is None:
+            assert self.embed is not None and target is not None
+            cond = self.embed(target)
         h = self.proj(self.ln(x).permute(0, 3, 1, 2).contiguous())
         h = self.film_in(h, cond)
         if self.kind == "unet":

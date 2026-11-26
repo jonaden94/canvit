@@ -88,6 +88,36 @@ each trial gets a fixed prompt of its category from the release's `vp_test` (the
 `blake2b(f"{image}|{category}|{box_id}", digest_size=8)`); training on COCO-Search18 with it is refused. Off (the
 default), samples are exactly as before.
 
+### Prompt-cued search (`--cfg.prompt.cue prompt`, `prompt.py`)
+
+Owner decisions of 2026-11-26. Training on the curated release with text and visual prompts, no class index:
+
+- **Prompts:** text = Talk2DINO of the trial's text; visual = the trial's `vp_feat` cells. Every 768-d vector
+  L2-normalised, then one trainable Linear per type.
+- **Backbone conditioning:** AdaLN of the prompt's 1x1 vector in every block (zero at init) and prompt tokens
+  (`--cfg.prompt.tokens none|1x1|2x2|3x3`, default 2x2) read by a gated cross-attention before every block (tanh
+  gate, 0 at init): the pretrained model starts unchanged. Attached by forward hooks; `canvit/core` is unchanged.
+- **Heads / policy:** FiLM-conditioned on the prompt (`--cfg.prompt.condition-heads/-policy`, on).
+- **Training:** the whole model (backbone fine-tuned, truncated BPTT in chunks of `--cfg.prompt.bptt-chunk`
+  glimpses, default 2), the policy with exp43's PG
+  settings via `--rl`. One LR (`--cfg.peak-lr`) for all groups unless `--cfg.prompt.{backbone,head,policy}-lr`
+  (see the comment in `SearchRunTask._prompt_spec`: a lower backbone LR is probably wise).
+- **Visual share** `--cfg.prompt.visual-share` (default 0.5): per epoch, trials with a visual prompt get it with
+  probability s/f; only when s > f (the epoch's fraction with one, ~0.77) are text-only trials dropped.
+- **Distillation** `--cfg.prompt.distill-weight` (0 = off): the pretraining scene loss on the canvas next to the
+  search loss; val logs `scene_cos`.
+- **Validation:** per prompt type (`text/...`, `visual/...`; plain keys = their mean), per class-size band; metric
+  of record `found_mean_policy` = mean found over t1..t9 (n_timesteps 10). Only the policy rule by default;
+  random fixations at the first validation and at the end. `--cfg.prompt.eval-cosine-baseline`: the zero-shot
+  baseline (cosine of the predicted DINOv3 features and the prompt), `found_cos_*`.
+- **COCO-Search18 zero-shot test:** `harness.evaluate search` with `--cfg.dataset coco_search18 --cfg.data-root
+  .../coco_search18_nopadding`: text = the category name, visual = the release's `vp_test` prompt.
+- DDP is refused.
+- **Not on a V100** when gradients pass through the backbone (fine-tuning, or any prompt-cued run: the prompt
+  modules sit inside it). On sm_70 the default (memory-efficient) attention backward returns garbage gradients,
+  ~1e12 at block 0, while CPU and the math kernel give ~10. Such a run is refused unless
+  `--cfg.prompt.v100-math-sdpa` (math-only attention: slower, more memory). A frozen class-cued run is unaffected.
+
 ### Text encoder (`text_encoder.py`): built, not wired into the model yet
 
 `TextEncoder()(batch["text"]) -> [B, 768]`: Talk2DINO for DINOv3 ViT-B, frozen. CLIP ViT-B/16's text tower

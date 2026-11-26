@@ -1,0 +1,199 @@
+"""Prompt-cued search through the real task and ``harness.run`` on CPU: a tiny random foveated ViT-S, synthetic
+release-format batches (both prompt types), the text encoder replaced by fixed random vectors (it has its own
+parity test). LR groups, the distill switch, the val keys, COCO-Search18 as the zero-shot test."""
+
+from dataclasses import replace
+
+import pytest
+import torch
+
+from canvit.harness.run import RunSettings, run
+from canvit.search.config import PromptConfig, SearchAugConfig, SearchConfig
+from canvit.search.data import collate_search
+from canvit.search.model import CanViTForVisualSearch
+from canvit.search.task import SearchRunTask
+
+from .test_release import fake_release, fake_vp_release  # noqa: F401  (fixtures)
+from .test_search_task import _FOVEATED, _rl
+
+S, G = 224, 32  # scene px, canvas grid (as the class-cued tests)
+TEACHER_DIM = 768  # = the prompt width: the cosine baseline compares the two
+
+
+def _batch(b: int, seed: int) -> dict:
+    """Release-format samples: half present (one box), half absent; every other trial with a visual prompt."""
+    g = torch.Generator().manual_seed(seed)
+    samples = []
+    for i in range(b):
+        box = torch.tensor([[-0.2, -0.1, 0.1, 0.2]]) + 0.1 * (i % 3) if i % 2 == 0 else torch.zeros(0, 4)
+        vp = i % 4 < 2
+        samples.append({"image": torch.randn(3, S, S, generator=g), "boxes": box, "present": torch.tensor(i % 2 == 0),
+                        "text": f"thing {i % 5}", "band": torch.tensor(i % 6),
+                        "vp_feat": torch.randn(14, 768, generator=g) if vp else torch.zeros(14, 768),
+                        "vp_cov": torch.rand(14, generator=g) if vp else torch.zeros(14),
+                        "vp_valid": torch.tensor(vp)})
+    return collate_search(samples)
+
+
+class _FakeTeacher:
+    calls = 0
+
+    def forward_norm_features(self, images):
+        _FakeTeacher.calls += 1
+        from canvit.core.backbone.vit import NormFeatures
+        b = images.shape[0]
+        return NormFeatures(patches=images.mean() + torch.randn(b, G * G, TEACHER_DIM), cls=torch.zeros(b, TEACHER_DIM))
+
+
+class _TinyPromptTask(SearchRunTask):
+    """Builds a random tiny model, feeds synthetic batches, fakes the text encoder."""
+
+    def _build_prompt_model(self, device, prior_model_config):
+        torch.manual_seed(0)
+        c, p = self.cfg, self.cfg.prompt
+        keep_scene = p.distill_weight > 0 or p.eval_cosine_baseline
+        kw = {"adaln": p.adaln, "tokens": p.tokens, "condition_heads": p.condition_heads,
+              "scene_grid": G if keep_scene else None, "teacher_dim": TEACHER_DIM}
+        model = CanViTForVisualSearch(backbone_name="vits16", model_config=_FOVEATED, n_classes=None, prompt_kw=kw,
+                                      cond_dim=c.cond_dim, kind=c.head, width=c.head_width,
+                                      block_layers=c.head_block_layers, presence=c.condition == "both")
+        if keep_scene:
+            model.scene["std"].set_stats(torch.randn(64, G * G, TEACHER_DIM))
+        return model.to(device)
+
+    def _text_vectors(self, texts, device):
+        return torch.stack([torch.randn(768, generator=torch.Generator().manual_seed(hash(t) % 1000))
+                            for t in texts]).to(device)
+
+    def build_loaders(self, *, world_size, rank):
+        def endless():
+            i = 0
+            while True:
+                yield _batch(4, seed=i)
+                i += 1
+        return endless(), [_batch(6, seed=100), _batch(6, seed=101)]
+
+    def build_val_loader(self):
+        return [_batch(6, seed=100), _batch(6, seed=101)]
+
+
+def _cfg(**prompt) -> SearchConfig:
+    return SearchConfig(dataset="release", prompt=PromptConfig(cue="prompt", **prompt), scene_size=S,
+                        canvas_grid=G, n_timesteps=3, batch_size=4, eval_batch_size=6, num_workers=0,
+                        head_width=16, head_block_layers=1, cond_dim=8, max_steps=4, warmup_steps=1,
+                        device="cpu", amp=False, tracker="none", viz_every=0, model_repo="tiny",
+                        aug=SearchAugConfig(crop=True), supervise="every")
+
+
+def _run(task, n_steps=2):
+    settings = RunSettings(n_steps=n_steps, eval_every=n_steps, log_every=1, grad_clip=1.0, amp=False, seed=0,
+                           device="cpu", tracker="none")
+    return run(task=task, spec=task.default_spec(), settings=settings)
+
+
+@pytest.mark.parametrize("share", [0.0, 0.5, 1.0])
+def test_prompt_search_trains_and_validates(share):
+    task = _TinyPromptTask(_cfg(visual_share=share), rl=_rl(reward="fractional"))
+    last = _run(task)
+    assert torch.isfinite(torch.tensor(last["total_loss"]))
+    types = ["text"] if share == 0 else ["visual"] if share == 1 else ["text", "visual"]
+    assert task._eval_prompt_types() == types
+    assert task.best_metric == "found_mean_policy"
+
+
+def test_val_keys_per_prompt_type_and_band(tmp_path):
+    import json
+    task = _TinyPromptTask(_cfg(visual_share=0.5, eval_cosine_baseline=True), rl=_rl(reward="fractional"))
+    model, head = task.build_model(torch.device("cpu"))
+    joint = task.build_policy(model, device=torch.device("cpu"), canvas_grid=G,
+                              generator=torch.Generator().manual_seed(0))
+    out = task.evaluate(model=model, head=head, val_loader=task.build_val_loader(), device=torch.device("cpu"),
+                        step=0, joint=joint, run_dir=tmp_path)
+    full = json.loads((tmp_path / "eval.jsonl").read_text().splitlines()[0])
+    for ty in ("text", "visual"):
+        assert f"{ty}/found_mean_policy" in out and f"{ty}/found_t2_policy_band10-99" in out
+        assert f"{ty}/found_mean_random" in out  # random is added at the first validation
+        assert f"{ty}/found_cos_t2_policy" in full
+    assert out["found_mean_policy"] == pytest.approx((out["text/found_mean_policy"]
+                                                      + out["visual/found_mean_policy"]) / 2)
+    # the visual pass sees only the trials with a visual prompt (i % 4 < 2: 8 of 12 here), the text pass all 12
+    assert sum(v for k, v in full.items() if k.startswith("text/n_trials_band")) == 12
+    assert sum(v for k, v in full.items() if k.startswith("visual/n_trials_band")) == 8
+    out2 = task.evaluate(model=model, head=head, val_loader=task.build_val_loader(), device=torch.device("cpu"),
+                         step=2, joint=joint)
+    assert not any("random" in k for k in out2)  # not the first validation, not max_steps
+
+
+def test_lr_groups():
+    from canvit.harness.loop import apply_requires_grad
+    from canvit.harness.optim import build_optimizer_and_scheduler
+    for lrs, want in (({}, (1e-4, 1e-4, 1e-4)),
+                      ({"backbone_lr": 1e-5, "head_lr": 3e-4, "policy_lr": 2e-4}, (1e-5, 3e-4, 2e-4))):
+        task = _TinyPromptTask(_cfg(**lrs), rl=_rl())
+        model, head = task.build_model(torch.device("cpu"))
+        joint = task.build_policy(model, device=torch.device("cpu"), canvas_grid=G,
+                                  generator=torch.Generator().manual_seed(0))
+        spec = task.default_spec()
+        assert spec.train_backbone and spec.task_grad_to_backbone and not spec.policy_grad_to_backbone
+        apply_requires_grad(model=model, head=head, joint=joint, spec=spec)
+        groups = task.trainable_param_groups(model=model, head=head, joint=joint, spec=spec)
+        opt, _ = build_optimizer_and_scheduler(spec, groups)
+        ids = [id(q) for g in groups.values() for q in g]
+        assert len(ids) == len(set(ids)), "a parameter in two groups"
+        trainable = {id(q) for q in list(model.parameters()) + list(joint.scorer.parameters()) if q.requires_grad}
+        assert trainable == set(ids), "a trainable parameter in no group"
+        prompt_ids = {id(q) for q in model.prompt.parameters()} | {id(q) for q in model.head_cond.parameters()}
+        assert prompt_ids <= {id(q) for q in groups["head"]}
+        assert {id(q) for q in model.canvit.parameters()} == {id(q) for q in groups["backbone"]}
+        by_name = dict(zip(spec.trainable_modules(), opt.param_groups))
+        got = tuple(by_name[m]["initial_lr"] for m in ("backbone", "head", "policy"))
+        assert got == pytest.approx(want)
+
+
+def test_distill_off_never_touches_the_teacher(monkeypatch):
+    import canvit.core.teacher as teacher_mod
+
+    def boom(*a, **k):
+        raise AssertionError("teacher loaded with distill_weight 0")
+    monkeypatch.setattr(teacher_mod, "load_teacher", boom)
+    last = _run(_TinyPromptTask(_cfg(distill_weight=0.0), rl=_rl(reward="fractional")))
+    assert torch.isfinite(torch.tensor(last["total_loss"]))
+
+
+def test_distill_on_calls_the_teacher_once_per_batch(monkeypatch):
+    import canvit.core.teacher as teacher_mod
+    monkeypatch.setattr(teacher_mod, "load_teacher", lambda *a, **k: _FakeTeacher())
+    _FakeTeacher.calls = 0
+    task = _TinyPromptTask(_cfg(distill_weight=0.1), rl=_rl(reward="fractional"))
+    out = _run(task, n_steps=2)
+    assert torch.isfinite(torch.tensor(out["total_loss"]))
+    # 2 training batches + 2 val batches x 2 prompt types (both passes run the teacher on their rows)
+    assert _FakeTeacher.calls == 2 + 4
+
+
+def test_refusals():
+    with pytest.raises(ValueError, match="at least one"):
+        task = SearchRunTask(_cfg(adaln=False, tokens="none", condition_heads=False), rl=_rl())
+        task._build_prompt_model(torch.device("cpu"), None)
+    task = SearchRunTask(_cfg(), rl=_rl())
+    with pytest.raises(RuntimeError, match="DDP"):
+        task.build_loaders(world_size=2, rank=0)
+    with pytest.raises(ValueError, match="release"):
+        SearchRunTask(replace(_cfg(), dataset="coco_search18"), rl=_rl()).build_loaders(world_size=1, rank=0)
+
+
+def test_coco_zero_shot_test_with_prompts(fake_cs18, fake_vp_release):  # noqa: F811
+    """harness.evaluate's path on COCO-Search18 with cue='prompt': text = the category name, visual = the
+    release's vp_test prompt of the category; keys per prompt type."""
+    root, _ = fake_cs18
+    cfg = replace(_cfg(visual_share=0.5), dataset="coco_search18", data_root=root, release_dir=fake_vp_release)
+    task = _TinyPromptTask(cfg, rl=_rl())
+    task.build_val_loader = SearchRunTask.build_val_loader.__get__(task)  # the real COCO val loader
+    loader = task.build_val_loader()
+    b = next(iter(loader))
+    assert "vp_feat" in b and set(b["text"]) <= {"bottle", "bowl", "car", "chair", "clock", "cup", "fork",
+                                                 "keyboard", "knife", "laptop"}
+    assert b["vp_valid"].tolist() == [t in ("bottle", "bowl") for t in b["text"]]
+    model, head = task.build_model(torch.device("cpu"))
+    out = task.evaluate(model=model, head=head, val_loader=loader, device=torch.device("cpu"), step=0)
+    assert "text/found_mean_random" in out and "visual/found_mean_random" in out

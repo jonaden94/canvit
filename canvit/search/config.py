@@ -66,6 +66,52 @@ class SearchAugConfig:
 
 
 @dataclass
+class PromptConfig:
+    """Prompt-cued search on the curated release (owner decisions 2026-11-26,
+    ``canvit_claude/canvit/search/04-prompt-conditioning-decisions.md``; ``prompt.py``). ``cue='class'`` = the
+    class-index path of COCO-Search18 (everything below unused); ``cue='prompt'`` = text and visual prompts, no
+    class index anywhere."""
+
+    cue: Literal["class", "prompt"] = "class"
+    visual_share: float = 0.5
+    """PROPOSAL (not decided by the owner). Share of trials cued by their visual prompt, in [0, 1]: 0 = text only,
+    1 = visual only. Trials are dropped only when the epoch cannot meet it (``prompt.assign_prompt_types``); > 0
+    needs a release with visual prompts."""
+    adaln: bool = True
+    """AdaLN of the prompt's 1x1 vector in every backbone block, zero at init."""
+    tokens: Literal["none", "1x1", "2x2", "3x3"] = "2x2"
+    """PROPOSAL (not decided by the owner). Prompt tokens read by gated cross-attention (tanh gate, 0 at init)
+    before every backbone block: none / the 1x1 cell / the 4 cells of 2x2 / the 9 cells of 3x3 (empty cells
+    masked); a text prompt is one token."""
+    condition_heads: bool = True
+    """The task head is FiLM-conditioned on the prompt (else on a zero vector: the backbone alone carries it)."""
+    condition_policy: bool = True
+    """The policy is FiLM-conditioned on the prompt (else unconditioned)."""
+    backbone_lr: float | None = None
+    head_lr: float | None = None
+    policy_lr: float | None = None
+    """Optional separate LRs (backbone; heads incl. the prompt modules; policy). None = ``peak_lr``, the ONE LR of
+    all groups by default (decision 6). See the comment in ``SearchRunTask._prompt_spec``."""
+    bptt_chunk: int | None = 2
+    """PROPOSAL (memory). The backbone trains through the rollout in chunks of this many glimpses (truncated
+    BPTT, as distill); None = one graph over all ``n_timesteps`` glimpses (did not fit a V100-32GB at batch 16 with
+    10 glimpses)."""
+    distill_weight: float = 0.0
+    """Weight of the distillation loss (DINOv3 scene features from the canvas, as in pretraining) next to the
+    search loss. 0 = off: no teacher is built or called."""
+    best_prompt_type: Literal["mean", "text", "visual"] = "mean"
+    """Which prompt type's mean found rate selects the best checkpoint (open for the owner)."""
+    v100_math_sdpa: bool = False
+    """Allow gradients through the backbone on a V100 (sm_70) by switching SDPA to its math kernel for the run.
+    Without it such a run is refused (``task.sdpa_guard``): there the memory-efficient SDPA backward returns
+    garbage gradients (~1e12 at block 0; CPU and math-only give ~10, 2026-11-26). Applies to every search run
+    (class-cued with a trained backbone too), not only prompt-cued ones."""
+    eval_cosine_baseline: bool = False
+    """Also report the zero-shot baseline: heatmap = cosine of the canvas's predicted DINOv3 patch features and the
+    raw prompt vector (needs the pretraining scene head, kept for it)."""
+
+
+@dataclass
 class SearchConfig:
     # --- data ------------------------------------------------------------------
     dataset: Literal["coco_search18", "release"] = "coco_search18"
@@ -79,6 +125,7 @@ class SearchConfig:
     section 7 of a release with visual prompts, read from ``release_dir``). ``release``: the sampler's / val's
     ``vp_idx``. ``coco_search18``: evaluation only, a fixed prompt per trial from ``release_dir``'s ``vp_test``
     (training on COCO-Search18 with it is refused). Off: samples exactly as without visual prompts."""
+    prompt: PromptConfig = field(default_factory=PromptConfig)
     data_root: Path = field(default_factory=_default_data_root)
     """COCO-Search18 root in the restructured layout: ``images/<name>.jpg`` (flat) +
     ``fixations/*.json`` (``data.py``). The padded release (Haoze's setting), not ``_nopadding``."""
@@ -136,12 +183,15 @@ class SearchConfig:
     implementation scales every sample alike (it is not class balancing)."""
 
     # --- rollout / eval ----------------------------------------------------------------
-    n_timesteps: int = 4
-    """Glimpses per episode: the centred t0 fixation plus n-1 chosen ones (Haoze: 4)."""
-    eval_policies: tuple[str, ...] = ("random", "greedy", "policy")
+    n_timesteps: int | None = None
+    """Glimpses per episode: the centred t0 fixation plus n-1 chosen ones. None = 4 (Haoze) for
+    ``prompt.cue='class'``, 10 for ``'prompt'`` (the metric of record averages t1..t9)."""
+    eval_policies: tuple[str, ...] | None = None
     """Fixation policies run at every validation. ``random``: seeded random fixations.
     ``greedy``: the argmax of the current task heatmap, never revisiting a cell.
-    ``policy``: the learned scorer's argmax (skipped when no policy is trained)."""
+    ``policy``: the learned scorer's argmax (skipped when no policy is trained).
+    None = all three for ``prompt.cue='class'``; ``('policy',)`` for ``'prompt'`` (a full release validation per
+    rule takes long), where ``random`` is added at the first validation and at ``max_steps`` as a baseline."""
     overlap_box_frac: float = 0.1
     """Side of the square drawn around a point, as a fraction of the scene side, for the
     lenient metrics ``found_X_percent`` (the task head's argmax) and ``hit_X_percent`` (the
@@ -181,6 +231,13 @@ class SearchConfig:
     wandb_project: str | None = field(default_factory=_default_wandb_project)
     wandb_entity: str | None = field(default_factory=_default_wandb_entity)
     wandb_dir: Path | None = field(default_factory=_default_wandb_dir)
+
+    def __post_init__(self) -> None:
+        prompt = self.prompt.cue == "prompt"
+        if self.n_timesteps is None:
+            self.n_timesteps = 10 if prompt else 4
+        if self.eval_policies is None:
+            self.eval_policies = ("policy",) if prompt else ("random", "greedy", "policy")
 
 
 # FoAViS's entropy target was 3.5 nats on a 64x64 policy grid. The same spatial spread on
