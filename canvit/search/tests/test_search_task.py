@@ -442,3 +442,40 @@ def test_resumed_search_run_keeps_the_runs_best_checkpoint(fake_cs18, tmp_path, 
     assert load_checkpoint(tmp_path / "best.pt", "cpu")["step"] == 1
     assert load_checkpoint(tmp_path / "latest.pt", "cpu")["extra"]["best"]["value"] == 0.8
     assert evals == [0, 1, 2, 3, 4], "each step validated once; the run's final weights included"
+
+
+def test_search_run_stops_at_max_steps_and_a_spare_array_task_does_nothing(fake_cs18, tmp_path, monkeypatch):
+    """Search's defaults (checkpoint at every validation, keep 1) through harness.run, with
+    a 4-step run in chunks of 3: chunk 2 trains only 1 step (to max_steps), chunk 3 starts
+    at max_steps and exits without validating or training."""
+    from canvit.harness.infra.checkpoint import load_checkpoint
+    from canvit.harness.loop import read_last_val
+    root, _ = fake_cs18
+    evals: list[int] = []
+
+    def fake_eval(self, **kw):
+        evals.append(kw["step"])
+        return {"found_t2_policy": 0.1 * kw["step"]}
+    monkeypatch.setattr(SearchRunTask, "evaluate", fake_eval)
+
+    def chunk():
+        task = _TinyTask(_cfg(root), rl=_rl())
+        s = RunSettings(n_steps=3, max_steps=4, eval_every=1, log_every=1, grad_clip=1.0, amp=False,
+                        seed=0, device="cpu", tracker="none", ckpt_dir=tmp_path, resume=True,
+                        ckpt_at_eval=True, keep_ckpts=1)
+        return run(task=task, spec=task.default_spec(), settings=s)
+    chunk()                                   # 0, 1, 2 + end 3
+    chunk()                                   # resumed at 3 (validated): 1 step, end 4
+    assert chunk() == {}                      # spare: start 4 >= max_steps
+    assert evals == [0, 1, 2, 3, 4]
+    assert sorted(p.name for p in tmp_path.glob("*.pt")) == ["best.pt", "latest.pt", "step-4.pt"]
+    assert load_checkpoint(tmp_path / "latest.pt", "cpu")["step"] == 4 and read_last_val(tmp_path)["step"] == 4
+    # Complete but its final weights not on record as validated (the final validation died,
+    # or the run predates validate-at-end): the next job validates them once, trains nothing.
+    (tmp_path / "last_val.json").unlink()
+    mtime = (tmp_path / "step-4.pt").stat().st_mtime_ns
+    chunk()
+    assert evals == [0, 1, 2, 3, 4, 4]
+    assert (tmp_path / "step-4.pt").stat().st_mtime_ns == mtime, "a validation-only job must not rewrite the checkpoint"
+    assert read_last_val(tmp_path)["step"] == 4 and load_checkpoint(tmp_path / "best.pt", "cpu")["step"] == 4
+    assert chunk() == {}                      # and now it is on record: nothing to do

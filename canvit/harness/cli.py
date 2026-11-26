@@ -63,6 +63,14 @@ class HarnessOpts:
     start_step: int = 0
     ckpt_every: int = 0
     """Periodic checkpoints every N steps (0 => only the end-of-run checkpoint)."""
+    ckpt_at_eval: bool | None = None
+    """Also checkpoint the validated weights at every validation (resumable step-N.pt +
+    latest.pt), so a job killed mid-way loses at most one validation interval. None => the
+    task default: True for search; False elsewhere (distill / in1k refuse it: their shard
+    schedule resumes only at a job boundary)."""
+    keep_ckpts: int | None = None
+    """Keep only the newest N step-*.pt of the run (0 => keep all; best.pt is always kept).
+    None => the task default: 1 for search, 0 elsewhere."""
     viz_every: int = 0
     """Render the task's training-batch visualization every N steps. 0 => the task
     config's own cadence (distill: ``val_every * viz_every_n_vals``; ade20k:
@@ -121,6 +129,7 @@ def _common(opts: HarnessOpts) -> dict[str, Any]:
     """HarnessOpts fields that map straight onto RunSettings."""
     out = {
         "start_step": opts.start_step, "ckpt_every": opts.ckpt_every,
+        "ckpt_at_eval": bool(opts.ckpt_at_eval), "keep_ckpts": opts.keep_ckpts or 0,
         "viz_every": opts.viz_every,
         "signal_checkpoint": opts.signal_checkpoint,
         "use_failed_marker": opts.use_failed_marker, "amp_dtype": opts.amp_dtype,
@@ -270,6 +279,7 @@ class Ade20kCmd:
             seed=self.opts.seed if self.opts.seed is not None else self.cfg.seed,
             device=self.cfg.device,
             resume=self.opts.resume if self.opts.resume is not None else False,
+            max_steps=self.cfg.max_steps,
             **_identity(self.cfg, self.opts, prefix="ade20k"),
             **{**_common(self.opts),
                # specialize's segmentation overlay cadence (cfg.viz_every, default 500).
@@ -470,8 +480,12 @@ class SearchCmd:
             seed=self.opts.seed if self.opts.seed is not None else self.cfg.seed,
             device=self.cfg.device,
             resume=self.opts.resume if self.opts.resume is not None else False,
+            max_steps=self.cfg.max_steps,
             **_identity(self.cfg, self.opts, prefix="search"),
-            **{**_common(self.opts), "viz_every": self.opts.viz_every or self.cfg.viz_every},
+            **{**_common(self.opts), "viz_every": self.opts.viz_every or self.cfg.viz_every,
+               # a time limit must never cost more than one validation interval (2026-11-26)
+               "ckpt_at_eval": self.opts.ckpt_at_eval if self.opts.ckpt_at_eval is not None else True,
+               "keep_ckpts": self.opts.keep_ckpts if self.opts.keep_ckpts is not None else 1},
         )
         return SearchRunTask(self.cfg, rl=self.rl), settings
 
