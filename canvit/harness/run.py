@@ -68,6 +68,7 @@ from canvit.harness.loop import (
     apply_requires_grad,
     cancel_slurm_array,
     install_sigusr1_handler,
+    read_last_val,
     run_training_loop,
 )
 from canvit.harness.optim import build_optimizer_and_scheduler
@@ -96,6 +97,9 @@ class RunSettings:
     # cadence
     log_every: int = 20
     ckpt_every: int = 0          # 0 => only the end-of-run checkpoint
+    ckpt_at_eval: bool = False   # also checkpoint the validated weights at every validation (resumable)
+    keep_ckpts: int = 0          # keep only the newest N step-*.pt of the run (0 => all); best.pt always kept
+    max_steps: int | None = None # the run's total: a job trains at most up to it, a job starting there exits
     eval_every: int = 0          # 0 => no periodic eval
     ckpt_dir: Path | None = None
     # resume + operational (task-neutral; parity with train/loop.py)
@@ -274,6 +278,9 @@ def run(*, task: RunTask, spec: TrainSpec, settings: RunSettings) -> dict:
     """Train ``task`` under ``spec`` for ``settings.n_steps`` and return the last
     step's metrics. Task-neutral; every task-specific decision is delegated to ``task``.
     """
+    if settings.ckpt_at_eval and not getattr(task, "resumes_mid_job", True):
+        raise ValueError(f"ckpt_at_eval: task {task.name!r} resumes only at a job boundary (its shard "
+                         "schedule), so a checkpoint at a mid-job validation could never be resumed")
     # Topology first: under srun the environment knows the real rank/world size, and
     # RunSettings' single-GPU defaults would make every rank think it trains alone.
     dinfo = ddp.setup(device=settings.device, rank=settings.rank, world_size=settings.world_size)
@@ -445,6 +452,38 @@ def run(*, task: RunTask, spec: TrainSpec, settings: RunSettings) -> dict:
     else:
         log.info("FRESH mode: no checkpoint, starting from scratch")
 
+    # The previous job validated its final weights (loop.write_last_val): skip that one
+    # validation and take the best from the record, which includes it. Keyed on the step,
+    # so any other resume (a mid-job/signal checkpoint, an older run, a final validation
+    # that did not complete) validates at its start as before. Every rank reads the same file.
+    last_val = None if (forked or prior_ckpt is None) else read_last_val(ckpt_dir)
+    if last_val is not None and last_val.get("step") != start_step:
+        last_val = None
+    if last_val is not None:
+        log.info("RESUME: step %d was validated by the previous job; not validating it again", start_step)
+
+    # --- the run's total (max_steps) ------------------------------------------
+    # A job resumed from a mid-job checkpoint (ckpt_at_eval) starts off its chunk grid, so
+    # a fixed n_steps would overshoot the run's end (and a cosine schedule's). Train at
+    # most up to max_steps; a spare array task that starts at or past it does nothing.
+    n_steps = settings.n_steps
+    if settings.max_steps is not None:
+        n_steps = min(n_steps, settings.max_steps - start_step)
+        if n_steps <= 0:
+            if settings.eval_every and prior_ckpt is not None and last_val is None:
+                # Complete, but its final weights were never validated (the job died during
+                # that validation, or the run predates validate-at-end): validate them, no training.
+                log.info("run complete at step %d but its final weights were never validated: "
+                         "validating them (no training)", start_step)
+                n_steps = 0
+            else:
+                log.info("run already complete: start step %d >= max_steps %d; nothing to do",
+                         start_step, settings.max_steps)
+                return {}
+        if n_steps < settings.n_steps:
+            log.info("this job trains %d steps (to max_steps %d), not n_steps %d",
+                     n_steps, settings.max_steps, settings.n_steps)
+
     # --- data + selector ---------------------------------------------------
     train_loader, val_loader = task.build_loaders(world_size=world_size, rank=rank)
     # Every rank must start from IDENTICAL weights and buffers, or averaged gradients are
@@ -614,15 +653,17 @@ def run(*, task: RunTask, spec: TrainSpec, settings: RunSettings) -> dict:
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "run_config.json").write_text(json.dumps(settings.run_config, indent=1) + "\n")
 
+
     try:
         last = run_training_loop(
             task=task, model=model, head=head, optimizer=optimizer, scheduler=scheduler,
             selector=selector, spec=spec, branches=branches, canvas_grid=canvas_grid, device=device,
-            train_batches=train_batches, n_steps=settings.n_steps, start_step=start_step,
+            train_batches=train_batches, n_steps=n_steps, start_step=start_step,
             joint=joint, amp_ctx=amp_ctx, grad_clip=settings.grad_clip, is_dist=is_dist, rank=rank,
             task_name=task.name, model_config=task.model_config(model),
             metadata=metadata, log_every=settings.log_every,
             ckpt_dir=ckpt_dir, ckpt_every=settings.ckpt_every, eval_every=settings.eval_every,
+            ckpt_at_eval=settings.ckpt_at_eval, keep_ckpts=settings.keep_ckpts,
             ema_alpha=settings.ema_alpha, log_grad_norms=settings.log_grad_norms,
             log_timing=settings.log_timing,
             viz_every=settings.viz_every, run_dir=run_dir,
@@ -630,7 +671,9 @@ def run(*, task: RunTask, spec: TrainSpec, settings: RunSettings) -> dict:
             signal_checkpoint=settings.signal_checkpoint,
             best_metric=getattr(task, "best_metric", None),
             # a run forked by resume_from starts its own best (the source run's is not this run's)
-            best_init=None if forked else ((prior_ckpt or {}).get("extra") or {}).get("best"),
+            best_init=None if forked else ((last_val or {}).get("best")
+                                           or ((prior_ckpt or {}).get("extra") or {}).get("best")),
+            validated_step=last_val["step"] if last_val is not None else None,
             on_log=on_log, on_eval=(on_eval if settings.eval_every else None),
             on_best=on_best,
         )

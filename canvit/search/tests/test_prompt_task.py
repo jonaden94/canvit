@@ -178,8 +178,9 @@ def test_distill_on_calls_the_teacher_once_per_batch(monkeypatch):
     task = _TinyPromptTask(_cfg(distill_weight=0.1), rl=_rl(reward="fractional"))
     out = _run(task, n_steps=2)
     assert torch.isfinite(torch.tensor(out["total_loss"]))
-    # 2 training batches + 2 val batches x 2 prompt types (both passes run the teacher on their rows)
-    assert _FakeTeacher.calls == 2 + 4
+    # 2 training batches + 2 validations (step 0 and the final weights, since 2026-11-26) x
+    # 2 val batches x 2 prompt types (both passes run the teacher on their rows)
+    assert _FakeTeacher.calls == 2 + 2 * 4
 
 
 def test_refusals():

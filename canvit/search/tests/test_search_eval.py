@@ -19,11 +19,17 @@ from .test_search_task import _cfg, _rl, _TinyTask
 
 
 class _RecordingTinyTask(_TinyTask):
-    """Keeps the metrics of its last training-time validation."""
+    """Keeps the metrics of every training-time validation, by step."""
 
     def evaluate(self, **kw):
-        self.last_eval = super().evaluate(**kw)
-        return self.last_eval
+        self.evals = getattr(self, "evals", {})
+        self.evals[kw["step"]] = super().evaluate(**kw)
+        return self.evals[kw["step"]]
+
+    def eval_of(self, ckpt: Path) -> dict:
+        """The validation whose weights ``ckpt`` holds (a run validates step 0 and its final
+        weights, so the last validation need not be the best one)."""
+        return self.evals[torch.load(ckpt, map_location="cpu", weights_only=False)["step"]]
 
 
 def _argv(root: Path, run_dir: Path) -> list[str]:
@@ -39,7 +45,7 @@ def _argv(root: Path, run_dir: Path) -> list[str]:
 
 @pytest.fixture(scope="module")
 def trained(fake_cs18, tmp_path_factory):
-    """Train the tiny search model 2 steps (validation at step 2 writes best.pt)."""
+    """Train the tiny search model 2 steps (validations at 0 and of the final weights, 2)."""
     root, _ = fake_cs18
     run_dir = tmp_path_factory.mktemp("logs") / "g" / "tiny"
     argv = _argv(root, run_dir)
@@ -51,7 +57,7 @@ def trained(fake_cs18, tmp_path_factory):
                            device="cpu", tracker="none", run_dir=run_dir,
                            run_config=run_config_of(cmd, argv))
     run(task=task, spec=task.default_spec(), settings=settings)
-    return root, run_dir, task.last_eval, argv
+    return root, run_dir, task.eval_of(run_dir / "checkpoints" / "best.pt"), argv
 
 
 def test_the_run_config_is_saved_in_the_checkpoint_and_the_run_dir(trained):

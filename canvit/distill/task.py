@@ -101,6 +101,9 @@ class DistillRunTask:
     the model — stashed in ``build_model`` — and the first shard)."""
 
     name = "distill"
+    # The WebDataset shard schedule resumes only at a job boundary (resume_start_step), so a
+    # mid-job checkpoint (RunSettings.ckpt_at_eval) could never be resumed: refused.
+    resumes_mid_job = False
     display_frame = "scene"
     """How the training images sit in the scene (read by the scanpath evaluation): resized and centre-cropped
     to the square scene (``core.preprocess``)."""

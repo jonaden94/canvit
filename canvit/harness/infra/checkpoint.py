@@ -58,7 +58,11 @@ def save_checkpoint(
         "extra": extra or {},
         "policy_state": joint.state_dict() if joint is not None else None,
     }
-    torch.save(payload, path)
+    # Atomic: a job killed mid-write (time limit) leaves only the .tmp, never a truncated
+    # step-N.pt that find_latest's fallback (highest step file) would try to resume from.
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
     if update_latest:
         update_latest_symlink(path.parent / "latest.pt", path)
     return path

@@ -97,7 +97,7 @@ def test_conditioned_search_trains_end_to_end(fake_cs18):
 
 @pytest.fixture(scope="module")
 def trained_stage2(fake_cs18, tmp_path_factory):
-    """Train the tiny conditioned search model 2 steps from a command line (best.pt at step 2)."""
+    """Train the tiny conditioned search model 2 steps from a command line (validated at 0 and 2)."""
     root, _ = fake_cs18
     run_dir = tmp_path_factory.mktemp("logs") / "g" / "tiny_beta"
     argv = _argv(root, run_dir) + STAGE2_ARGV
@@ -107,7 +107,7 @@ def trained_stage2(fake_cs18, tmp_path_factory):
     settings = RunSettings(n_steps=2, eval_every=2, log_every=1, grad_clip=1.0, amp=False, seed=0,
                            device="cpu", tracker="none", run_dir=run_dir, run_config=run_config_of(cmd, argv))
     run(task=task, spec=task.default_spec(), settings=settings)
-    return run_dir, task.last_eval
+    return run_dir, task.eval_of(run_dir / "checkpoints" / "best.pt")
 
 
 def test_stage2_checkpoint_records_the_cost_and_reproduces_its_validation(trained_stage2):
