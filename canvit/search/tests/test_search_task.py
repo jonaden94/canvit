@@ -416,3 +416,23 @@ def test_head_lr_schedule_cosine_by_default_constant_on_request(fake_cs18):
     # the head then follows the same schedule shape as the policy group
     pol = _TinyTask(_cfg(root), rl=_rl(policy_warmup_steps=0, policy_warmup_frac=0.0)).default_spec().optim["policy"]
     assert pol.schedule.kind == const.schedule.kind
+
+
+def test_resumed_search_run_keeps_the_runs_best_checkpoint(fake_cs18, tmp_path, monkeypatch):
+    """Through harness.run: chunk 1 peaks, chunk 2 (resumed from latest.pt) validates worse,
+    so best.pt must stay at chunk 1's peak (it used to be replaced: best was per job)."""
+    from canvit.harness.infra.checkpoint import load_checkpoint
+    root, _ = fake_cs18
+    scores = iter([0.2, 0.8, 0.5, 0.4, 0.3])     # validations at steps 0, 1 | 2, 3, ...
+    monkeypatch.setattr(SearchRunTask, "evaluate", lambda self, **kw: {"found_t2_policy": next(scores)})
+
+    def chunk(n):
+        task = _TinyTask(_cfg(root), rl=_rl())
+        s = RunSettings(n_steps=n, eval_every=1, log_every=1, grad_clip=1.0, amp=False, seed=0,
+                        device="cpu", tracker="none", ckpt_dir=tmp_path, resume=True)
+        run(task=task, spec=task.default_spec(), settings=s)
+    chunk(2)                                       # steps 0-1: best 0.8 at step 1
+    assert load_checkpoint(tmp_path / "best.pt", "cpu")["step"] == 1
+    chunk(2)                                       # resumed, steps 2-3: 0.5, 0.4
+    assert load_checkpoint(tmp_path / "best.pt", "cpu")["step"] == 1
+    assert load_checkpoint(tmp_path / "latest.pt", "cpu")["extra"]["best"]["value"] == 0.8

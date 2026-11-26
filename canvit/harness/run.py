@@ -577,6 +577,7 @@ def run(*, task: RunTask, spec: TrainSpec, settings: RunSettings) -> dict:
             grad_norm_deep_prefixes=settings.grad_norm_deep_prefixes,
             signal_checkpoint=settings.signal_checkpoint,
             best_metric=getattr(task, "best_metric", None),
+            best_init=((prior_ckpt or {}).get("extra") or {}).get("best"),
             on_log=on_log, on_eval=(on_eval if settings.eval_every else None),
             on_best=on_best,
         )

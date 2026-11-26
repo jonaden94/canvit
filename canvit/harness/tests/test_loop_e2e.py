@@ -115,6 +115,37 @@ def test_best_checkpoint_tracks_max_and_leaves_latest_alone(tmp_path):
     assert find_latest(tmp_path).name == "step-4.pt"
 
 
+def test_best_checkpoint_survives_a_resume(tmp_path):
+    """A resumed array task continues the run's best so far (stored in every checkpoint):
+    a later, worse validation must not replace best.pt (it used to: best was per job)."""
+    seg = _seg()
+    spec = TrainSpec.probe(
+        bptt=BpttSpec(mode="none", horizon=2),
+        optim={"head": GroupOptim(lr=1e-2, schedule=ScheduleSpec(kind="warmup_constant", warmup_steps=1))},
+    )
+    apply_requires_grad(model=seg, head=seg.head, joint=None, spec=spec)
+    opt, sched = build_optimizer_and_scheduler(spec, {"head": list(seg.head.parameters())})
+    selector = RandomSelector(is_foveated=False, foveated_scale=FoveatedScaleConfig(), min_viewpoint_scale=0.05)
+    scores = {0: 0.10, 1: 0.60, 2: 0.30, 3: 0.40, 4: 0.20, 5: 0.70}
+    kw = dict(task=_StubAdeTask(), model=seg, head=seg.head, optimizer=opt, scheduler=sched,
+              selector=selector, spec=spec, branches=[ViewpointType.FULL], canvas_grid=_G,
+              device=torch.device("cpu"), task_name="ade20k", model_config={"num_classes": NUM_CLASSES},
+              ckpt_dir=tmp_path, eval_every=1, best_metric="miou_final",
+              on_eval=lambda s: {"miou_final": scores[s]})
+    run_training_loop(**kw, train_batches=_batches(), n_steps=3)            # job 1: steps 0-2, best at 1
+    latest = load_checkpoint(find_latest(tmp_path), "cpu")
+    assert latest["extra"]["best"] == {"metric": "miou_final", "value": 0.60, "step": 1}
+    run_training_loop(**kw, train_batches=_batches(), n_steps=2, start_step=3,  # job 2: 3-4, both worse
+                      best_init=latest["extra"]["best"])
+    assert load_checkpoint(tmp_path / "best.pt", "cpu")["step"] == 1, "a worse resumed eval replaced best.pt"
+    run_training_loop(**kw, train_batches=_batches(), n_steps=1, start_step=5,  # job 3: 5 beats it
+                      best_init=load_checkpoint(find_latest(tmp_path), "cpu")["extra"]["best"])
+    assert load_checkpoint(tmp_path / "best.pt", "cpu")["step"] == 5
+    # without a stored best (an old checkpoint), the loop starts over as before
+    run_training_loop(**kw, train_batches=_batches(), n_steps=1, start_step=4, best_init=None)
+    assert load_checkpoint(tmp_path / "best.pt", "cpu")["step"] == 4
+
+
 def test_no_best_metric_writes_no_best_checkpoint(tmp_path):
     seg = _seg()
     spec = TrainSpec.probe(

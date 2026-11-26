@@ -203,6 +203,7 @@ def run_training_loop(
     run_dir: Path | None = None,     # where task.render_viz writes figures (locally)
     signal_checkpoint: bool = True,  # honor SIGUSR1 -> checkpoint (handler in run())
     best_metric: str | None = None,  # eval key to MAXIMIZE -> writes ckpt_dir/best.pt
+    best_init: dict | None = None,   # a resumed run's best so far ({"metric", "value", "step"})
     on_log: Callable[[int, dict], None] | None = None,
     on_eval: Callable[[int], dict] | None = None,
     on_best: Callable[[int, str, float], None] | None = None,
@@ -222,10 +223,14 @@ def run_training_loop(
     last: dict = {}
 
     def _write_ckpt(path: Path, step: int, *, update_latest: bool = True) -> None:
+        # Every checkpoint carries the run's best so far, so a resumed array task keeps
+        # comparing against it (see _track_best) instead of starting over.
+        extra = ({"best": {"metric": best_metric, "value": best_so_far, "step": best_step}}
+                 if best_metric and best_so_far is not None else None)
         save_checkpoint(
             path, model=model, optimizer=optimizer, scheduler=scheduler,
             step=step, task_name=task_name, spec=spec, model_config=model_config,
-            metadata=metadata, joint=joint, update_latest=update_latest,
+            metadata=metadata, joint=joint, update_latest=update_latest, extra=extra,
         )
 
     def _save(step: int) -> None:
@@ -240,21 +245,27 @@ def run_training_loop(
 
     # Best-checkpoint selection (ade20k/train.py 177-182, in1k/train.py 210-214): the
     # task names an eval metric to MAXIMIZE and the improving checkpoint is kept as
-    # `best.pt`, because what you publish is the best probe, not the last one. Per-job,
-    # which is exactly the standalone semantics (neither standalone resumes, and both
-    # run their whole schedule in one job). Tasks with no `best_metric` are unaffected.
+    # `best.pt`, because what you publish is the best probe, not the last one. Over the
+    # whole RUN: a resumed array task starts from the best so far stored in the checkpoint
+    # it resumed from (`best_init`), so a worse validation never replaces best.pt. (Until
+    # 2026-11-26 the best was per job: each resumed chunk overwrote best.pt with its own
+    # best.) Tasks with no `best_metric` are unaffected.
     #
     # NO barrier here, unlike _save: validation is rank-0-only (on_eval returns {} on the
     # others), so only rank 0 ever gets a metric to compare. A barrier would deadlock.
     best_so_far: float | None = None
+    best_step: int | None = None
+    if best_init and best_metric and best_init.get("metric") == best_metric:
+        best_so_far, best_step = float(best_init["value"]), best_init.get("step")
+        log.info("resumed best so far: %s=%.4f (step %s)", best_metric, best_so_far, best_step)
 
     def _track_best(step: int, metrics: dict) -> None:
-        nonlocal best_so_far
+        nonlocal best_so_far, best_step
         if not best_metric or best_metric not in metrics:
             return
         value = metrics[best_metric]
         if best_so_far is None or value > best_so_far:
-            best_so_far = value
+            best_so_far, best_step = value, step
             if ckpt_dir is not None:
                 # update_latest=False is load-bearing: `latest.pt` must keep pointing at
                 # the NEWEST checkpoint. Repointing it at best.pt would make a resumed
