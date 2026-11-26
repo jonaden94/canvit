@@ -269,11 +269,12 @@ def run_rollout(
         # Empty for the historical inline-credit objectives (QReg/PG).
         defer = is_policy and joint is not None and joint.defers_credit
         traj: list[dict[str, Tensor]] = []
-        # Optional saccade cost (terminal-reward PG only, refused elsewhere by build_policy):
+        # Optional saccade cost (PG with any reward, QReg; refused for VPG by build_policy):
         # the length of each policy saccade, measured from the previous glimpse centre (t0's
         # FULL view sits at the scene centre). Off => nothing is measured, the path is unchanged.
-        measure_saccades = defer and joint is not None and joint.saccade_cost.active
+        measure_saccades = is_policy and joint is not None and joint.saccade_cost.active
         prev_centre: Tensor | None = None
+        sacc_len: Tensor | None = None  # [B] this glimpse's saccade length (measure_saccades only)
         # Stage 2 (beta-conditioned policy): the task's per-trial beta [B], drawn at bind.
         beta_kw: dict[str, Tensor] = {}
         if measure_saccades and joint is not None and joint.saccade_cost.conditioned:
@@ -351,6 +352,11 @@ def run_rollout(
                 assert joint is not None
                 aux = sel.last_aux  # type: ignore[attr-defined]
                 assert aux is not None, "policy selector produced no aux for a RANDOM glimpse"
+            if measure_saccades:
+                assert prev_centre is not None
+                centre = vp.centers.detach().float()  # [B, 2] (cy, cx) in [-1, 1]
+                sacc_len = (centre - prev_centre).norm(dim=-1)
+                prev_centre = centre
             if is_policy and defer:
                 # VPG: buffer this action's logits + V(s_t); the reward is only known at
                 # the LAST glimpse, so the loss is built below (still inside the loop, so
@@ -359,17 +365,15 @@ def run_rollout(
                 traj.append({"scores": aux["scores"], "flat_idx": aux["flat_idx"],
                              "value": joint.state_value(aux["feats"]) if joint.needs_value else None})
                 if measure_saccades:
-                    assert prev_centre is not None
-                    centre = vp.centers.detach().float()  # [B, 2] (cy, cx) in [-1, 1]
-                    traj[-1]["saccade_len"] = (centre - prev_centre).norm(dim=-1)
-                    prev_centre = centre
+                    traj[-1]["saccade_len"] = sacc_len
             elif is_policy:
                 assert joint is not None and prev_pi_loss is not None and aux is not None
                 cur_pi = task.per_image_loss(gout.readout).detach()
                 reward = joint.inline_reward(prev_pi_loss, cur_pi)
                 prev_pi_loss = cur_pi
                 ploss = joint.glimpse_loss(depth=t, scores=aux["scores"], flat_idx=aux["flat_idx"], reward=reward,
-                                           **mask_kw)
+                                           **mask_kw, **({"saccade_len": sacc_len, **beta_kw}
+                                                         if measure_saccades else {}))
                 # chunk_loss is divided by n_glimpses below, but there are only
                 # n_glimpses-1 POLICY glimpses (t0 is the anchor and carries no policy
                 # loss). Undo that division and re-normalize by the policy count, so the

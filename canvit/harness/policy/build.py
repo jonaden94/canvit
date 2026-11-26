@@ -116,15 +116,21 @@ def build_policy(
     # Reward kind + centring + scaling; refuses what the objective cannot honour.
     reward = resolve_reward(objective=obj, reward=rl.reward, center=rl.reward_center, scale=rl.reward_scale)
 
-    # Optional saccade cost: defined on the deferred (terminal-reward) PG path only.
+    # Optional saccade cost: PG with any reward (terminal or per glimpse) and QReg (per glimpse).
+    # VPG is refused: its advantage is R - V(s_t) with a learned V that predicts the terminal
+    # reward, so a per-step cost would need its own value target; not defined yet.
     conditioned = rl.saccade_cost_beta_mode == "conditioned"
+    if rl.saccade_cost_r is not None and (rl.saccade_cost != "log" or rl.saccade_cost_r <= 0.0):
+        raise ValueError(f"saccade_cost_r is the log cost's scale: it needs saccade_cost='log' and r > 0 "
+                         f"(scene units, [-1, 1]); got saccade_cost={rl.saccade_cost!r}, r={rl.saccade_cost_r}")
     saccade_cost = SaccadeCost(form=rl.saccade_cost, weight=rl.saccade_cost_weight,
-                               combine=rl.saccade_cost_combine, r=1.0 / rl.centers_per_axis,
+                               combine=rl.saccade_cost_combine,
+                               r=1.0 / rl.centers_per_axis if rl.saccade_cost_r is None else rl.saccade_cost_r,
                                conditioned=conditioned, beta_eval=rl.saccade_cost_beta_eval)
-    if saccade_cost.active and not (isinstance(obj, PG) and reward.kind == "terminal"):
+    if saccade_cost.active and not isinstance(obj, (PG, QReg)):
         raise ValueError(
-            f"saccade_cost={rl.saccade_cost!r} is implemented for objective='pg' with "
-            f"reward='terminal' only (got objective={rl.objective!r}, reward={reward.kind!r}).")
+            f"saccade_cost={rl.saccade_cost!r} is implemented for objective='pg' (any reward) and "
+            f"'qreg', not {rl.objective!r}: VPG's learned V(s) baseline predicts the terminal reward only.")
     if not saccade_cost.active and rl.saccade_cost_weight != 0.0:
         raise ValueError("saccade_cost_weight is set but saccade_cost='none': choose 'log' or 'linear'.")
     if conditioned:

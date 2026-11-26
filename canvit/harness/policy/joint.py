@@ -52,17 +52,20 @@ from canvit.harness.rollout.viewpoint import ViewpointType
 
 @dataclass(frozen=True)
 class SaccadeCost:
-    """Optional cost of each policy saccade on the terminal-reward PG target
-    (``JointPolicyConfig.saccade_cost*``). ``d`` is the Euclidean distance between
+    """Optional cost of each policy saccade on the policy target (``JointPolicyConfig.saccade_cost*``):
+    PG with any reward (terminal: :meth:`JointPolicy.trajectory_loss`; per glimpse:
+    :meth:`JointPolicy.glimpse_loss`) and QReg (per glimpse). ``d`` is the Euclidean distance between
     consecutive glimpse centres in the [-1, 1] centre units (scene width = 2).
 
-    ``log``: c(d) = log(1 + d / r), r = half a policy-grid cell (= 1 / centers_per_axis).
+    ``log``: c(d) = log(1 + d / r); r defaults to half a policy-grid cell (= 1 / centers_per_axis),
+    ``--rl.saccade-cost-r`` fixes it independent of the grid.
     ``linear``: c(d) = d / 2, the fraction of the scene width. ``none``: no cost (default).
 
     ``combine='standardized'``: target_t = std(R) - weight * z_batch(c_t), where std(R) is
     the reward as the resolved ``RewardSpec`` centres/scales it; unit-free, so ``weight``
     keeps its meaning while R shrinks over training. ``combine='raw'``: the cost enters in
-    reward units, target_t = std(R - weight * sum_t c_t)."""
+    reward units, target_t = std(R - weight * sum_t c_t) for a terminal reward and
+    target_t = std(r_t - weight * c_t) for a per-glimpse reward r_t."""
 
     form: Literal["none", "log", "linear"] = "none"
     weight: float = 0.0
@@ -141,7 +144,8 @@ class JointPolicy:
     """The resolved reward (``rl.resolve_reward``). The default is the historical QReg/PG one."""
     ema_abs: dict[int, Tensor] = field(default_factory=dict)  # per-depth state of reward_scale='ema_abs'
     saccade_cost: SaccadeCost = field(default_factory=SaccadeCost)
-    """Optional per-saccade cost (terminal-reward PG only). The default is off."""
+    """Optional per-saccade cost (PG, QReg; not VPG). The default is off."""
+    _rollout_saccades: list = field(default_factory=list)  # inline path: this rollout's (mean len, mean cost)
     _rollout_entropies: list = field(default_factory=list)  # entropy_update='per_rollout' accumulator
 
     def branch_selector(self, t0_type: ViewpointType) -> tuple[object, bool]:
@@ -258,7 +262,13 @@ class JointPolicy:
 
     def end_rollout(self) -> None:
         """Called by ``run_rollout`` after each policy branch. Takes the ``per_rollout``
-        entropy dual step on the inline path; a no-op otherwise."""
+        entropy dual step on the inline path and logs the rollout's mean saccade length and
+        cost (inline path, active cost); a no-op otherwise."""
+        if self._rollout_saccades:
+            lens, costs = zip(*self._rollout_saccades)
+            self.last_step["saccade_len"] = torch.stack(lens).mean()
+            self.last_step["saccade_cost"] = torch.stack(costs).mean()
+            self._rollout_saccades = []
         if self._rollout_entropies:
             obj = self.objective
             assert isinstance(obj, PG)
@@ -349,18 +359,49 @@ class JointPolicy:
             self.last_step["saccade_cost"] = cost.mean()
         return self.rl_weight * torch.stack(losses).mean()
 
+    def _glimpse_cost(self, saccade_len: Tensor | None, saccade_beta: Tensor | None
+                      ) -> Tensor | None:
+        """The per-glimpse cost c_t [B] of this glimpse's saccade (None: no cost measured).
+        Also kept for the rollout's logged mean (:meth:`end_rollout`)."""
+        if saccade_len is None:
+            return None
+        sc = self.saccade_cost
+        assert sc.active and (saccade_beta is not None) == sc.conditioned, \
+            "a conditioned cost needs the per-trial beta"
+        cost = sc.cost(saccade_len.float())
+        self._rollout_saccades.append((saccade_len.float().mean(), cost.mean()))
+        return cost
+
+    def _cost_target(self, depth: int, reward: Tensor, mask: Tensor | None, cost: Tensor | None,
+                     saccade_beta: Tensor | None) -> Tensor:
+        """The standardised per-glimpse target, lowered by the saccade cost as in
+        :meth:`trajectory_loss`: ``standardized``: std(r_t) - beta * z_batch(c_t);
+        ``raw``: std(r_t - weight * c_t). No cost / weight 0: the historical expression."""
+        sc = self.saccade_cost
+        if cost is not None and sc.weight != 0.0 and sc.combine == "raw":
+            reward = reward - sc.weight * cost
+        target = self._standardize(depth, reward, mask)
+        if cost is not None and sc.weight != 0.0 and sc.combine == "standardized":
+            beta = sc.weight if saccade_beta is None else saccade_beta
+            target = target - beta * _batch_z(cost, mask, eps=sc.std_eps)
+        return target
+
     def glimpse_loss(self, *, depth: int, scores: Tensor, flat_idx: Tensor, reward: Tensor,
-                     mask: Tensor | None = None) -> Tensor:
+                     mask: Tensor | None = None, saccade_len: Tensor | None = None,
+                     saccade_beta: Tensor | None = None) -> Tensor:
         """The weighted policy loss for ONE glimpse. ``scores`` [B, A] carries grad
         (the train-mode scorer forward); ``flat_idx`` [B] is the taken candidate;
         ``reward`` [B] is the raw fractional distill-MSE reduction (detached). ``mask``: as
-        in :meth:`trajectory_loss` (PG only)."""
+        in :meth:`trajectory_loss` (PG only). ``saccade_len`` [B] / ``saccade_beta`` [B]: this
+        glimpse's saccade length and the per-trial beta, as in :meth:`trajectory_loss`; the
+        same target formula for PG and QReg (see :meth:`_cost_target`)."""
         obj = self.objective
         self._require_pg_for_mask(mask)
+        cost = self._glimpse_cost(saccade_len, saccade_beta)
         if isinstance(obj, PG):
             # Historical default (fractional, running_mean + running_std / z_subtract_only)
             # resolves to exactly `self._norm(depth).normalize(reward, subtract_only=...)`.
-            target = self._standardize(depth, reward, mask)
+            target = self._cost_target(depth, reward, mask, cost, saccade_beta)
             if mask is None:
                 loss, entropy, _ = pg_loss(scores, flat_idx, target, alpha=self._alpha(obj), crit_all=None)
             else:
@@ -372,6 +413,6 @@ class JointPolicy:
                 else:  # per_rollout: one step on the rollout's mean entropy, in end_rollout()
                     self._rollout_entropies.append(entropy.detach())
         else:
-            target = self._standardize(depth, reward)
+            target = self._cost_target(depth, reward, None, cost, saccade_beta)
             loss, _ = qreg_loss(scores, flat_idx, target)
         return self.rl_weight * loss
