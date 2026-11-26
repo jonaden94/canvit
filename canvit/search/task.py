@@ -42,6 +42,7 @@ log = logging.getLogger(__name__)
 
 
 POLICY_FEATURE_GROUPS: tuple[str, ...] = ("ln_feat",)  # the plain canvas, no handcrafted maps
+ALL_RETINAS = "all"  # --cfg.retina: use a multi-retina backbone through every retina
 
 
 def _canvas_hidden(model: Any, state: RecurrentState, canvas_grid: int) -> Tensor:
@@ -53,16 +54,17 @@ class BoundSearchTask:
     """Per-batch :class:`RolloutTask`: binds this batch's targets and boxes.
 
     Optional engine hooks, present only when they apply: ``step_weight`` (``supervise='last'``),
-    ``policy_cond`` (a policy is trained) and ``reward_mask`` (``condition='both'``: only the
-    target-present trials carry a policy reward, Haoze's ``valid_mask``).
+    ``policy_cond`` (a policy is trained), ``reward_mask`` (``condition='both'``: only the
+    target-present trials carry a policy reward, Haoze's ``valid_mask``) and ``saccade_beta``
+    (a beta-conditioned saccade cost: each trial's beta [B], already inside ``policy_cond``).
 
     Losses (Haoze's, with ``condition='both'``): the heatmap KL averaged over the
     target-present trials only, plus ``presence_weight`` x the presence loss over all trials."""
 
     def __init__(self, *, model: Any, targets: Any, boxes: Tensor, canvas_grid: int,
                  cfg: SearchConfig, policy_embed: Callable[[Any], Tensor] | None = None,
-                 present: Tensor | None = None, scene_target: Tensor | None = None,
-                 grad_touch: list[Tensor] | None = None):
+                 present: Tensor | None = None, saccade_beta: Tensor | None = None,
+                 scene_target: Tensor | None = None, grad_touch: list[Tensor] | None = None):
         """``targets``: the batch's cue, class indices [B] or a ``prompt.Prompt`` (prompt-cued search).
         ``scene_target``: standardized DINOv3 patch features [B, G*G, T] of the scene (distill loss on).
         ``grad_touch`` (DDP only): parameters that must get a gradient TENSOR in this step's backward, even where
@@ -84,6 +86,8 @@ class BoundSearchTask:
             self.step_weight = self._last_only
         if policy_embed is not None:
             self.policy_cond = lambda: policy_embed(self.cue())
+        if saccade_beta is not None:
+            self.saccade_beta = saccade_beta
 
     def cue(self):
         """The cue for one use: class indices, or the prompt encoded afresh (``prompt.PromptInputs``)."""
@@ -167,6 +171,9 @@ class SearchRunTask:
     """Run-level visual-search task for ``harness.run``."""
 
     name = "search"
+    display_frame = "1680x1050"
+    """How the training images sit in the scene (read by the scanpath evaluation): COCO-Search18's 1680x1050
+    displays letterboxed into the scene (``SearchDataset``; the crop augmentation keeps the aspect)."""
 
     def __init__(self, cfg: SearchConfig, *, rl=None):
         self.cfg = cfg
@@ -228,9 +235,7 @@ class SearchRunTask:
         from canvit.harness.spec import BpttSpec, GroupOptim, ScheduleSpec, TrainSpec
         if self._prompt_mode:
             return self._prompt_spec()
-        head = GroupOptim(lr=self.cfg.peak_lr, weight_decay=self.cfg.weight_decay,
-                          schedule=ScheduleSpec(kind="warmup_cosine", warmup_steps=self.cfg.warmup_steps,
-                                                total_steps=self.cfg.max_steps))
+        head = GroupOptim(lr=self.cfg.peak_lr, weight_decay=self.cfg.weight_decay, schedule=self._task_schedule())
         pol = self.rl
         policy = GroupOptim(lr=pol.policy_lr, weight_decay=pol.policy_weight_decay, betas=pol.policy_betas,
                             schedule=ScheduleSpec(kind="warmup_constant", warmup_steps=self._policy_warmup_steps()))
@@ -240,6 +245,15 @@ class SearchRunTask:
             bptt=BpttSpec(mode="none", horizon=self.cfg.n_timesteps),
             optim={"head": head, "policy": policy},
         )
+
+    def _task_schedule(self):
+        """The task groups' LR schedule after the warmup (``--cfg.lr-schedule``): ``cosine`` (Haoze) decays to 0 at
+        ``max_steps``; ``constant`` holds the peak (the policy's schedule)."""
+        from canvit.harness.spec import ScheduleSpec
+        if self.cfg.lr_schedule == "cosine":
+            return ScheduleSpec(kind="warmup_cosine", warmup_steps=self.cfg.warmup_steps,
+                                total_steps=self.cfg.max_steps)
+        return ScheduleSpec(kind="warmup_constant", warmup_steps=self.cfg.warmup_steps)
 
     def _prompt_spec(self):
         """Prompt-cued search (decision 5): the WHOLE model trains (backbone fine-tuned, one graph over the
@@ -254,14 +268,14 @@ class SearchRunTask:
         backbone_lr = p.backbone_lr if p.backbone_lr is not None else lr
         head_lr = p.head_lr if p.head_lr is not None else lr
         policy_lr = p.policy_lr if p.policy_lr is not None else lr
-        cosine = ScheduleSpec(kind="warmup_cosine", warmup_steps=c.warmup_steps, total_steps=c.max_steps)
+        sched = self._task_schedule()  # backbone and heads: --cfg.lr-schedule
         return TrainSpec(
             train_backbone=True, train_head=True, train_policy=True, task_weight=1.0, policy_weight=1.0,
             task_grad_to_backbone=True, policy_grad_to_backbone=False,
             bptt=(BpttSpec(mode="full", horizon=c.n_timesteps) if p.bptt_chunk is None
                   else BpttSpec(mode="chunked", chunk_size=p.bptt_chunk, horizon=c.n_timesteps)),
-            optim={"backbone": GroupOptim(lr=backbone_lr, weight_decay=c.weight_decay, schedule=cosine),
-                   "head": GroupOptim(lr=head_lr, weight_decay=c.weight_decay, schedule=cosine),
+            optim={"backbone": GroupOptim(lr=backbone_lr, weight_decay=c.weight_decay, schedule=sched),
+                   "head": GroupOptim(lr=head_lr, weight_decay=c.weight_decay, schedule=sched),
                    "policy": GroupOptim(lr=policy_lr, weight_decay=pol.policy_weight_decay, betas=pol.policy_betas,
                                         schedule=ScheduleSpec(kind="warmup_constant",
                                                               warmup_steps=self._policy_warmup_steps()))},
@@ -298,16 +312,29 @@ class SearchRunTask:
             model = CanViTForVisualSearch.from_pretrained_backbone(
                 c.model_repo, n_classes=len(self._classes()), cond_dim=c.cond_dim, kind=c.head,
                 width=c.head_width, block_layers=c.head_block_layers, dropout=c.dropout,
-                presence=c.condition == "both",
+                presence=c.condition == "both", levels=c.head_levels,
             ).to(device)
         if not consumes_full_image(model):
             raise ValueError(f"the search task supports FOVEATED backbones only; {c.model_repo} has patcher "
                              f"{getattr(model.canvit.cfg, 'patcher_name', '?')!r}.")
-        fix_backbone_retina(model, c.retina, c.model_repo)
+        self._apply_retina(model, source=c.model_repo)
         fs = c.foveated_scale
         log.warning("foveated view scale: mode=%s fixed_scale=%s -- this MUST match the backbone's "
                     "pretraining scale or every glimpse is out of distribution.", fs.mode, fs.fixed_scale)
         return model, model.head
+
+    def _apply_retina(self, model, *, source) -> None:
+        """``--cfg.retina``: one named retina of a multi-retina backbone (``fix_backbone_retina``),
+        or ``all``: every retina, as distill trains -- the rollout engine draws each training
+        sample's retina, ``evaluate`` validates each one (``_retina_names``)."""
+        c = self.cfg
+        if c.retina != ALL_RETINAS:
+            fix_backbone_retina(model, c.retina, source)
+            return
+        n = getattr(model.canvit.patcher, "n_retinas", 1)
+        if n < 2:
+            raise ValueError(f"--cfg.retina {ALL_RETINAS} needs a multi-retina backbone; {source} has one retina.")
+        log.info("multi-retina backbone: all %d retinas (drawn per training sample, each validated)", n)
 
     def _build_prompt_model(self, device, prior_model_config):
         from .model import CanViTForVisualSearch
@@ -331,7 +358,7 @@ class SearchRunTask:
         """The head's constructor arguments in prompt-cued search (``head_kw`` of the checkpoint)."""
         c, p = self.cfg, self.cfg.prompt
         kw = dict(cond_dim=c.cond_dim, kind=c.head, width=c.head_width, block_layers=c.head_block_layers,
-                  dropout=c.dropout, presence=c.condition == "both")
+                  dropout=c.dropout, presence=c.condition == "both", levels=c.head_levels)
         if c.head == "xattn":
             if not p.condition_heads:
                 raise ValueError("--cfg.head xattn reads the prompt as its query: --cfg.prompt.no-condition-heads "
@@ -439,6 +466,24 @@ class SearchRunTask:
             return lambda t: core.head.policy_embedding(t, detach=self.cfg.detach_policy_embedding)
         return lambda t: jp.scorer.target_embed(t)
 
+    def _policy_cond(self, model, targets: Any, beta: Tensor | None = None) -> Tensor | None:
+        """The scorer's FiLM input for ``targets`` (class indices, or a ``prompt.Prompt``): the cue embedding,
+        plus, for a beta-conditioned saccade cost, the features of each row's beta (None: the eval beta
+        ``saccade_cost_beta_eval`` for every row). None: an unconditioned policy (prompt-cued,
+        ``--cfg.prompt.no-condition-policy``; the harness's ``build_policy`` refuses that with a beta-conditioned
+        saccade cost)."""
+        embed = self._policy_embed(model)
+        assert self._joint is not None
+        if embed is None:
+            return None
+        cue = embed(targets)
+        sc = self._joint.saccade_cost
+        if not sc.conditioned:
+            return cue
+        if beta is None:
+            beta = torch.full((cue.shape[0],), sc.beta_eval, device=cue.device)
+        return torch.cat([cue, sc.features(beta).to(cue.dtype)], dim=-1)
+
     def policy_feature_groups(self):
         return POLICY_FEATURE_GROUPS
 
@@ -464,7 +509,7 @@ class SearchRunTask:
                         groups["head"] += [q for q in m.parameters() if q.requires_grad]
         if spec.train_policy:
             assert joint is not None
-            groups["policy"] = list(joint.scorer.parameters())
+            groups["policy"] = joint.policy_parameters()  # actor (+ SAC critics)
         return groups
 
     def resume_start_step(self, payload, scheduler):
@@ -485,10 +530,16 @@ class SearchRunTask:
 
     def bind(self, batch, device, *, model, head):
         core = getattr(model, "module", model)
+        targets = self._cue_of(batch, device, core)
+        policy_embed, beta = self._policy_embed(model), None
+        jp = self._joint
+        if jp is not None and jp.saccade_cost.conditioned:  # stage 2: one beta per trial
+            beta = jp.saccade_cost.sample_beta(batch["present"].shape[0], device)
+            policy_embed = lambda t: self._policy_cond(model, t, beta)  # noqa: E731
         bound = BoundSearchTask(
-            model=core, targets=self._cue_of(batch, device, core),
+            model=core, targets=targets,
             boxes=batch["boxes"].to(device), canvas_grid=self.canvas_grid(model), cfg=self.cfg,
-            policy_embed=self._policy_embed(model), present=batch["present"].to(device),
+            policy_embed=policy_embed, present=batch["present"].to(device), saccade_beta=beta,
             scene_target=self._scene_target(batch, device, core), grad_touch=self._grad_touch(core))
         self._bound = bound  # this step's targets, for viz_frame
         return bound
@@ -503,7 +554,7 @@ class SearchRunTask:
             return None
         params = [p for p in model.parameters() if p.requires_grad]
         if self._joint is not None:
-            params += [p for p in self._joint.scorer.parameters() if p.requires_grad]
+            params += [p for p in self._joint.policy_parameters() if p.requires_grad]
         return params
 
     # --- prompts (prompt-cued search) ------------------------------------------
@@ -576,12 +627,14 @@ class SearchRunTask:
         k_tp = min(len(tp), max(n // 2, n - len(ta)))
         return torch.cat([tp[:k_tp], ta[:n - k_tp]])
 
-    def _policy_logits(self, model, joint, state: RecurrentState, targets: Tensor, idx: Tensor) -> Tensor:
+    def _policy_logits(self, model, joint, state: RecurrentState, targets: Tensor, idx: Tensor,
+                       beta: Tensor | None = None) -> Tensor:
         """[n, Gp, Gp] scorer logits on ``state`` for the batch rows ``idx``: the
         distribution the policy draws the NEXT fixation from. The scorer is deterministic
         (no BatchNorm, no dropout), so this equals the selector's own forward. The encoder's
         rolling reference is restored, so a mid-rollout call cannot shift later features."""
-        st = RecurrentState(canvas=state.canvas[idx], recurrent_cls=state.recurrent_cls[idx])
+        st = RecurrentState(canvas=state.canvas[idx], recurrent_cls=state.recurrent_cls[idx],
+                            policy_tokens=None if state.policy_tokens is None else state.policy_tokens[idx])
         enc = joint.policy_selector.encoder
         prev = enc.prev
         # the encoder's rolling reference holds the whole batch (or the batch-1 init
@@ -589,8 +642,7 @@ class SearchRunTask:
         enc.prev = tuple(None if x is None else x if x.shape[0] == 1 else x[idx] for x in prev)
         try:
             with torch.no_grad():
-                embed = self._policy_embed(model)
-                cond = embed(targets[idx]) if embed is not None else None
+                cond = self._policy_cond(model, targets[idx], None if beta is None else beta[idx])
                 scores = joint.scorer(enc(st).float(), cond=cond)
         finally:
             enc.prev = prev
@@ -598,7 +650,7 @@ class SearchRunTask:
         return scores.reshape(len(idx), g, g).float()
 
     def _viz_capture(self, model, *, hidden, logits, presence, state, centers, targets, joint,
-                     idx: Tensor) -> dict:
+                     idx: Tensor, beta: Tensor | None = None) -> dict:
         """One glimpse of the figure for the batch rows ``idx`` (``_viz_index``), on CPU.
         ``logits`` / ``presence`` are already restricted to those rows."""
         return {"idx": idx.cpu(),
@@ -606,7 +658,7 @@ class SearchRunTask:
                 "logits": logits.detach().float().cpu(),
                 "presence": presence.detach().float().cpu() if presence is not None else None,
                 "canvas": hidden[idx].detach().float().cpu(),
-                "policy_next": (self._policy_logits(model, joint, state, targets, idx).cpu()
+                "policy_next": (self._policy_logits(model, joint, state, targets, idx, beta).cpu()
                                 if joint is not None else None)}
 
     def _episode(self, frames: list[dict], *, images, boxes, targets, present, labels: list[str] | None = None):
@@ -646,7 +698,8 @@ class SearchRunTask:
         with torch.no_grad():
             logits, pres = core.search_head(gout.readout[idx].float(), bound.cue()[idx])
         return self._viz_capture(core, hidden=gout.readout, logits=logits, presence=pres, state=gout.state,
-                                 centers=viewpoint.centers, targets=bound.cue(), joint=self._joint, idx=idx)
+                                 centers=viewpoint.centers, targets=bound.cue(), joint=self._joint, idx=idx,
+                                 beta=getattr(bound, "saccade_beta", None))
 
     def render_viz(self, viz, *, batch, run_dir, step):
         """Training-rollout figure -> ``{run_dir}/visualization/search_train/``."""
@@ -722,10 +775,9 @@ class SearchRunTask:
             return out.state
 
         if joint is not None:
-            embed = self._policy_embed(model)
             deploy_rollout_viewpoints(joint=joint, advance=advance, t0_type=ViewpointType.FULL,
                                       batch_size=B, device=images.device, n=T,
-                                      cond=(lambda: embed(targets)) if embed is not None else None)
+                                      cond=lambda: self._policy_cond(model, targets))
         else:
             assert choose is not None
             sel = self._random_selector()
@@ -759,14 +811,21 @@ class SearchRunTask:
 
     @torch.no_grad()
     def evaluate(self, *, model, head, val_loader, device, step, tracker=None, run_dir=None, joint=None):
-        """Validation (``_evaluate_pass``); writes ``eval.jsonl`` and the tracker's ``overview/``.
+        """Validation; writes ``eval.jsonl`` and the tracker's ``overview/``. Metrics: :meth:`_evaluate_pass`.
 
         Prompt-cued search (decision 8): one pass per prompt type -- text on every val trial, visual on the
         trials with a visual prompt; only the trained type when the visual share is 0 or 1. Keys of a type are
         prefixed ``text/`` / ``visual/``; the plain keys are the mean over the evaluated types. The metric of
         record ``found_mean_<policy>`` = the mean of ``found`` over glimpses t1..t(T-1), averaged over the types
         (``prompt.best_prompt_type``). ``random`` fixations are added at the first validation and at
-        ``max_steps`` (a baseline without its cost at every validation)."""
+        ``max_steps`` (a baseline without its cost at every validation).
+
+        ``--cfg.retina all`` (a multi-retina backbone through every retina): each retina is
+        validated on the same images (same seeded random fixations), the prompt types inside each retina; the MEAN
+        over retinas goes under the usual keys (so ``best_metric`` and best.pt follow it), each retina's
+        values under ``<retina>/<key>`` (prompt-cued: ``<retina>/<type>/<key>`` too; all of them in
+        ``eval.jsonl``; the tracker gets the last-glimpse ``found`` / ``hit`` / ``correct_found`` /
+        ``presence_acc`` (and ``found_mean``) per retina), and its figures under ``visualization/<retina>/``."""
         T = self.cfg.n_timesteps
         pct = percent_label(self.cfg.overlap_box_frac)
         policies = [p for p in self.cfg.eval_policies if p != "policy" or joint is not None]
@@ -775,41 +834,82 @@ class SearchRunTask:
         self._n_evals += 1
         kw = dict(model=model, val_loader=val_loader, device=device, step=step, run_dir=run_dir, joint=joint,
                   policies=policies)
-        if not self._prompt_mode:
-            full, out = self._evaluate_pass(**kw)
+        names_r = self._retina_names(model)
+        per: dict[str, dict[str, float]] = {}
+        if names_r is None:
+            full, out = self._evaluate_types(**kw)
         else:
-            per = {ty: self._evaluate_pass(**kw, prompt_type=ty) for ty in self._eval_prompt_types()}
-            for ty, (f, o) in per.items():
-                for p in policies:
-                    f[f"found_mean_{p}"] = o[f"found_mean_{p}"] = sum(
-                        f[f"found_t{t}_{p}"] for t in range(1, T)) / max(T - 1, 1)
-            full, out = {}, {}
-            for ty, (f, o) in per.items():
-                full |= {f"{ty}/{k}": v for k, v in f.items()}
-                out |= {f"{ty}/{k}": v for k, v in o.items()}
-            for src, dst in ((0, full), (1, out)):
-                first = next(iter(per.values()))[src]
-                for k in first:
-                    if all(k in d[src] for d in per.values()):
-                        dst[k] = sum(d[src][k] for d in per.values()) / len(per)
-            sel = self.cfg.prompt.best_prompt_type
-            if sel != "mean" and sel in per:
-                for p in policies:
-                    out[f"found_mean_{p}"] = full[f"found_mean_{p}"] = per[sel][0][f"found_mean_{p}"]
+            patcher = model.canvit.patcher
+            outs: dict[str, dict[str, float]] = {}
+            try:
+                for i, name in enumerate(names_r):
+                    patcher.set_retinas(i)
+                    per[name], outs[name] = self._evaluate_types(**kw, viz_prefix=f"{name}/")
+            finally:
+                patcher.set_retinas(None)
+            keys = set.intersection(*(set(v) for v in per.values()))
+            full = {k: sum(v[k] for v in per.values()) / len(per) for k in sorted(keys)}
+            first = next(iter(outs.values()))
+            out = {k: sum(o[k] for o in outs.values()) / len(outs) for k in first if all(k in o for o in outs.values())}
+            L = T - 1
+            for name, d in per.items():
+                out.update({f"{name}/{k}_t{L}_{p}": d[f"{k}_t{L}_{p}"]
+                            for k in ("found", "hit", "correct_found", "presence_acc") for p in policies
+                            if f"{k}_t{L}_{p}" in d})
+                out.update({f"{name}/found_mean_{p}": d[f"found_mean_{p}"] for p in policies
+                            if f"found_mean_{p}" in d})
         if run_dir is not None:
             import json
             from pathlib import Path
             Path(run_dir).mkdir(parents=True, exist_ok=True)  # an empty tmp dir can vanish (tests)
+            flat = {**full, **{f"{name}/{k}": v for name, d in per.items() for k, v in d.items()}}
             with open(Path(run_dir) / "eval.jsonl", "a") as f:
-                f.write(json.dumps({"step": step, **full}) + "\n")
+                f.write(json.dumps({"step": step, **flat}) + "\n")
         if tracker is not None:
             tracker.log_metrics({f"overview/{k}": v for k, v in self._overview(full, T, pct).items()}, step=step)
         return out
 
+    def _evaluate_types(self, *, policies, viz_prefix: str = "", **kw) -> tuple[dict, dict]:
+        """One validation (one retina): a single :meth:`_evaluate_pass`, or for prompt-cued search one per prompt
+        type, with ``<type>/`` keys and the plain keys = their mean (see :meth:`evaluate`)."""
+        T = self.cfg.n_timesteps
+        if not self._prompt_mode:
+            return self._evaluate_pass(**kw, policies=policies, viz_prefix=viz_prefix)
+        per = {ty: self._evaluate_pass(**kw, policies=policies, prompt_type=ty, viz_prefix=viz_prefix)
+               for ty in self._eval_prompt_types()}
+        for ty, (f, o) in per.items():
+            for p in policies:
+                f[f"found_mean_{p}"] = o[f"found_mean_{p}"] = sum(
+                    f[f"found_t{t}_{p}"] for t in range(1, T)) / max(T - 1, 1)
+        full, out = {}, {}
+        for ty, (f, o) in per.items():
+            full |= {f"{ty}/{k}": v for k, v in f.items()}
+            out |= {f"{ty}/{k}": v for k, v in o.items()}
+        for src, dst in ((0, full), (1, out)):
+            first = next(iter(per.values()))[src]
+            for k in first:
+                if all(k in d[src] for d in per.values()):
+                    dst[k] = sum(d[src][k] for d in per.values()) / len(per)
+        sel = self.cfg.prompt.best_prompt_type
+        if sel != "mean" and sel in per:
+            for p in policies:
+                out[f"found_mean_{p}"] = full[f"found_mean_{p}"] = per[sel][0][f"found_mean_{p}"]
+        return full, out
+
+    @staticmethod
+    def _retina_names(model) -> list[str] | None:
+        """The retinas to validate one by one: all of a multi-retina patcher that no task
+        fixed to one retina (``--cfg.retina all``); None otherwise (one pass, as before)."""
+        patcher = model.canvit.patcher
+        if getattr(patcher, "n_retinas", 1) > 1 and getattr(patcher, "fixed_retina", None) is None:
+            return list(patcher.retina_names)
+        return None
+
     def _evaluate_pass(self, *, model, val_loader, device, step, run_dir=None, joint=None, policies,
-                       prompt_type: str | None = None) -> tuple[dict, dict]:
+                       prompt_type: str | None = None, viz_prefix: str = "") -> tuple[dict, dict]:
         """One validation pass under each of ``policies`` (random / greedy / policy fixations); for
         prompt-cued search under one prompt type. Returns (every metric, the ones the tracker gets).
+        ``viz_prefix`` (e.g. ``<retina>/``) is put in front of the figure folders.
 
         Localisation, over the target-present trials, after glimpse t (X = ``percent_label``
         of ``cfg.overlap_box_frac``, 10 by default):
@@ -827,10 +927,10 @@ class SearchRunTask:
         ``recall`` (present trials judged present), ``specificity`` (absent judged absent),
         ``precision``, ``f1``.
 
-        Keys are ``<metric>_t<t>_<policy>``. Every value goes to ``run_dir/eval.jsonl`` (one
-        line per validation). The returned dict -- the harness logs it under ``eval/`` -- holds
-        ``loss`` / ``found`` / ``hit`` / ``correct_found`` / ``presence_acc`` at every glimpse
-        and the rest at the last glimpse only. ``tracker`` additionally gets a short
+        Keys are ``<metric>_t<t>_<policy>``. :meth:`evaluate` writes every value to
+        ``run_dir/eval.jsonl`` (one line per validation) and returns -- the harness logs it under
+        ``eval/`` -- ``loss`` / ``found`` / ``hit`` / ``correct_found`` / ``presence_acc`` at every
+        glimpse and the rest at the last glimpse only; ``tracker`` additionally gets a short
         ``overview/`` section (``_overview``). Prompt-cued extras: ``found_cos`` (zero-shot cosine
         baseline) and ``scene_cos`` (distill), when on."""
         T = self.cfg.n_timesteps
@@ -919,7 +1019,8 @@ class SearchRunTask:
                     if record:
                         try:  # a diagnostic: a plotting failure must never abort validation
                             self._save_episode(record, batch=batch, run_dir=run_dir,
-                                               subdir=f"search_val_{p}" + (f"_{prompt_type}" if prompt_type else ""),
+                                               subdir=(f"{viz_prefix}search_val_{p}"
+                                                       + (f"_{prompt_type}" if prompt_type else "")),
                                                step=step,
                                                title=f"val step {step}, fixations: {p}")
                         except Exception:
@@ -1029,11 +1130,19 @@ class SearchRunTask:
 
     def checkpoint_metadata(self, model):
         from canvit.checkpoint import downstream_pretrain_view_scale
-        return {"task": "search", "scene_size": self.cfg.scene_size, "n_timesteps": self.cfg.n_timesteps,
+        meta = {"task": "search", "scene_size": self.cfg.scene_size, "n_timesteps": self.cfg.n_timesteps,
                 "model_repo": str(self.cfg.model_repo),
                 "pretrain_view_scale": downstream_pretrain_view_scale(
                     patcher_name=getattr(model.canvit.cfg, "patcher_name", None),
                     foveated_scale=self.cfg.foveated_scale)}
+        rl = self.rl
+        if rl.saccade_cost != "none":  # absent when off: the historical metadata
+            meta["saccade_cost"] = {
+                "form": rl.saccade_cost, "weight": rl.saccade_cost_weight, "combine": rl.saccade_cost_combine,
+                "beta_mode": rl.saccade_cost_beta_mode, "beta_eval": rl.saccade_cost_beta_eval,
+                "r": 1.0 / rl.centers_per_axis,
+                "beta_features": "[beta, log1p(beta / 0.1)] appended to the FiLM cue (conditioned only)"}
+        return meta
 
 
 __all__ = ["BoundSearchTask", "SearchRunTask", "POLICY_FEATURE_GROUPS"]

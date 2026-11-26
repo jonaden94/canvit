@@ -88,6 +88,10 @@ class HarnessOpts:
     amp_dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"
     log_grad_norms: bool = True
     log_timing: bool = True
+    human_eval_every: int = 0
+    """Human alignment every N steps (a multiple of the eval cadence; 0 = off): RunSettings.human_eval_every."""
+    human_eval_data: Path | None = None
+    """The human-subset cache for ``human_eval_every`` (``python -m canvit.scanpath.online --out <file>``)."""
 
 
 def _resolve_run_dir(logs_dir: Path, run_group: str, run_name: str | None,
@@ -121,6 +125,7 @@ def _common(opts: HarnessOpts) -> dict[str, Any]:
         "signal_checkpoint": opts.signal_checkpoint,
         "use_failed_marker": opts.use_failed_marker, "amp_dtype": opts.amp_dtype,
         "log_grad_norms": opts.log_grad_norms, "log_timing": opts.log_timing,
+        "human_eval_every": opts.human_eval_every, "human_eval_data": opts.human_eval_data,
     }
     if opts.ema_alpha is not None:   # else: the task's own default (see each build())
         out["ema_alpha"] = opts.ema_alpha
@@ -220,6 +225,8 @@ class DistillCmd:
             seed=self.opts.seed if self.opts.seed is not None else self.cfg.seed,
             device=str(self.cfg.device), compile=self.cfg.compile,
             seed_ckpt=self.cfg.seed_ckpt, resume_from=self.cfg.resume_from,
+            seed_optimizer=self.cfg.seed_optimizer,
+            seed_exp_avg_sq_scale=self.cfg.seed_exp_avg_sq_scale,
             resume=self.opts.resume if self.opts.resume is not None else True,
             **_identity(self.cfg, self.opts, prefix=""),
             # Break `patcher` down into kpe / embed_head / conditioner (and the
@@ -363,7 +370,14 @@ def resolve_spec(task: Any, preset: str, lr: float, wd: float,
     elif preset == "finetune":
         spec = TrainSpec.finetune(bptt=bptt_full)
     elif preset == "policy_only":
-        spec = TrainSpec.policy_only(bptt=bptt_none)
+        # A task that SAMPLES its trajectory length (distill: chunked TBPTT, chunk_size glimpses,
+        # extended while rand() < continue_prob) keeps its own lengths and chunking: the policy
+        # then sees the trajectories the model was trained on, and only one chunk of policy graph
+        # is alive at a time (a fixed 10-glimpse 'full' graph of the isolated policy stream did
+        # not fit a 32 GB GPU at batch 64; exp41, 2026-11-25). The frozen trunk records no graph.
+        # Fixed-horizon tasks (ade20k/in1k) keep 'none' as before.
+        task_bptt = task.default_spec().bptt
+        spec = TrainSpec.policy_only(bptt=task_bptt if task_bptt.stochastic else bptt_none)
     elif preset == "joint":
         spec = TrainSpec.joint()
     else:

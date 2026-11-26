@@ -101,6 +101,9 @@ class DistillRunTask:
     the model — stashed in ``build_model`` — and the first shard)."""
 
     name = "distill"
+    display_frame = "scene"
+    """How the training images sit in the scene (read by the scanpath evaluation): resized and centre-cropped
+    to the square scene (``core.preprocess``)."""
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -361,6 +364,7 @@ class DistillRunTask:
             canvit=model, rl=self.cfg.rl, feature_groups=POLICY_FEATURE_GROUPS, device=device,
             canvas_grid=canvas_grid, min_viewpoint_scale=self.cfg.min_viewpoint_scale,
             foveated_scale=self.cfg.foveated_scale, generator=generator, encode_model=None,
+            scorer_input_norm=self.cfg.policy_scorer_input_norm,
         )
 
     def policy_feature_groups(self):
@@ -368,11 +372,15 @@ class DistillRunTask:
 
     def trainable_param_groups(self, *, model, head, joint, spec):
         groups: dict[str, list] = {}
+        # With policy tokens the scorer IS a submodule of the model (its readout); it belongs to
+        # the policy group only (a param in two optimizer groups is an error). Without them the
+        # scorer is a separate module and this excludes nothing.
+        scorer_ids = {id(p) for p in joint.scorer.parameters()} if joint is not None else set()
         if spec.train_backbone:  # distill's in-forward heads ride the backbone group
-            groups["backbone"] = list(model.parameters())
+            groups["backbone"] = [p for p in model.parameters() if id(p) not in scorer_ids]
         if spec.train_policy:
             assert joint is not None
-            groups["policy"] = list(joint.scorer.parameters())
+            groups["policy"] = joint.policy_parameters()  # actor (+ SAC critics)
         return groups
 
     # --- visualization (ported from train/loop.py; saved LOCALLY, never uploaded) ---
@@ -394,10 +402,16 @@ class DistillRunTask:
         with torch.no_grad():
             init_scene = core.predict_teacher_scene(state.canvas)
             init_spatial = core.get_spatial(state.canvas[0:1])[0]
+        # Multi-retina training draws each sample's retina (the engine set them before
+        # this call): name sample 0's in the figure title.
+        patcher = getattr(core, "patcher", None)
+        retina = (patcher.retina_names[patcher.active_retina(0)]
+                  if getattr(patcher, "n_retinas", 1) > 1 else None)
         return {
             "image": imagenet_denormalize_to_numpy(images[0]),
             "initial_scene": init_scene[0].detach().cpu().float().numpy(),
             "initial_canvas_spatial": init_spatial.detach().cpu().float().numpy(),
+            "retina": retina,
         }
 
     def render_viz(self, viz, *, batch, run_dir, step):
@@ -431,6 +445,7 @@ class DistillRunTask:
             initial_hidden_spatial=init["initial_canvas_spatial"],
             foveated_samples=fov if any(f is not None for f in fov) else None,
             square_samples=sq if any(f is not None for f in sq) else None,
+            fig_title=f"training sample 0, retina {init['retina']}" if init.get("retina") else None,
         )
         save_figure(fig, run_dir, "pca_train", step)
 
@@ -544,14 +559,23 @@ class DistillRunTask:
             },
         )
 
+    distributed_eval = True
+    """Every DDP rank calls :meth:`evaluate` (each validates its share of the val chunks,
+    sums all-reduced in ``validate``); without this flag only rank 0 validates."""
+
     @torch.no_grad()
     def evaluate(self, *, model, head, val_loader, device, step, tracker=None, run_dir=None,
-                 joint=None):
+                 joint=None, rank=0, world_size=1):
         """The full distill validation phase (train/loop.py 689-734): ``validate()`` over
         the fixed val subset, logging its per-timestep cos/recon series through the REAL
         tracker, plus the IN1k linear-probe readout, the curve plots and the PCA figure on
         their historical cadences. Needs the teacher (cached, offline) for val targets.
-        Best-effort: a readout, not parity-gated — returns {} if it can't run."""
+        Best-effort: a readout, not parity-gated — returns {} if it can't run.
+
+        Passes: the configured ``eval_policy`` (``auto`` = fixation_grid for foveated) under
+        the historical keys, and — when the run trains a policy (``joint`` given) — the
+        policy's argmax deploy under ``policy/<key>``. ``val_metric`` (and so best.pt)
+        follows the first pass. ``rank``/``world_size``: see ``distributed_eval``."""
         import tempfile
         from pathlib import Path
 
@@ -583,7 +607,12 @@ class DistillRunTask:
                 self._probe = load_probe(self.cfg.teacher_name, device)
             base_run_dir = run_dir or Path(tempfile.mkdtemp(prefix="distill_eval_"))
 
-            def run_validate(prefix: str, run_dir_: Path) -> dict[str, float]:
+            # Figures: <run>/visualization/[<retina>/]{pca_val,pca_val_policy,graphs}/ (the
+            # retina level only for a multi-retina patcher); pca_train stays at the top.
+            log_pca = val_count % max(1, self.cfg.viz_every_n_vals) == 0
+            log_curves = val_count % max(1, self.cfg.curve_every_n_vals) == 0
+
+            def run_validate(prefix: str, pca_subdir: str, eval_policy: str) -> dict[str, float]:
                 return validate(
                     exp=exp, step=step, model=model, compute_raw_targets=compute_raw_targets,
                     scene_normalizer=self.scene_norm, cls_normalizer=self.cls_norm,
@@ -595,7 +624,7 @@ class DistillRunTask:
                     # while both are /16, wrong for a mixed pair.
                     scene_size_px=self._scene_size_px(),
                     glimpse_size_px=self._glimpse_size_px,
-                    run_dir=run_dir_,
+                    run_dir=base_run_dir, pca_subdir=pca_subdir,
                     n_eval_viewpoints=self.cfg.n_eval_viewpoints,
                     min_viewpoint_scale=self.cfg.min_viewpoint_scale,
                     # foveated/square validate at the TRAINING scale for mode='fixed';
@@ -604,36 +633,66 @@ class DistillRunTask:
                     # The shared validation-trajectory knob (harness/eval_viewpoints.py).
                     # "auto" (the default) reproduces this task's historical choice
                     # exactly: C2F for uniform, fixation_grid for foveated/square.
-                    eval_policy=self.cfg.eval_policy, foveated_scale=fs, joint=joint,
+                    eval_policy=eval_policy, foveated_scale=fs, joint=joint,
                     override_scale=self.cfg.eval_override_scale,
                     prefix=prefix, probe=self._probe,
-                    log_curves=(val_count % max(1, self.cfg.curve_every_n_vals) == 0),
-                    log_pca=(val_count % max(1, self.cfg.viz_every_n_vals) == 0),
+                    log_pca=log_pca,
                     teacher=teacher, log_spatial_stats=self.cfg.log_spatial_stats,
                     teacher_name=self.cfg.teacher_name,
+                    rank=rank, world_size=world_size,
                 )
 
-            patcher = getattr(model, "patcher", None)
-            n_retinas = getattr(patcher, "n_retinas", 1)
-            with amp:
+            from canvit.harness.rollout.eval_viewpoints import resolve
+            passes = [(self.cfg.eval_policy, "")]
+            if joint is not None and resolve(self.cfg.eval_policy, task="distill",
+                                             is_foveated=self.is_foveated(model)) != "policy":
+                passes.append(("policy", "policy/"))
+
+            def run_pass(eval_policy: str, key_prefix: str) -> dict[str, float]:
+                patcher = getattr(model, "patcher", None)
+                n_retinas = getattr(patcher, "n_retinas", 1)
+                tag = key_prefix.rstrip("/")
+                vprefix = f"val/{tag}" if tag else "val"
+                pca_name = f"pca_val_{tag}" if tag else "pca_val"
                 if n_retinas == 1:
-                    series = run_validate("val", base_run_dir)
-                else:
-                    # Multi-retina patcher: validate every retina on the same images, return
-                    # each one's series under its name and the mean over retinas under the
-                    # usual keys (so `val_metric` and best.pt follow the mean). Each retina's
-                    # figures go to `<run_dir>/retinas/<retina>/`, its spatial stats under
-                    # the tracker prefix `val/<retina>`.
-                    per: dict[str, dict[str, float]] = {}
-                    try:
-                        for i, name in enumerate(patcher.retina_names):
-                            patcher.set_retinas(i)
-                            per[name] = run_validate(f"val/{name}", base_run_dir / "retinas" / name)
-                    finally:
-                        patcher.set_retinas(None)
-                    keys = set.intersection(*(set(v) for v in per.values()))
-                    series = {k: sum(float(v[k]) for v in per.values()) / n_retinas for k in sorted(keys)}
-                    series.update({f"{name}/{k}": float(v) for name, d in per.items() for k, v in d.items()})
+                    return run_validate(vprefix, pca_name, eval_policy)
+                # Multi-retina patcher: validate every retina on the same images, return
+                # each one's series under its name and the mean over retinas under the
+                # usual keys (so `val_metric` and best.pt follow the mean). Each retina's
+                # figures go to `<run_dir>/visualization/<retina>/`, its spatial stats under
+                # the tracker prefix `val/<retina>`.
+                per: dict[str, dict[str, float]] = {}
+                try:
+                    for i, name in enumerate(patcher.retina_names):
+                        patcher.set_retinas(i)
+                        per[name] = run_validate(f"{vprefix}/{name}", f"{name}/{pca_name}",
+                                                 eval_policy)
+                finally:
+                    patcher.set_retinas(None)
+                keys = set.intersection(*(set(v) for v in per.values()))
+                out = {k: sum(float(v[k]) for v in per.values()) / n_retinas for k in sorted(keys)}
+                out.update({f"{name}/{k}": float(v) for name, d in per.items() for k, v in d.items()})
+                return out
+
+            series: dict[str, float] = {}
+            per_pass: dict[str, dict[str, float]] = {}
+            with amp:
+                for eval_policy, key_prefix in passes:
+                    out = run_pass(eval_policy, key_prefix)
+                    per_pass[key_prefix.rstrip("/") or resolve(
+                        eval_policy, task="distill", is_foveated=self.is_foveated(model))] = out
+                    series.update({f"{key_prefix}{k}": v for k, v in out.items()})
+            if log_curves and rank == 0:
+                # One curves figure per retina (or one), every pass a line in each panel.
+                from canvit.harness.viz.disk import plot_combined_curves, save_figure
+                patcher = getattr(model, "patcher", None)
+                names = (list(patcher.retina_names) if getattr(patcher, "n_retinas", 1) > 1
+                         else [None])
+                for name in names:
+                    pre = f"{name}/" if name else ""
+                    curves = {label: {k[len(pre):]: v for k, v in out.items() if k.startswith(pre)}
+                              for label, out in per_pass.items()}
+                    save_figure(plot_combined_curves(curves), base_run_dir, f"{pre}graphs", step)
             # `val_metric` is kept as an alias of scene_cos_raw_t{last} -- it is the key
             # exp22-exp36 logged and the one the loop's log line reads. The rest of the
             # series now comes back too, so a standalone evaluation sees more than one

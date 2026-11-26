@@ -14,7 +14,7 @@ from canvit.search.model import CanViTForVisualSearch
 from canvit.search.task import SearchRunTask
 
 from .test_release import fake_release, fake_vp_release  # noqa: F401  (fixtures)
-from .test_search_task import _FOVEATED, _rl
+from .test_search_task import _FOVEATED, _MULTI, _rl
 
 S, G = 224, 32  # scene px, canvas grid (as the class-cued tests)
 TEACHER_DIM = 768  # = the prompt width: the cosine baseline compares the two
@@ -48,14 +48,16 @@ class _FakeTeacher:
 class _TinyPromptTask(SearchRunTask):
     """Builds a random tiny model, feeds synthetic batches, fakes the text encoder."""
 
+    backbone_config = _FOVEATED
+
     def _build_prompt_model(self, device, prior_model_config):
         torch.manual_seed(0)
         p = self.cfg.prompt
         keep_scene = p.distill_weight > 0 or p.eval_cosine_baseline
         kw = {"adaln": p.adaln, "tokens": p.tokens, "token_mode": p.token_mode, "condition_heads": p.condition_heads,
               "scene_grid": G if keep_scene else None, "teacher_dim": TEACHER_DIM}
-        model = CanViTForVisualSearch(backbone_name="vits16", model_config=_FOVEATED, n_classes=None, prompt_kw=kw,
-                                      **self._head_kw())
+        model = CanViTForVisualSearch(backbone_name="vits16", model_config=self.backbone_config, n_classes=None,
+                                      prompt_kw=kw, **self._head_kw())
         if keep_scene:
             model.scene["std"].set_stats(torch.randn(64, G * G, TEACHER_DIM))
         self.built = model
@@ -291,3 +293,62 @@ def test_ddp_every_trainable_parameter_gets_a_grad(rows, ddp, variant):
         assert missing == []
     else:
         assert unused in missing
+
+
+def test_prompt_mode_with_all_retinas(tmp_path):
+    """--cfg.retina all in prompt mode: trains; validation runs every retina with the prompt types inside:
+    eval.jsonl holds <retina>/<type>/<key>; the plain keys (and so best.pt's found_mean_policy) are the mean over
+    the retinas of the mean over the types."""
+    import json
+
+    class _Multi(_TinyPromptTask):
+        backbone_config = _MULTI
+
+    task = _Multi(replace(_cfg(visual_share=0.5), retina="all"), rl=_rl(reward="fractional"))
+    last = _run(task)
+    assert torch.isfinite(torch.tensor(last["total_loss"]))
+    model, joint = task.built, task._joint
+    patcher = model.canvit.patcher
+    names = patcher.retina_names
+    assert len(names) == 2 and patcher.fixed_retina is None
+    model.canvit.eval()
+    out = task.evaluate(model=model, head=model.head, val_loader=task.build_val_loader(), device=torch.device("cpu"),
+                        step=4, joint=joint, run_dir=tmp_path)  # max_steps: the random rule runs too
+    assert patcher._active_retinas is None
+    row = [json.loads(line) for line in open(tmp_path / "eval.jsonl")][-1]
+    for k in ("found_mean_policy", "found_t2_policy", "text/found_mean_policy", "visual/found_t2_random"):
+        per = [row[f"{n}/{k}"] for n in names]
+        assert row[k] == pytest.approx(sum(per) / len(per)), k
+    for n in names:
+        assert row[f"{n}/found_mean_policy"] == pytest.approx(
+            (row[f"{n}/text/found_mean_policy"] + row[f"{n}/visual/found_mean_policy"]) / 2)
+    assert out["found_mean_policy"] == pytest.approx(row["found_mean_policy"])
+    assert f"{names[0]}/found_mean_policy" in out and f"{names[1]}/found_t2_policy" in out
+    assert row[f"{names[0]}/text/loss_t0_random"] != row[f"{names[1]}/text/loss_t0_random"]
+
+
+_STAGE2 = dict(saccade_cost="log", saccade_cost_weight=1.0, saccade_cost_beta_mode="conditioned",
+               saccade_cost_beta_eval=0.3, reward="terminal")
+
+
+def test_prompt_mode_with_a_beta_conditioned_saccade_cost():
+    """The saccade cost (stage 2) in prompt mode: each trial draws its beta, appended to the policy's FiLM input
+    after the (detached) prompt vector's projection; trains and validates (eval beta). Without policy
+    conditioning it is refused (beta has nowhere to go)."""
+    from canvit.harness.policy.joint import BETA_FEATURES
+    task = _TinyPromptTask(_cfg(visual_share=0.5), rl=_rl(**_STAGE2))
+    last = _run(task)
+    assert torch.isfinite(torch.tensor(last["total_loss"]))
+    model, joint = task.built, task._joint
+    assert joint.saccade_cost.conditioned and joint.scorer.film_cond_dim == 8 + BETA_FEATURES
+    b = _batch(4, seed=3)
+    bound = task.bind(b, torch.device("cpu"), model=model, head=model.head)
+    cond = bound.policy_cond()
+    assert bound.saccade_beta.shape == (4,) and cond.shape == (4, 8 + BETA_FEATURES)
+    assert torch.equal(cond[:, :8], joint.scorer.prompt_cond(bound.cue().vec))
+    eval_cond = task._policy_cond(model, bound.cue())
+    assert torch.allclose(eval_cond[:, 8:], joint.saccade_cost.features(torch.full((4,), 0.3)))
+    with pytest.raises(ValueError, match="FiLM-conditioned"):
+        t2 = _TinyPromptTask(_cfg(visual_share=0.5, condition_policy=False), rl=_rl(**_STAGE2))
+        m2, _ = t2.build_model(torch.device("cpu"))
+        t2.build_policy(m2, device=torch.device("cpu"), canvas_grid=G, generator=torch.Generator().manual_seed(0))

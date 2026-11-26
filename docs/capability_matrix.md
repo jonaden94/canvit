@@ -26,7 +26,7 @@ Other presets are built generically by `harness/cli.py::resolve_spec`.
 - `--preset default` → trains=[backbone] task->bb=True pol->bb=False bptt=chunked/continue_prob=0.5/chunk=2 | backbone(lr=0.0004, wd=0.0001, sched=warmup_constant/warmup=100000)
 - `--preset probe` → **rejected by check_spec**: nothing is trainable (train_backbone/head/policy all False)
 - `--preset finetune` → trains=[backbone] task->bb=True pol->bb=False bptt=full/horizon=10/chunk=1 | backbone(lr=0.0004, wd=0.0001, sched=warmup_constant/warmup=100000)
-- `--preset policy_only` → trains=[policy] task->bb=False pol->bb=False bptt=none/horizon=10/chunk=1 | policy(lr=0.0002, wd=0.01, sched=warmup_constant)
+- `--preset policy_only` → trains=[policy] task->bb=False pol->bb=False bptt=chunked/continue_prob=0.5/chunk=2 | policy(lr=0.0002, wd=0.01, sched=warmup_constant)
 - `--preset joint` → trains=[backbone,policy] task->bb=True pol->bb=False bptt=chunked/continue_prob=0.5/chunk=2 | backbone(lr=0.0004, wd=0.0001, sched=warmup_constant/warmup=100000), policy(lr=0.0002, wd=0.01, sched=warmup_constant)
 
 ### ade20k

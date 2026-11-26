@@ -86,9 +86,16 @@ class JointPolicyConfig:
     the FULL-start branches become policy branches while the RANDOM-start branches
     stay pure continuous-random (distill-only, no policy loss) for broad view
     coverage — needs n_full_start_branches>=1 and n_random_start_branches>=1."""
+    second_branch: Literal["none", "random_start", "center_start"] | None = None
+    """None (default): branches come from the task (``n_full_start_branches`` /
+    ``n_random_start_branches``) and ``keep_random_branch`` decides which are policy branches.
+    Set: exactly one policy branch (center start, then policy glimpses) plus the given second
+    branch, which takes random glimpses and no policy loss: ``none`` = no second branch,
+    ``random_start`` = random start, ``center_start`` = center start. Overrides the task's
+    branch counts; not combinable with ``keep_random_branch``."""
 
     # Objective
-    objective: Literal["qreg", "pg", "vpg"] = "qreg"
+    objective: Literal["qreg", "pg", "vpg", "sac"] = "qreg"
     """``qreg``/``pg``: the CanViT-PyTorch-RL recipes (per-glimpse fractional reward,
     EMA-standardized). ``vpg``: vanilla policy gradient with a learned V(s) baseline and a
     TERMINAL reward — the ``autoreg_tryout`` recipe (see :class:`~canvit.train.rl.VPG`).
@@ -118,6 +125,19 @@ class JointPolicyConfig:
     rollout on the entropy averaged over its decision steps."""
     policy_warmup_steps: int = 0
     """Steps to ramp prime_on_policy 0 -> its target (0 = constant target from step 0)."""
+    qreg_extra_candidates: int = 0
+    """``qreg``: dense QReg -- K extra random cells glimpsed (no grad) from each policy state
+    and regressed on with their measured rewards, besides the taken one. 0 = the recipe;
+    costs K more glimpse forwards per policy glimpse."""
+    sac_gamma: float = 0.99
+    """``sac``: discount of the soft Bellman target over glimpses (the paper's 0.99)."""
+    sac_target_tau: float = 0.005
+    """``sac``: Polyak rate of the target critics per training step (Haarnoja et al.)."""
+    sac_target_entropy: float | None = None
+    """``sac``: entropy the temperature steers the policy to, in nats. None = the paper's
+    0.98 * log|A| (near uniform). The temperature's step size is ``alpha_lr``."""
+    sac_alpha_init: float = 1.0
+    """``sac``: initial temperature (SAC's 1.0)."""
 
     # Reward, and how it is centred and scaled before it multiplies log pi (or is regressed,
     # QReg). "default" resolves to each objective's historical behaviour (see
@@ -138,6 +158,29 @@ class JointPolicyConfig:
     ``per_step``). ``ema_abs``: divide by an EMA of the mean absolute reward and clip to +-10
     (Haoze). ``none``: no scaling."""
 
+    # Optional per-saccade cost (objective='pg' with reward='terminal' only; refused elsewhere).
+    # d = Euclidean distance between consecutive glimpse centres in [-1, 1] units (scene width 2;
+    # the first saccade starts at t0's scene centre). "none" (default) leaves every run unchanged.
+    saccade_cost: Literal["none", "log", "linear"] = "none"
+    """``log``: c(d) = log(1 + d / r), r = half a policy-grid cell (1 / centers_per_axis) — the
+    form that fits human saccade lengths best post hoc. ``linear``: c(d) = d / 2, the fraction of
+    the scene width. ``none``: no cost, nothing measured."""
+    saccade_cost_weight: float = 0.0
+    """beta (``standardized``) or lambda (``raw``). 0 with a form set: saccade lengths and costs
+    are logged (policy/saccade_len, policy/saccade_cost) but the target is unchanged."""
+    saccade_cost_combine: Literal["standardized", "raw"] = "standardized"
+    """``standardized``: action t's target = the standardised reward - weight * z_batch(c_t);
+    unit-free, so the weight keeps its meaning while the terminal reward shrinks ~10x over
+    training. ``raw``: target = standardise(R - weight * sum_t c_t), the cost in reward units."""
+    saccade_cost_beta_mode: Literal["fixed", "conditioned"] = "fixed"
+    """``fixed`` (stage 1): every trial uses beta = ``saccade_cost_weight``. ``conditioned``
+    (stage 2): each training trial draws beta ~ U[0, saccade_cost_weight] and the policy gets
+    beta as an input next to its FiLM cue (FiLM-conditioned scorers only, i.e. search;
+    ``standardized`` only), so one run covers every beta in that range."""
+    saccade_cost_beta_eval: float = 0.0
+    """``conditioned`` only: the beta given to the policy at validation / deploy (all trials).
+    Override it at ``harness.evaluate`` to score one checkpoint at several betas."""
+
     # VPG only (objective="vpg"); ignored by qreg/pg. Defaults = autoreg exp12's values.
     vpg_entropy_bonus: float = 5e-3
     """FIXED entropy weight (autoreg ``rl_entropy_weight``). Separate from ``entropy_bonus``
@@ -157,6 +200,9 @@ class JointPolicyConfig:
     """Uniform-patcher candidate scales; ignored for foveated/square (fixation grid)."""
     width: int = 128
     block_layers: int = 3
+    policy_levels: int = 6
+    """U-Net depth of the canvas scorer (and SAC's critics): 6 (default, historical) pools 32 -> 1;
+    3 stops at 8x8 (on ADE20K as good as 6, half the parameters)."""
     policy_readout: Literal["unet", "local"] = "unet"
     """Scorer body — how much of the scene ONE candidate's score sees.
 

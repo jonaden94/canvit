@@ -91,6 +91,9 @@ class Ade20kRunTask:
     """
 
     name = "ade20k"
+    display_frame = "scene"
+    """How the training images sit in the scene (read by the scanpath evaluation): centre-cropped or squished
+    to the square scene (``Ade20kConfig`` resize mode)."""
 
     def __init__(self, cfg, *, rl=None):
         self.cfg = cfg
@@ -278,7 +281,7 @@ class Ade20kRunTask:
             groups["head"] = list(model.head.parameters())
         if spec.train_policy:
             assert joint is not None
-            groups["policy"] = list(joint.scorer.parameters())
+            groups["policy"] = joint.policy_parameters()  # actor (+ SAC critics)
         return groups
 
     def resume_start_step(self, payload, scheduler):

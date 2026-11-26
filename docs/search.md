@@ -119,6 +119,10 @@ Owner decisions of 2026-11-26. Training on the curated release with text and vis
   of record `found_mean_policy` = mean found over t1..t9 (n_timesteps 10). Only the policy rule by default;
   random fixations at the first validation and at the end. `--cfg.prompt.eval-cosine-baseline`: the zero-shot
   baseline (cosine of the predicted DINOv3 features and the prompt), `found_cos_*`.
+- **With `--cfg.retina all` / the saccade cost** (main's options): validation runs every retina, the prompt types
+  inside each one; `eval.jsonl` holds `<retina>/<type>/<key>`, and the plain keys (best.pt's `found_mean_policy`) are
+  the mean over retinas of the mean over types. A beta-conditioned saccade cost appends beta to the policy's FiLM
+  input after the prompt vector's projection (needs `--cfg.prompt.condition-policy`, on by default).
 - **COCO-Search18 zero-shot test:** `harness.evaluate search` with `--cfg.dataset coco_search18 --cfg.data-root
   .../coco_search18_nopadding`: text = the category name, visual = the release's `vp_test` prompt.
 - **DDP** on the release (2026-11-26, 2x A100 test job 17581598): ranks train on disjoint shares of each epoch,

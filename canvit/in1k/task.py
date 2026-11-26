@@ -76,6 +76,9 @@ class In1kRunTask:
     config passed in (``rl``)."""
 
     name = "in1k"
+    display_frame = "scene"
+    """How the training images sit in the scene (read by the scanpath evaluation): ``RandomResizedCrop`` to the
+    square scene (``in1k/data.py``)."""
     best_metric = "top1"
     """Eval key the harness maximizes for `best.pt` — matches `in1k/train.py`'s
     `best_top1` selection. NB the standalone also writes a `best-hf/` export alongside;
@@ -201,7 +204,7 @@ class In1kRunTask:
             groups["head"] = list(model.norm.parameters()) + list(model.head.parameters())
         if spec.train_policy:
             assert joint is not None
-            groups["policy"] = list(joint.scorer.parameters())
+            groups["policy"] = joint.policy_parameters()  # actor (+ SAC critics)
         return groups
 
     def resume_start_step(self, payload, scheduler):

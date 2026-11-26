@@ -282,14 +282,13 @@ class _TinyMultiTask(SearchRunTask):
     """A random tiny MULTI-retina backbone, through the real retina check of build_model."""
 
     def build_model(self, device, prior_model_config=None):
-        from canvit.search.task import fix_backbone_retina
         torch.manual_seed(0)
         c = self.cfg
         model = CanViTForVisualSearch(backbone_name="vits16", model_config=_MULTI,
                                       n_classes=len(self._classes()), cond_dim=c.cond_dim, kind=c.head,
                                       width=c.head_width, block_layers=c.head_block_layers,
-                                      presence=c.condition == "both").to(device)
-        fix_backbone_retina(model, c.retina, "tiny-multi")
+                                      presence=c.condition == "both", levels=c.head_levels).to(device)
+        self._apply_retina(model, source="tiny-multi")
         self.model = model
         return model, model.head
 
@@ -314,3 +313,126 @@ def test_retina_choice_is_required_for_multi_and_refused_for_single(fake_cs18):
     with pytest.raises(ValueError, match="needs a multi-retina backbone"):
         fix_backbone_retina(model, "cmf0.75_res32_cps3", "tiny")
     fix_backbone_retina(model, None, "tiny")                     # single retina, no choice: fine
+
+
+def test_all_retinas_trains_on_drawn_retinas_and_validates_each(fake_cs18, tmp_path):
+    """``--cfg.retina all``: no retina is fixed, the engine draws them in training, and
+    validation runs every retina on the same images: the usual keys are the mean over
+    retinas, each retina's values sit under ``<retina>/``, the choice is cleared after."""
+    import json
+    root, _ = fake_cs18
+    task = _TinyMultiTask(_cfg(root, retina="all", supervise="every"), rl=_rl(reward="fractional",
+                          reward_center="running_mean", reward_scale="running_std"))
+    last = _run(task)
+    assert torch.isfinite(torch.tensor(last["total_loss"]))
+    model = task.model
+    patcher = model.canvit.patcher
+    assert patcher.fixed_retina is None and patcher._active_retinas is None
+    names = patcher.retina_names
+    model.canvit.eval()
+    out = task.evaluate(model=model, head=model.head, val_loader=task.build_val_loader(),
+                        device=torch.device("cpu"), step=7, joint=task._joint, run_dir=tmp_path)
+    assert patcher._active_retinas is None
+    for k in ("found_t2_policy", "hit_t2_random", "presence_acc_t2_greedy"):
+        per = [out[f"{n}/{k}"] for n in names]
+        assert out[k] == pytest.approx(sum(per) / len(per)), k
+    assert "found_t0_policy" in out and f"{names[0]}/found_t0_policy" not in out  # per retina: last glimpse only
+    row = [json.loads(line) for line in open(tmp_path / "eval.jsonl")][-1]
+    assert row["step"] == 7 and f"{names[1]}/loss_t0_random" in row and "loss_t0_random" in row
+    # each retina really is validated through its own retina: the t0 losses differ
+    assert row[f"{names[0]}/loss_t0_random"] != row[f"{names[1]}/loss_t0_random"]
+
+
+def test_all_retinas_is_refused_for_a_single_retina_backbone(fake_cs18):
+    root, _ = fake_cs18
+    task = _TinyMultiTask(_cfg(root, retina="all"), rl=_rl())
+    model, _ = _TinyTask(_cfg(root), rl=_rl()).build_model(torch.device("cpu"))
+    with pytest.raises(ValueError, match="needs a multi-retina backbone"):
+        task._apply_retina(model, source="tiny")
+
+
+def test_head_levels_sets_the_unet_depth_and_defaults_to_six():
+    from canvit.core.policy.net import N_UNET_ENC
+    from canvit.search.head import SearchHead
+    kw = dict(canvas_dim=24, n_classes=3, cond_dim=8, width=16, block_layers=1, presence=True)
+    deep, shallow = SearchHead(**kw), SearchHead(**kw, levels=3)
+    assert len(deep.enc) == N_UNET_ENC == 6 and len(shallow.enc) == 3 and len(shallow.film_enc) == 3
+    assert len(shallow.dec) == len(shallow.film_dec) == 2
+    x, t = torch.randn(2, 32, 32, 24), torch.tensor([0, 2])
+    heat, pres = shallow(x, t)
+    assert heat.shape == (2, 32, 32) and pres.shape == (2,)
+    # the default is the historical head: same parameters and the same init
+    torch.manual_seed(0)
+    a = SearchHead(**kw).state_dict()
+    torch.manual_seed(0)
+    b = SearchHead(**kw, levels=6).state_dict()
+    assert a.keys() == b.keys() and all(torch.equal(a[k], b[k]) for k in a)
+    # a checkpoint's head_kw without "levels" (every run before the option) rebuilds 6 levels
+    assert SearchConfig(data_root=".").head_levels == 6
+
+
+# search's PG defaults configure the entropy dual ascent; QReg has none, so unset them
+_QREG = dict(objective="qreg", entropy_alpha_init=None, entropy_alpha_min=None, entropy_alpha_max=None,
+             entropy_update="per_glimpse")
+
+
+def test_qreg_trains_on_search_with_the_target_present_mask(fake_cs18):
+    root, _ = fake_cs18
+    task = _TinyTask(_cfg(root, supervise="every"), rl=_rl(**_QREG, reward="fractional",
+                     reward_center="running_mean", reward_scale="running_std"))
+    last = _run(task)
+    assert torch.isfinite(torch.tensor(last["total_loss"]))
+
+
+def test_qreg_mask_regresses_only_the_masked_in_rows(fake_cs18):
+    """QReg's per-glimpse loss with a reward mask = the plain QReg MSE over the masked-in
+    rows (their reward standardised among themselves); masked-out rows get no gradient."""
+    root, _ = fake_cs18
+    kw = dict(_QREG, reward="fractional", reward_center="none", reward_scale="none")
+    task = _TinyTask(_cfg(root, supervise="every"), rl=_rl(**kw))
+    model, _ = task.build_model(torch.device("cpu"))
+    joint = task.build_policy(model, device=torch.device("cpu"), canvas_grid=32,
+                              generator=torch.Generator().manual_seed(0))
+    torch.manual_seed(1)
+    scores = torch.randn(4, 1024, requires_grad=True)
+    idx, reward = torch.tensor([3, 7, 11, 5]), torch.tensor([0.5, -1.0, 2.0, 0.25])
+    mask = torch.tensor([True, False, True, False])
+    loss = joint.glimpse_loss(depth=1, scores=scores, flat_idx=idx, reward=reward, mask=mask)
+    ref = joint.glimpse_loss(depth=1, scores=scores[mask], flat_idx=idx[mask], reward=reward[mask])
+    assert torch.allclose(loss, ref)
+    loss.backward()
+    assert scores.grad[~mask].abs().sum() == 0 and scores.grad[mask].abs().sum() > 0
+    none = joint.glimpse_loss(depth=1, scores=scores, flat_idx=idx, reward=reward,
+                              mask=torch.zeros(4, dtype=torch.bool))
+    assert none.item() == 0.0
+
+
+def test_head_lr_schedule_cosine_by_default_constant_on_request(fake_cs18):
+    root, _ = fake_cs18
+    cos = _TinyTask(_cfg(root), rl=_rl()).default_spec().optim["head"].schedule
+    assert cos.kind == "warmup_cosine" and cos.total_steps == 4 and cos.warmup_steps == 1
+    const = _TinyTask(replace(_cfg(root, lr_schedule="constant"), warmup_steps=0), rl=_rl()).default_spec().optim["head"]
+    assert const.schedule.kind == "warmup_constant" and const.schedule.warmup_steps == 0
+    # the head then follows the same schedule shape as the policy group
+    pol = _TinyTask(_cfg(root), rl=_rl(policy_warmup_steps=0, policy_warmup_frac=0.0)).default_spec().optim["policy"]
+    assert pol.schedule.kind == const.schedule.kind
+
+
+def test_resumed_search_run_keeps_the_runs_best_checkpoint(fake_cs18, tmp_path, monkeypatch):
+    """Through harness.run: chunk 1 peaks, chunk 2 (resumed from latest.pt) validates worse,
+    so best.pt must stay at chunk 1's peak (it used to be replaced: best was per job)."""
+    from canvit.harness.infra.checkpoint import load_checkpoint
+    root, _ = fake_cs18
+    scores = iter([0.2, 0.8, 0.5, 0.4, 0.3])     # validations at steps 0, 1 | 2, 3, ...
+    monkeypatch.setattr(SearchRunTask, "evaluate", lambda self, **kw: {"found_t2_policy": next(scores)})
+
+    def chunk(n):
+        task = _TinyTask(_cfg(root), rl=_rl())
+        s = RunSettings(n_steps=n, eval_every=1, log_every=1, grad_clip=1.0, amp=False, seed=0,
+                        device="cpu", tracker="none", ckpt_dir=tmp_path, resume=True)
+        run(task=task, spec=task.default_spec(), settings=s)
+    chunk(2)                                       # steps 0-1: best 0.8 at step 1
+    assert load_checkpoint(tmp_path / "best.pt", "cpu")["step"] == 1
+    chunk(2)                                       # resumed, steps 2-3: 0.5, 0.4
+    assert load_checkpoint(tmp_path / "best.pt", "cpu")["step"] == 1
+    assert load_checkpoint(tmp_path / "latest.pt", "cpu")["extra"]["best"]["value"] == 0.8

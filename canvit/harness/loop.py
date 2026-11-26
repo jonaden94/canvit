@@ -82,6 +82,25 @@ def cancel_slurm_array() -> None:
         log.warning("scancel failed: %s", e)
 
 
+def _grad_split_metrics(params: list, policy_grads: list) -> dict[str, float]:
+    """Norms of the policy term's and the task term's gradient on the model params, and the
+    cosine between them, from THIS rank's gradient before the DDP average and the clip.
+    task = .grad - policy (the rollout's .grad holds their sum)."""
+    dot = pol_sq = task_sq = 0.0
+    for p, gp in zip(params, policy_grads):
+        if p.grad is None:
+            continue
+        g = p.grad.float()
+        gp = torch.zeros_like(g) if gp is None else gp.float()
+        gt = g - gp
+        dot += float((gt * gp).sum())
+        pol_sq += float((gp * gp).sum())
+        task_sq += float((gt * gt).sum())
+    denom = (pol_sq * task_sq) ** 0.5
+    return {"grad_split/policy_norm": pol_sq ** 0.5, "grad_split/task_norm": task_sq ** 0.5,
+            "grad_split/cos_task_policy": dot / denom if denom > 0 else 0.0}
+
+
 def grad_norms_by_module(
     module: Any, *, depth: int = 1, deep_prefixes: tuple[str, ...] = (),
 ) -> dict[str, float]:
@@ -146,7 +165,7 @@ def apply_requires_grad(*, model: Any, head: Any, joint: Any, spec: TrainSpec) -
         if not spec.train_head:
             head.eval()
     if joint is not None:
-        joint.scorer.requires_grad_(spec.train_policy)
+        joint.set_trainable(spec.train_policy)  # the actor, and SAC's critics
 
 
 def run_training_loop(
@@ -184,6 +203,7 @@ def run_training_loop(
     run_dir: Path | None = None,     # where task.render_viz writes figures (locally)
     signal_checkpoint: bool = True,  # honor SIGUSR1 -> checkpoint (handler in run())
     best_metric: str | None = None,  # eval key to MAXIMIZE -> writes ckpt_dir/best.pt
+    best_init: dict | None = None,   # a resumed run's best so far ({"metric", "value", "step"})
     on_log: Callable[[int, dict], None] | None = None,
     on_eval: Callable[[int], dict] | None = None,
     on_best: Callable[[int, str, float], None] | None = None,
@@ -196,17 +216,21 @@ def run_training_loop(
     # Model and policy gradients are clipped SEPARATELY, each to grad_clip (train/loop.py
     # 874-878): one joint norm over the union would couple their magnitudes, so a large
     # scorer gradient would shrink the model's update (and vice versa).
-    _scorer_ids = {id(p) for p in joint.scorer.parameters()} if joint is not None else set()
+    _scorer_ids = {id(p) for p in joint.policy_parameters()} if joint is not None else set()
     trainable = [p for g in optimizer.param_groups for p in g["params"] if id(p) not in _scorer_ids]
     core = getattr(model, "module", model)
     ema = EMATracker(ema_alpha) if ema_alpha > 0 else None
     last: dict = {}
 
     def _write_ckpt(path: Path, step: int, *, update_latest: bool = True) -> None:
+        # Every checkpoint carries the run's best so far, so a resumed array task keeps
+        # comparing against it (see _track_best) instead of starting over.
+        extra = ({"best": {"metric": best_metric, "value": best_so_far, "step": best_step}}
+                 if best_metric and best_so_far is not None else None)
         save_checkpoint(
             path, model=model, optimizer=optimizer, scheduler=scheduler,
             step=step, task_name=task_name, spec=spec, model_config=model_config,
-            metadata=metadata, joint=joint, update_latest=update_latest,
+            metadata=metadata, joint=joint, update_latest=update_latest, extra=extra,
         )
 
     def _save(step: int) -> None:
@@ -221,21 +245,27 @@ def run_training_loop(
 
     # Best-checkpoint selection (ade20k/train.py 177-182, in1k/train.py 210-214): the
     # task names an eval metric to MAXIMIZE and the improving checkpoint is kept as
-    # `best.pt`, because what you publish is the best probe, not the last one. Per-job,
-    # which is exactly the standalone semantics (neither standalone resumes, and both
-    # run their whole schedule in one job). Tasks with no `best_metric` are unaffected.
+    # `best.pt`, because what you publish is the best probe, not the last one. Over the
+    # whole RUN: a resumed array task starts from the best so far stored in the checkpoint
+    # it resumed from (`best_init`), so a worse validation never replaces best.pt. (Until
+    # 2026-11-26 the best was per job: each resumed chunk overwrote best.pt with its own
+    # best.) Tasks with no `best_metric` are unaffected.
     #
     # NO barrier here, unlike _save: validation is rank-0-only (on_eval returns {} on the
     # others), so only rank 0 ever gets a metric to compare. A barrier would deadlock.
     best_so_far: float | None = None
+    best_step: int | None = None
+    if best_init and best_metric and best_init.get("metric") == best_metric:
+        best_so_far, best_step = float(best_init["value"]), best_init.get("step")
+        log.info("resumed best so far: %s=%.4f (step %s)", best_metric, best_so_far, best_step)
 
     def _track_best(step: int, metrics: dict) -> None:
-        nonlocal best_so_far
+        nonlocal best_so_far, best_step
         if not best_metric or best_metric not in metrics:
             return
         value = metrics[best_metric]
         if best_so_far is None or value > best_so_far:
-            best_so_far = value
+            best_so_far, best_step = value, step
             if ckpt_dir is not None:
                 # update_latest=False is load-bearing: `latest.pt` must keep pointing at
                 # the NEWEST checkpoint. Repointing it at best.pt would make a resumed
@@ -276,12 +306,19 @@ def run_training_loop(
         do_viz = bool(viz_every) and run_dir is not None and step % viz_every == 0 \
             and hasattr(task, "render_viz")
         optimizer.zero_grad()
+        # Task-vs-policy gradient split (log steps only, only when the policy gradient
+        # reaches the model): the rollout additionally returns the policy term's own
+        # gradient; .grad stays the normal training gradient.
+        split = (log_grad_norms and on_log is not None and step % log_every == 0
+                 and joint is not None and spec.policy_grad_to_backbone and bool(trainable))
         result = run_rollout(
             model=model, images=images, task=bound, selector=selector, bptt=spec.bptt,
             branches=branches, canvas_grid_size=canvas_grid, amp_ctx=amp_ctx,
             task_weight=spec.task_weight, collect_viz=do_viz, viz_task=(task if do_viz else None),
-            joint=joint,
+            joint=joint, grad_split_params=(trainable if split else None),
         )
+        grad_split = (_grad_split_metrics(trainable, result.policy_grads)
+                      if result.policy_grads is not None else {})
         # DDP: average gradients across ranks BEFORE clipping (design §9 — nothing is
         # DDP-wrapped, so every trainable module is synced by hand here). Clipping first
         # and averaging after is a different operation and would drift from 1-GPU.
@@ -293,7 +330,7 @@ def run_training_loop(
         if joint is not None:
             if is_dist:  # the scorer carries its own reward standardizers -> its own hook
                 joint.allreduce_grads()
-            torch.nn.utils.clip_grad_norm_(joint.scorer.parameters(), grad_clip)
+            joint.clip_grads(grad_clip)  # the actor; SAC's critics separately
 
         is_log = on_log is not None and step % log_every == 0
         # Read grad norms AFTER clip and BEFORE optimizer.step() (grads persist until
@@ -303,6 +340,8 @@ def run_training_loop(
 
         optimizer.step()
         scheduler.step()
+        if joint is not None:
+            joint.after_optimizer_step()  # SAC's target-critic Polyak update; no-op otherwise
         t_gpu_total += time.perf_counter() - t1
 
         # Metrics that are EMA-smoothed before logging (train/loop.py logs ONLY EMAs
@@ -323,6 +362,7 @@ def run_training_loop(
         # Instantaneous (never smoothed), matching train/loop.py's metrics dict.
         if grad_norm is not None:
             last["grad_norm"] = float(grad_norm)
+        last.update(grad_split)
         if spec.bptt.continue_prob is not None:
             last["continue_prob"] = spec.bptt.continue_prob
         if log_timing and (t_data_total + t_gpu_total) > 0:

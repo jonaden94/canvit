@@ -33,17 +33,18 @@ class SearchHead(nn.Module):
 
     def __init__(self, *, canvas_dim: int, n_classes: int | None, cond_dim: int = 64,
                  kind: Literal["unet", "linear"] = "unet", width: int = 64, block_layers: int = 2,
-                 dropout: float = 0.0, presence: bool = False):
+                 dropout: float = 0.0, presence: bool = False, levels: int = N_UNET_ENC):
         super().__init__()
         self.kind = kind
+        self.levels = levels
         # None: prompt-cued search, the caller hands the FiLM condition to forward (``cond``).
         self.embed = nn.Embedding(n_classes, cond_dim) if n_classes is not None else None
         self.ln = nn.LayerNorm(canvas_dim)
         self.proj = nn.Conv2d(canvas_dim, width, 1)
         self.film_in = FiLM(cond_dim, width)
         if kind == "unet":
-            self.enc, self.dec = build_unet(width, block_layers)
-            self.film_enc, self.film_dec = build_unet_film(cond_dim, width)
+            self.enc, self.dec = build_unet(width, block_layers, levels)
+            self.film_enc, self.film_dec = build_unet_film(cond_dim, width, levels)
             self.post = _stage(width, width, block_layers)
         elif kind != "linear":
             raise ValueError(f"unknown search head {kind!r}")
@@ -55,9 +56,9 @@ class SearchHead(nn.Module):
         b, g, g2, _ = x.shape
         assert g == g2, f"square canvas expected, got {g}x{g2}"
         if self.kind == "unet":
-            assert g % (2 ** (N_UNET_ENC - 1)) == 0, (
-                f"the U-Net pools {N_UNET_ENC - 1} times; canvas grid {g} must be a multiple of "
-                f"{2 ** (N_UNET_ENC - 1)}")
+            assert g % (2 ** (self.levels - 1)) == 0, (
+                f"the U-Net pools {self.levels - 1} times; canvas grid {g} must be a multiple of "
+                f"{2 ** (self.levels - 1)}")
         if cond is None:
             assert self.embed is not None and target is not None
             cond = self.embed(target)

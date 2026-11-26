@@ -30,7 +30,7 @@ from canvit.harness.infra.utils import assert_shape
 
 from ..harness.infra.tracker import Tracker
 from ..harness.rollout.eval_viewpoints import open_loop_viewpoints, resolve
-from ..harness.viz.disk import plot_combined_curves, save_figure
+from ..harness.viz.disk import save_figure
 from .probe import (
     compute_in1k_top1,
     get_imagenet_class_names,
@@ -59,6 +59,7 @@ class ValAccumulator:
     cls_cos_raw: list[float] = field(default_factory=list)
     cls_cos_norm: list[float] = field(default_factory=list)
     in1k_accs: list[float] = field(default_factory=list)
+    policy_entropy: list[float] = field(default_factory=list)  # policy pass only, t >= 1
     pca_predictions: list[TimestepPredictions] = field(default_factory=list)
     viz_samples: list[VizSampleData] = field(default_factory=list)
     initial_scene: np.ndarray | None = None
@@ -79,8 +80,10 @@ def _log_pca(
     glimpse_grid_size: int,
     log_spatial_stats: bool,
     run_dir: Path,
+    pca_subdir: str,
+    policy_maps: list[np.ndarray] | None = None,
 ) -> None:
-    """Save PCA visualization to disk from accumulator data.
+    """Save PCA visualization to ``run_dir/visualization/<pca_subdir>/`` from accumulator data.
 
     The local-stream column (uniform g x g grid vs foveated patch-Voronoi)
     is selected inside `plot_multistep_pca` based on whether the
@@ -126,8 +129,9 @@ def _log_pca(
         timestep_predictions=acc.pca_predictions if acc.pca_predictions else None,
         foveated_samples=foveated_samples,
         square_samples=square_samples,
+        policy_maps=policy_maps,
     )
-    save_figure(fig_pca, run_dir, f"pca_{prefix}", step)
+    save_figure(fig_pca, run_dir, pca_subdir, step)
 
     if log_spatial_stats and acc.viz_samples:
         target_stats = {"mean": float(np.mean(teacher_np)), "std": float(np.std(teacher_np))}
@@ -143,7 +147,7 @@ def _log_pca(
         )
 
 
-def _deploy_viewpoints(*, model, images, joint, n, canvas_grid_size):
+def _deploy_viewpoints(*, model, images, joint, n, canvas_grid_size, prob_maps=None):
     """The trajectory a trained scorer actually takes on this batch (argmax deploy).
 
     Distill validates through core's ``forward_reduce``, which consumes a precomputed
@@ -156,7 +160,7 @@ def _deploy_viewpoints(*, model, images, joint, n, canvas_grid_size):
     (ade20k/in1k collect their readout DURING selection and pay nothing extra.)
     """
     from canvit.harness.rollout.eval_viewpoints import deploy_rollout_viewpoints
-    from canvit.harness.rollout.viewpoint import ViewpointType
+    from canvit.harness.rollout.viewpoint import Viewpoint, ViewpointType
 
     B = images.shape[0]
 
@@ -165,8 +169,12 @@ def _deploy_viewpoints(*, model, images, joint, n, canvas_grid_size):
             state = model.init_state(batch_size=B, canvas_grid_size=canvas_grid_size)
         return model(image=images, state=state, viewpoint=vp).state
 
-    return deploy_rollout_viewpoints(joint=joint, advance=advance, t0_type=ViewpointType.FULL,
-                                     batch_size=B, device=images.device, n=n)
+    vps = deploy_rollout_viewpoints(joint=joint, advance=advance, t0_type=ViewpointType.FULL,
+                                    batch_size=B, device=images.device, n=n, prob_maps=prob_maps)
+    # The selectors return core Viewpoints; the viz (PCA panel boxes) needs the named
+    # harness Viewpoint, like open_loop_viewpoints returns.
+    return [Viewpoint(centers=v.centers, scales=v.scales, name="full" if t == 0 else f"policy_t{t}")
+            for t, v in enumerate(vps)]
 
 
 def validate(
@@ -192,21 +200,38 @@ def validate(
     joint: Any = None,
     prefix: str = "val",
     probe: DINOv3LinearClassificationHead | None = None,
-    log_curves: bool = False,
     log_pca: bool = False,
+    pca_subdir: str = "pca_val",
     teacher: DINOv3Teacher | None = None,
     log_spatial_stats: bool = False,
     teacher_name: str | None = None,
     non_blocking: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> dict[str, float]:
-    """Run validation over a fixed set of batches (rank 0 only); return its scalars.
+    """Run validation over a fixed set of batches; return its scalars.
 
     Iterates ``val_batches`` (the fixed N-sample subset, chunked by batch size),
     computes per-timestep streaming metrics per chunk, and aggregates them weighted
     by chunk size — so the reported metrics are over all N samples and identical
     regardless of the chunk (batch) size. PCA/viz uses sample 0 of the first chunk.
+
+    Multi-GPU (``world_size > 1``, every rank calls this): rank r evaluates the chunks with
+    index ``ci % world_size == r`` — whole chunks, so each sees the same batch as on one GPU
+    — and the chunk-size-weighted SUMS are all-reduced, so every rank returns the same
+    means (equal to the 1-GPU result up to float summation order). Figures and spatial
+    stats come from chunk 0, which rank 0 owns; the other ranks draw nothing. A failure on
+    any rank is reported to all of them through the same all-reduce, so no rank is left
+    waiting; it then raises everywhere (the caller treats validation as best-effort).
+
+    ``log_pca``: save sample 0's PCA figure to ``run_dir/visualization/<pca_subdir>/``; in the
+    policy pass it also shows the action distribution behind each policy glimpse. The curves
+    over timesteps are drawn by the caller from the returned series (``plot_combined_curves``),
+    so one figure can hold several passes.
     """
     assert not log_pca or teacher is not None
+    if rank != 0:  # figures and spatial stats come from chunk 0, which rank 0 owns
+        log_pca = False
 
     if probe is not None and teacher_name is not None:
         probe_res = get_probe_resolution(teacher_name)
@@ -227,10 +252,12 @@ def validate(
         """Evaluate one chunk. Returns (acc, batch_size, teacher_acc, target_sample0,
         viewpoints, gt_idx, gt_name); per-timestep entries in ``acc`` are batch means."""
         B = images.shape[0]
+        prob_maps: list[Tensor] | None = None
         if policy == "policy":
+            prob_maps = []
             viewpoints = _deploy_viewpoints(
                 model=model, images=images, joint=joint, n=n_eval_viewpoints,
-                canvas_grid_size=canvas_grid_size,
+                canvas_grid_size=canvas_grid_size, prob_maps=prob_maps,
             )
         else:
             viewpoints = open_loop_viewpoints(
@@ -324,7 +351,13 @@ def validate(
             init_fn=init_fn,
             step_fn=step_fn,
         )
-        return acc, B, teacher_acc, target_sample0, viewpoints, gt_idx, gt_name
+        maps0 = None
+        if prob_maps is not None:  # mean entropy (nats) of the deploy distribution, per glimpse
+            acc.policy_entropy = [
+                float(-(p * p.clamp_min(1e-12).log()).sum(dim=1).mean()) for p in prob_maps]
+            if want_viz:
+                maps0 = [p[0].cpu().numpy() for p in prob_maps]
+        return acc, B, teacher_acc, target_sample0, viewpoints, gt_idx, gt_name, maps0
 
     try:
         with torch.inference_mode():
@@ -332,34 +365,77 @@ def validate(
             chunk_accs: list[tuple[ValAccumulator, int]] = []
             teacher_accs: list[tuple[float, int]] = []
             first: dict | None = None
-            for ci, (images_cpu, labels_cpu) in enumerate(val_batches):
-                images = images_cpu.to(device, non_blocking=non_blocking)
-                labels = labels_cpu.to(device, non_blocking=non_blocking) if probe is not None else None
-                want_viz = log_pca and ci == 0
-                acc, B, t_acc, tgt0, viewpoints, _gt_idx, _gt_name = _run_chunk(
-                    images, labels, want_viz=want_viz
-                )
-                chunk_accs.append((acc, B))
-                if t_acc is not None:
-                    teacher_accs.append((t_acc, B))
-                if ci == 0:
-                    first = {"acc": acc, "images": images, "target_sample0": tgt0, "viewpoints": viewpoints}
+            local_error: BaseException | None = None
+            try:
+                for ci, (images_cpu, labels_cpu) in enumerate(val_batches):
+                    if ci % world_size != rank:  # another rank's chunk
+                        continue
+                    images = images_cpu.to(device, non_blocking=non_blocking)
+                    labels = labels_cpu.to(device, non_blocking=non_blocking) if probe is not None else None
+                    want_viz = log_pca and ci == 0
+                    acc, B, t_acc, tgt0, viewpoints, _gt_idx, _gt_name, maps0 = _run_chunk(
+                        images, labels, want_viz=want_viz
+                    )
+                    chunk_accs.append((acc, B))
+                    if t_acc is not None:
+                        teacher_accs.append((t_acc, B))
+                    if ci == 0:
+                        first = {"acc": acc, "images": images, "target_sample0": tgt0,
+                                 "viewpoints": viewpoints, "maps0": maps0}
+                if not chunk_accs:
+                    raise RuntimeError(f"rank {rank} got no validation chunk (world_size={world_size} "
+                                       "exceeds the number of val chunks)")
+            except Exception as e:  # reported to the other ranks below, then re-raised
+                if world_size == 1:
+                    raise
+                local_error = e
 
-            assert chunk_accs, "validate() received no batches"
+            # Chunk-size-weighted per-timestep SUMS, laid out identically on every rank so
+            # they can be all-reduced; a series this rank does not have contributes zeros.
+            n_t = n_eval_viewpoints
+            names = ("scene_cos_raw", "scene_cos_norm", "cls_cos_raw", "cls_cos_norm",
+                     "in1k_accs", "policy_entropy")
+
+            def wsum(attr: str, length: int) -> tuple[list[float], float]:
+                rows = [(getattr(a, attr), b) for a, b in chunk_accs if getattr(a, attr)]
+                if not rows:
+                    return [0.0] * length, 0.0
+                assert all(len(v) == length for v, _ in rows), (attr, length)
+                return ([sum(vals[t] * b for vals, b in rows) for t in range(length)],
+                        float(sum(b for _, b in rows)))
+
+            lengths = {k: (n_t - 1 if k == "policy_entropy" else n_t) for k in names}
+            sums = {k: wsum(k, lengths[k]) if local_error is None else ([0.0] * lengths[k], 0.0)
+                    for k in names}
+            teacher_sum = float(sum(a * b for a, b in teacher_accs))
+            teacher_n = float(sum(b for _, b in teacher_accs))
+            if world_size > 1:
+                flat = [0.0 if local_error is not None else 1.0, teacher_sum, teacher_n]
+                for k in names:
+                    flat += sums[k][0] + [sums[k][1]]
+                buf = torch.tensor(flat, dtype=torch.float64, device=device)
+                torch.distributed.all_reduce(buf, op=torch.distributed.ReduceOp.SUM)
+                vals = buf.tolist()
+                if vals[0] < world_size:
+                    raise RuntimeError(f"validation failed on {world_size - int(vals[0])} rank(s)") from local_error
+                teacher_sum, teacher_n = vals[1], vals[2]
+                pos = 3
+                for k in names:
+                    sums[k] = (vals[pos:pos + lengths[k]], vals[pos + lengths[k]])
+                    pos += lengths[k] + 1
 
             def agg(attr: str) -> list[float]:
-                """Per-timestep mean over all samples (weighted by chunk size)."""
-                series = [(getattr(a, attr), b) for a, b in chunk_accs]
-                total = sum(b for _, b in series)
-                n_t = len(series[0][0])
-                return [sum(vals[t] * b for vals, b in series) / total for t in range(n_t)]
+                """Per-timestep mean over all samples (weighted by chunk size); [] if absent."""
+                s, total = sums[attr]
+                return [v / total for v in s] if total > 0 else []
 
             scene_cos_raw = agg("scene_cos_raw")
             scene_cos_norm = agg("scene_cos_norm")
             cls_cos_raw = agg("cls_cos_raw") if has_cls else []
             cls_cos_norm = agg("cls_cos_norm") if has_cls else []
-            have_in1k = len(chunk_accs[0][0].in1k_accs) > 0
-            in1k_accs = agg("in1k_accs") if have_in1k else []
+            in1k_accs = agg("in1k_accs")
+            have_in1k = len(in1k_accs) > 0
+            policy_entropy = agg("policy_entropy")
 
             # RETURNED, not logged. The caller namespaces and logs them (run.py's
             # on_eval under the task's own prefix, so the wandb keys are unchanged), and
@@ -371,9 +447,8 @@ def validate(
                 "scene_cos_raw": scene_cos_raw[-1],
                 "scene_cos_norm": scene_cos_norm[-1],
             }
-            if teacher_accs:
-                total = sum(b for _, b in teacher_accs)
-                series["in1k_teacher_top1"] = sum(a * b for a, b in teacher_accs) / total
+            if teacher_n > 0:
+                series["in1k_teacher_top1"] = teacher_sum / teacher_n
             for t, (raw, norm) in enumerate(zip(scene_cos_raw, scene_cos_norm)):
                 series[f"scene_cos_raw_t{t}"] = raw
                 series[f"scene_cos_norm_t{t}"] = norm
@@ -386,19 +461,8 @@ def validate(
             if have_in1k:
                 for t, ia in enumerate(in1k_accs):
                     series[f"in1k_tts_top1_t{t}"] = ia
-
-            # Combined 5-subplot graphs figure saved to disk at log_curves cadence.
-            # Replaces the per-curve wandb log_curve calls (scene_cos_*, cls_cos_*,
-            # in1k_tts_top1_*). Per-timestep scalars above keep going to wandb.
-            if log_curves:
-                fig_graphs = plot_combined_curves(
-                    scene_cos_raw=scene_cos_raw,
-                    scene_cos_norm=scene_cos_norm,
-                    cls_cos_raw=cls_cos_raw if has_cls else None,
-                    cls_cos_norm=cls_cos_norm if has_cls else None,
-                    in1k_accs=in1k_accs if have_in1k else None,
-                )
-                save_figure(fig_graphs, run_dir, "graphs", step)
+            for t, ent in enumerate(policy_entropy, start=1):  # policy pass only
+                series[f"policy_entropy_t{t}"] = ent
 
             if log_pca:
                 assert first is not None and first["target_sample0"] is not None
@@ -437,6 +501,8 @@ def validate(
                     glimpse_grid_size=glimpse_grid_size,
                     log_spatial_stats=log_spatial_stats,
                     run_dir=run_dir,
+                    pca_subdir=pca_subdir,
+                    policy_maps=first.get("maps0"),
                 )
 
             return series

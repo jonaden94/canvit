@@ -73,15 +73,36 @@ class SelfAttention(nn.Module):
 
     _bias_mask: Tensor
 
-    def forward(self, x: Tensor, rope: RoPE) -> Tensor:
+    def _qkv(self, x: Tensor, rope: RoPE | None) -> tuple[Tensor, Tensor, Tensor]:
+        """q, k, v [B, H, N, D_h]; RoPE on q and k when given (prefix tokens unrotated)."""
         B, N, D = x.shape
         assert self.qkv.bias is not None
         qkv = F.linear(x, self.qkv.weight, self.qkv.bias * self._bias_mask).reshape(B, N, 3, self.num_heads, self.head_dim)
         q, k, v = [qkv[:, :, i].transpose(1, 2) for i in range(3)]  # [B, H, N, D_h]
-        q = rope_apply_with_prefix(x=q, rope=rope)
-        k = rope_apply_with_prefix(x=k, rope=rope)
+        if rope is not None:
+            q = rope_apply_with_prefix(x=q, rope=rope)
+            k = rope_apply_with_prefix(x=k, rope=rope)
+        return q, k, v
+
+    def forward(self, x: Tensor, rope: RoPE) -> Tensor:
+        B, N, D = x.shape
+        q, k, v = self._qkv(x, rope)
         out = F.scaled_dot_product_attention(q, k, v, scale=self.scale)
         return self.proj(out.transpose(1, 2).reshape(B, N, D))
+
+    def forward_with_readers(self, x: Tensor, rope: RoPE, readers: Tensor) -> tuple[Tensor, Tensor]:
+        """``forward(x)`` (the same ops on the same tensor), plus READ-ONLY tokens ``readers``
+        [B, K, D] that attend to x and to themselves while nothing in x attends to them.
+        Readers are positionless (no RoPE), like the other prefix tokens."""
+        B, N, D = x.shape
+        K = readers.shape[1]
+        q, k, v = self._qkv(x, rope)
+        out_x = F.scaled_dot_product_attention(q, k, v, scale=self.scale)
+        q_r, k_r, v_r = self._qkv(readers, None)
+        out_r = F.scaled_dot_product_attention(
+            q_r, torch.cat([k, k_r], dim=2), torch.cat([v, v_r], dim=2), scale=self.scale)
+        return (self.proj(out_x.transpose(1, 2).reshape(B, N, D)),
+                self.proj(out_r.transpose(1, 2).reshape(B, K, D)))
 
 
 class ViTBlock(nn.Module):
@@ -132,6 +153,28 @@ class ViTBlock(nn.Module):
         x = x + (self._alpha0 + a1) * self.attn((1.0 + g1) * h + b1, rope)
         h = self.norm2(x)
         return x + (self._alpha0 + a2) * self.mlp((1.0 + g2) * h + b2)
+
+    def forward_with_kv(self, x: Tensor, rope: RoPE) -> tuple[Tensor, Tensor, Tensor]:
+        """Standard (unmodulated) block on ``x`` exactly as ``forward`` (the same ops), also
+        returning the attention's k, v [B, H, N, D_h] (RoPE applied to k) for an isolated
+        policy stream that reads them detached."""
+        assert not self.modulated, "isolated policy tokens are not implemented for modulated blocks"
+        B, N, D = x.shape
+        q, k, v = self.attn._qkv(self.norm1(x), rope)
+        a = F.scaled_dot_product_attention(q, k, v, scale=self.attn.scale)
+        x = x + self.ls1(self.attn.proj(a.transpose(1, 2).reshape(B, N, D)))
+        return x + self.ls2(self.mlp(self.norm2(x))), k, v
+
+    def forward_with_readers(self, x: Tensor, rope: RoPE, readers: Tensor) -> tuple[Tensor, Tensor]:
+        """Standard (unmodulated) block on ``x`` exactly as ``forward``, plus read-only tokens
+        that use the same weights but attend one way (see SelfAttention.forward_with_readers)."""
+        assert not self.modulated, "read-only policy tokens are not implemented for modulated blocks"
+        a_x, a_r = self.attn.forward_with_readers(self.norm1(x), rope, self.norm1(readers))
+        x = x + self.ls1(a_x)
+        x = x + self.ls2(self.mlp(self.norm2(x)))
+        r = readers + self.ls1(a_r)
+        r = r + self.ls2(self.mlp(self.norm2(r)))
+        return x, r
 
 
 # ---------------------------------------------------------------------------
