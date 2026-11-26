@@ -32,7 +32,7 @@ ENT="${ENT:-4.0}"             # PG entropy target; 4.0 = the original arms (name
 SUFFIX=""; [ "$ENT" != "4.0" ] && SUFFIX="-e$ENT"
 RUN_NAME=exp43-search-$ARM$SUFFIX-s$SEED
 STEPS_PER_JOB="${STEPS_PER_JOB:?STEPS_PER_JOB=5000 (smoke 2026-11-25: 0.82 s per step, 110 s per 9-retina validation)}"
-MAX_STEPS=10000
+MAX_STEPS="${MAX_STEPS:-10000}"   # 2026-11-26 reruns: MAX_STEPS=4501 STEPS_PER_JOB=4501 (one job; LR constant, so = the first 4,500 steps of 10k; last validation at 4,500)
 N_JOBS=$(( (MAX_STEPS + STEPS_PER_JOB - 1) / STEPS_PER_JOB ))
 ARRAY="${ARRAY:-0-$((N_JOBS - 1))%1}"
 TIME="${TIME:-0-02:00:00}"
