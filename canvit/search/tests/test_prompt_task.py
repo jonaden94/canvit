@@ -105,7 +105,8 @@ def test_prompt_search_trains_and_validates(share):
 
 def test_val_keys_per_prompt_type_and_band(tmp_path):
     import json
-    task = _TinyPromptTask(_cfg(visual_share=0.5, eval_cosine_baseline=True), rl=_rl(reward="fractional"))
+    cfg = replace(_cfg(visual_share=0.5, eval_cosine_baseline=True), eval_policies=("policy", "random"))
+    task = _TinyPromptTask(cfg, rl=_rl(reward="fractional"))
     model, head = task.build_model(torch.device("cpu"))
     joint = task.build_policy(model, device=torch.device("cpu"), canvas_grid=G,
                               generator=torch.Generator().manual_seed(0))
@@ -114,16 +115,24 @@ def test_val_keys_per_prompt_type_and_band(tmp_path):
     full = json.loads((tmp_path / "eval.jsonl").read_text().splitlines()[0])
     for ty in ("text", "visual"):
         assert f"{ty}/found_mean_policy" in out and f"{ty}/found_t2_policy_band10-99" in out
-        assert f"{ty}/found_mean_random" in out  # random is added at the first validation
+        assert f"{ty}/found_mean_random" in out  # listed in eval_policies
         assert f"{ty}/found_cos_t2_policy" in full
     assert out["found_mean_policy"] == pytest.approx((out["text/found_mean_policy"]
                                                       + out["visual/found_mean_policy"]) / 2)
     # the visual pass sees only the trials with a visual prompt (i % 4 < 2: 8 of 12 here), the text pass all 12
     assert sum(v for k, v in full.items() if k.startswith("text/n_trials_band")) == 12
     assert sum(v for k, v in full.items() if k.startswith("visual/n_trials_band")) == 8
-    out2 = task.evaluate(model=model, head=head, val_loader=task.build_val_loader(), device=torch.device("cpu"),
-                         step=2, joint=joint)
-    assert not any("random" in k for k in out2)  # not the first validation, not max_steps
+    # the prompt-mode default: the policy rule only, never an automatic random pass (owner 2026-11-26)
+    plain = _TinyPromptTask(_cfg(visual_share=0.5), rl=_rl(reward="fractional"))
+    assert plain.cfg.eval_policies == ("policy",)
+    pjoint = plain.build_policy(model, device=torch.device("cpu"), canvas_grid=G,
+                                generator=torch.Generator().manual_seed(0))
+    for step in (0, 4):  # the first validation and max_steps
+        out2 = plain.evaluate(model=model, head=head, val_loader=plain.build_val_loader(), device=torch.device("cpu"),
+                              step=step, joint=pjoint)
+        assert not any("random" in k for k in out2) and "found_mean_policy" in out2
+    with pytest.raises(ValueError, match="no fixation rule"):  # no policy, no listed rule
+        plain.evaluate(model=model, head=head, val_loader=plain.build_val_loader(), device=torch.device("cpu"), step=0)
 
 
 def test_lr_groups():
@@ -190,7 +199,8 @@ def test_coco_zero_shot_test_with_prompts(fake_cs18, fake_vp_release):  # noqa: 
     """harness.evaluate's path on COCO-Search18 with cue='prompt': text = the category name, visual = the
     release's vp_test prompt of the category; keys per prompt type."""
     root, _ = fake_cs18
-    cfg = replace(_cfg(visual_share=0.5), dataset="coco_search18", data_root=root, release_dir=fake_vp_release)
+    cfg = replace(_cfg(visual_share=0.5), dataset="coco_search18", data_root=root, release_dir=fake_vp_release,
+                  eval_policies=("random",))
     task = _TinyPromptTask(cfg, rl=_rl())
     task.build_val_loader = SearchRunTask.build_val_loader.__get__(task)  # the real COCO val loader
     loader = task.build_val_loader()
@@ -218,7 +228,8 @@ def test_prefix_token_mode_trains():
 
 def _frozen(spec):
     from canvit.harness.spec import BpttSpec
-    return replace(spec, train_backbone=False, task_grad_to_backbone=False, bptt=BpttSpec(mode="none", horizon=3))
+    return replace(spec, train_backbone=False, task_grad_to_backbone=False,
+                   bptt=BpttSpec(mode="none", horizon=spec.bptt.horizon))
 
 
 @pytest.mark.parametrize("frozen", [False, True])
@@ -304,7 +315,8 @@ def test_prompt_mode_with_all_retinas(tmp_path):
     class _Multi(_TinyPromptTask):
         backbone_config = _MULTI
 
-    task = _Multi(replace(_cfg(visual_share=0.5), retina="all"), rl=_rl(reward="fractional"))
+    task = _Multi(replace(_cfg(visual_share=0.5), retina="all", eval_policies=("policy", "random")),
+                  rl=_rl(reward="fractional"))
     last = _run(task)
     assert torch.isfinite(torch.tensor(last["total_loss"]))
     model, joint = task.built, task._joint
@@ -313,7 +325,7 @@ def test_prompt_mode_with_all_retinas(tmp_path):
     assert len(names) == 2 and patcher.fixed_retina is None
     model.canvit.eval()
     out = task.evaluate(model=model, head=model.head, val_loader=task.build_val_loader(), device=torch.device("cpu"),
-                        step=4, joint=joint, run_dir=tmp_path)  # max_steps: the random rule runs too
+                        step=1, joint=joint, run_dir=tmp_path)
     assert patcher._active_retinas is None
     row = [json.loads(line) for line in open(tmp_path / "eval.jsonl")][-1]
     for k in ("found_mean_policy", "found_t2_policy", "text/found_mean_policy", "visual/found_t2_random"):
@@ -352,3 +364,71 @@ def test_prompt_mode_with_a_beta_conditioned_saccade_cost():
         t2 = _TinyPromptTask(_cfg(visual_share=0.5, condition_policy=False), rl=_rl(**_STAGE2))
         m2, _ = t2.build_model(torch.device("cpu"))
         t2.build_policy(m2, device=torch.device("cpu"), canvas_grid=G, generator=torch.Generator().manual_seed(0))
+
+
+def test_train_length_distribution_seeded_by_seed_and_step():
+    """Training glimpse count (owner 2026-11-26): canvit's distill paradigm unchanged (chunks of 2, continue 0.5
+    after each: P(n = 2k) = 0.5^k, mean 4, no cap, also past n_timesteps); a pure function of (seed, step) that
+    leaves the global random alone; a fixed --cfg.prompt.train-timesteps."""
+    import collections
+    import random
+    task = _TinyPromptTask(replace(_cfg(), n_timesteps=10), rl=_rl())
+    m = 20000
+    counts = collections.Counter(task._train_length(s) for s in range(m))
+    assert all(n % 2 == 0 and n >= 2 for n in counts) and max(counts) > 10  # no cap at n_timesteps
+    for k in range(1, 6):
+        assert abs(counts[2 * k] / m - 0.5 ** k) < 0.012, (2 * k, counts[2 * k])
+    mean = sum(n * c for n, c in counts.items()) / m
+    assert abs(mean - 4.0) < 0.1
+    assert [task._train_length(s) for s in range(50)] == [task._train_length(s) for s in range(50)]
+    other = _TinyPromptTask(replace(_cfg(), seed=1), rl=_rl())
+    assert [task._train_length(s) for s in range(50)] != [other._train_length(s) for s in range(50)]
+    state = random.getstate()
+    task._train_length(3)
+    assert random.getstate() == state  # the global random is left alone
+    fixed = _TinyPromptTask(_cfg(train_timesteps=2), rl=_rl())
+    assert {fixed._train_length(s) for s in range(100)} == {2}
+    with pytest.raises(ValueError, match="train-timesteps"):
+        _cfg(train_timesteps=0)
+    assert task.cfg.n_timesteps == 10 and task.default_spec().bptt.continue_prob is None  # validation's length
+
+
+def test_train_length_reaches_the_engine_and_resumes():
+    """bind() hands the step's length to the engine (n_glimpses of the logged step); a resume continues the
+    (seed, step) sequence; the frozen spec ('none') uses it too; validation still runs n_timesteps."""
+    from types import SimpleNamespace
+
+    def logged(task, spec, n_steps=3):
+        seen = []
+        orig = type(task).bind
+
+        def bind(self, *a, **k):
+            b = orig(self, *a, **k)
+            seen.append(b.rollout_length)
+            return b
+        task.bind = bind.__get__(task)
+        settings = RunSettings(n_steps=n_steps, eval_every=0, log_every=1, grad_clip=1.0, amp=False, seed=0,
+                               device="cpu", tracker="none")
+        last = run(task=task, spec=spec, settings=settings)
+        return seen, last
+
+    cfg = _cfg()  # n_timesteps 3: the drawn lengths (2, 4, 6, ...) exceed it, as they may
+    task = _TinyPromptTask(cfg, rl=_rl(reward="fractional"))
+    seen, last = logged(task, task.default_spec())
+    assert seen == [task._train_length(s) for s in range(3)] and len(set(seen)) > 1  # (n_glimpses: a running mean)
+    frozen = _TinyPromptTask(cfg, rl=_rl(reward="fractional"))
+    seen_f, last_f = logged(frozen, _frozen(frozen.default_spec()))
+    assert seen_f == seen
+    resumed = _TinyPromptTask(cfg, rl=_rl())
+    resumed.resume_start_step({}, SimpleNamespace(last_epoch=7))
+    assert resumed._train_step == 7
+    fixed = _TinyPromptTask(_cfg(train_timesteps=2), rl=_rl(reward="fractional"))
+    seen_x, last_x = logged(fixed, fixed.default_spec(), n_steps=2)
+    assert seen_x == [2, 2] and last_x["n_glimpses"] == 2
+
+
+def test_train_length_one_is_refused_with_a_policy():
+    """The engine refuses a 1-glimpse rollout when a policy trains (t0 carries no policy loss; n / (n - 1))."""
+    task = _TinyPromptTask(_cfg(train_timesteps=1), rl=_rl(reward="fractional"))
+    with pytest.raises(ValueError, match="at least 2 glimpses"):
+        _run(task, n_steps=1)

@@ -43,6 +43,7 @@ log = logging.getLogger(__name__)
 
 POLICY_FEATURE_GROUPS: tuple[str, ...] = ("ln_feat",)  # the plain canvas, no handcrafted maps
 ALL_RETINAS = "all"  # --cfg.retina: use a multi-retina backbone through every retina
+TRAIN_LENGTH_UNIT = 2  # prompt-cued search's random training length grows in distill's chunks of 2 glimpses
 
 
 def _canvas_hidden(model: Any, state: RecurrentState, canvas_grid: int) -> Tensor:
@@ -55,8 +56,9 @@ class BoundSearchTask:
 
     Optional engine hooks, present only when they apply: ``step_weight`` (``supervise='last'``),
     ``policy_cond`` (a policy is trained), ``reward_mask`` (``condition='both'``: only the
-    target-present trials carry a policy reward, Haoze's ``valid_mask``) and ``saccade_beta``
-    (a beta-conditioned saccade cost: each trial's beta [B], already inside ``policy_cond``).
+    target-present trials carry a policy reward, Haoze's ``valid_mask``), ``saccade_beta``
+    (a beta-conditioned saccade cost: each trial's beta [B], already inside ``policy_cond``) and
+    ``rollout_length`` (prompt-cued search: this step's training glimpse count, set by ``SearchRunTask.bind``).
 
     Losses (Haoze's, with ``condition='both'``): the heatmap KL averaged over the
     target-present trials only, plus ``presence_weight`` x the presence loss over all trials."""
@@ -186,8 +188,8 @@ class SearchRunTask:
         self._world_size: int | None = None
         self._text_encoder = None  # prompt-cued search: Talk2DINO, built on first use
         self._teacher = None  # prompt-cued search with the distill loss: DINOv3, built on first use
-        self._n_evals = 0
         self._ddp = False  # world_size > 1 (build_loaders): every trainable parameter gets a grad tensor per step
+        self._train_step = 0  # the step bind() is called for (resumed in resume_start_step): seeds the train length
 
     @property
     def _prompt_mode(self) -> bool:
@@ -269,6 +271,9 @@ class SearchRunTask:
         head_lr = p.head_lr if p.head_lr is not None else lr
         policy_lr = p.policy_lr if p.policy_lr is not None else lr
         sched = self._task_schedule()  # backbone and heads: --cfg.lr-schedule
+        # The training length is not this horizon: bind() hands each step's own length to the engine
+        # (``BoundSearchTask.rollout_length``, ``_train_length``), also when --spec.train-backbone False rebuilds
+        # the BPTT spec (mode 'none').
         return TrainSpec(
             train_backbone=True, train_head=True, train_policy=True, task_weight=1.0, policy_weight=1.0,
             task_grad_to_backbone=True, policy_grad_to_backbone=False,
@@ -513,6 +518,7 @@ class SearchRunTask:
         return groups
 
     def resume_start_step(self, payload, scheduler):
+        self._train_step = scheduler.last_epoch  # the training-length draw continues at this step
         if self.cfg.dataset == "release":
             # The release's trial stream resumes at position step x batch_size (release.EpochStream).
             self._resume_saved = (payload.get("metadata") or {}).get("resume_state") or {}
@@ -541,8 +547,28 @@ class SearchRunTask:
             boxes=batch["boxes"].to(device), canvas_grid=self.canvas_grid(model), cfg=self.cfg,
             policy_embed=policy_embed, present=batch["present"].to(device), saccade_beta=beta,
             scene_target=self._scene_target(batch, device, core), grad_touch=self._grad_touch(core))
+        if self._prompt_mode:  # engine hook: this step's training length (validation keeps n_timesteps)
+            bound.rollout_length = self._train_length(self._train_step)
+        self._train_step += 1
         self._bound = bound  # this step's targets, for viz_frame
         return bound
+
+    def _train_length(self, step: int) -> int:
+        """Prompt-cued search's training glimpse count at ``step`` (owner 2026-11-26): ``prompt.train_timesteps``,
+        or (None) canvit's distill paradigm unchanged: chunks of 2 glimpses, after each chunk continue with
+        probability ``prompt.train_length_continue`` (0.5): P(n = 2k) = 0.5^k, mean 4, no cap (validation keeps
+        ``n_timesteps``). A PRIVATE ``random.Random`` seeded by (seed, step), so the draw is the same at a resume and
+        on every DDP rank, and Python's global ``random`` is never touched (distill draws from the global one,
+        unseeded)."""
+        import random
+        c, p = self.cfg, self.cfg.prompt
+        if p.train_timesteps is not None:
+            return p.train_timesteps
+        rng = random.Random(f"search-train-length/{c.seed}/{step}")
+        n = TRAIN_LENGTH_UNIT
+        while rng.random() < p.train_length_continue:
+            n += TRAIN_LENGTH_UNIT
+        return n
 
     def _grad_touch(self, model) -> list[Tensor] | None:
         """DDP: every trainable parameter (model and policy scorer) gets a gradient tensor in every step.
@@ -817,8 +843,8 @@ class SearchRunTask:
         trials with a visual prompt; only the trained type when the visual share is 0 or 1. Keys of a type are
         prefixed ``text/`` / ``visual/``; the plain keys are the mean over the evaluated types. The metric of
         record ``found_mean_<policy>`` = the mean of ``found`` over glimpses t1..t(T-1), averaged over the types
-        (``prompt.best_prompt_type``). ``random`` fixations are added at the first validation and at
-        ``max_steps`` (a baseline without its cost at every validation).
+        (``prompt.best_prompt_type``). Only the rules in ``cfg.eval_policies`` run (owner 2026-11-26: no automatic
+        random passes; a baseline is a listed rule or a separate ``harness.evaluate``).
 
         ``--cfg.retina all`` (a multi-retina backbone through every retina): each retina is
         validated on the same images (same seeded random fixations), the prompt types inside each retina; the MEAN
@@ -829,9 +855,9 @@ class SearchRunTask:
         T = self.cfg.n_timesteps
         pct = percent_label(self.cfg.overlap_box_frac)
         policies = [p for p in self.cfg.eval_policies if p != "policy" or joint is not None]
-        if self._prompt_mode and "random" not in policies and (self._n_evals == 0 or step >= self.cfg.max_steps):
-            policies.append("random")
-        self._n_evals += 1
+        if not policies:
+            raise ValueError(f"no fixation rule to validate: --cfg.eval-policies {self.cfg.eval_policies} without a "
+                             "trained policy; list random and/or greedy")
         kw = dict(model=model, val_loader=val_loader, device=device, step=step, run_dir=run_dir, joint=joint,
                   policies=policies)
         names_r = self._retina_names(model)

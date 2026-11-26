@@ -239,7 +239,16 @@ def run_rollout(
     if draw_retinas:
         patcher.set_retinas(torch.randint(n_retinas, (B,)))
 
-    n_glimpses = sample_n_glimpses(bptt, rng=rng)
+    # Optional hook: the bound task's own length for this step (visual search draws it from (seed, step), in
+    # frozen 'none' runs too), in place of the spec's. Absent (every other task): the draw as before.
+    n_glimpses = getattr(task, "rollout_length", None)
+    if n_glimpses is None:
+        n_glimpses = sample_n_glimpses(bptt, rng=rng)
+    elif n_glimpses < 1:
+        raise ValueError(f"task.rollout_length={n_glimpses} must be >= 1")
+    elif joint is not None and n_glimpses < 2:
+        # t0 is the fixed anchor without a policy loss; the policy terms are scaled by n / (n - 1).
+        raise ValueError(f"task.rollout_length={n_glimpses}: a trained policy needs at least 2 glimpses")
     # DDP: each rank samples independently; broadcast so all ranks call backward()
     # the same number of times (else NCCL allreduce deadlocks).
     if dist.is_available() and dist.is_initialized():

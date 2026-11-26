@@ -101,6 +101,13 @@ class PromptConfig:
     """PROPOSAL (memory). The backbone trains through the rollout in chunks of this many glimpses (truncated
     BPTT, as distill); None = one graph over all ``n_timesteps`` glimpses (did not fit a V100-32GB at batch 16 with
     10 glimpses)."""
+    train_timesteps: int | None = None
+    """Glimpses per TRAINING episode (validation keeps ``n_timesteps``; owner 2026-11-26). None = a random length per
+    batch, canvit's distill paradigm unchanged: chunks of 2 glimpses, after each chunk continue with probability
+    ``train_length_continue`` (P(n = 2k) = 0.5^k at 0.5, mean 4, no cap), seeded by (``seed``, step) so a resume
+    draws the same lengths (``SearchRunTask._train_length``); frozen runs draw the same. An int = that fixed length."""
+    train_length_continue: float = 0.5
+    """The random training length's continue probability (distill's ``continue_prob``)."""
     distill_weight: float = 0.0
     """Weight of the distillation loss (DINOv3 scene features from the canvas, as in pretraining) next to the
     search loss. 0 = off: no teacher is built or called."""
@@ -204,13 +211,14 @@ class SearchConfig:
     # --- rollout / eval ----------------------------------------------------------------
     n_timesteps: int | None = None
     """Glimpses per episode: the centred t0 fixation plus n-1 chosen ones. None = 4 (Haoze) for
-    ``prompt.cue='class'``, 10 for ``'prompt'`` (the metric of record averages t1..t9)."""
+    ``prompt.cue='class'``, 10 for ``'prompt'`` (the metric of record averages t1..t9). Prompt-cued search trains
+    with its own length (``prompt.train_timesteps``); validation always runs this many."""
     eval_policies: tuple[str, ...] | None = None
     """Fixation policies run at every validation. ``random``: seeded random fixations.
     ``greedy``: the argmax of the current task heatmap, never revisiting a cell.
     ``policy``: the learned scorer's argmax (skipped when no policy is trained).
     None = all three for ``prompt.cue='class'``; ``('policy',)`` for ``'prompt'`` (a full release validation per
-    rule takes long), where ``random`` is added at the first validation and at ``max_steps`` as a baseline."""
+    rule takes long; owner 2026-11-26: no automatic random passes, list a baseline rule or run ``harness.evaluate``)."""
     overlap_box_frac: float = 0.1
     """Side of the square drawn around a point, as a fraction of the scene side, for the
     lenient metrics ``found_X_percent`` (the task head's argmax) and ``hit_X_percent`` (the
@@ -260,6 +268,9 @@ class SearchConfig:
             self.head_width = 256 if self.head == "xattn" else 64
         if self.n_timesteps is None:
             self.n_timesteps = 10 if prompt else 4
+        t = self.prompt.train_timesteps
+        if prompt and t is not None and t < 1:
+            raise ValueError(f"--cfg.prompt.train-timesteps {t} must be >= 1")
         if self.eval_policies is None:
             self.eval_policies = ("policy",) if prompt else ("random", "greedy", "policy")
 

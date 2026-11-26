@@ -111,13 +111,19 @@ Owner decisions of 2026-11-26. Training on the curated release with text and vis
   glimpses, default 2), the policy with exp43's PG
   settings via `--rl`. One LR (`--cfg.peak-lr`) for all groups unless `--cfg.prompt.{backbone,head,policy}-lr`
   (see the comment in `SearchRunTask._prompt_spec`: a lower backbone LR is probably wise).
+- **Training glimpse count** (owner 2026-11-26), separate from validation's: by default a random length per batch,
+  canvit's distill paradigm unchanged: chunks of 2 glimpses, after each chunk continue with probability
+  `--cfg.prompt.train-length-continue` 0.5 (P(n = 2k) = 0.5^k, mean 4, no cap), seeded by (seed, step) so a resume
+  repeats it, in frozen runs too (engine hook `rollout_length`). `--cfg.prompt.train-timesteps k`: a fixed length k. Validation
+  always runs `n_timesteps` (10).
 - **Visual share** `--cfg.prompt.visual-share` (default 0.5): per epoch, trials with a visual prompt get it with
   probability s/f; only when s > f (the epoch's fraction with one, ~0.77) are text-only trials dropped.
 - **Distillation** `--cfg.prompt.distill-weight` (0 = off): the pretraining scene loss on the canvas next to the
   search loss; val logs `scene_cos`.
 - **Validation:** per prompt type (`text/...`, `visual/...`; plain keys = their mean), per class-size band; metric
-  of record `found_mean_policy` = mean found over t1..t9 (n_timesteps 10). Only the policy rule by default;
-  random fixations at the first validation and at the end. `--cfg.prompt.eval-cosine-baseline`: the zero-shot
+  of record `found_mean_policy` = mean found over t1..t9 (n_timesteps 10). Only the policy rule by default, no
+  automatic random pass (list `--cfg.eval-policies policy random` or run `harness.evaluate` for a baseline; a run
+  without a policy must list a rule). `--cfg.prompt.eval-cosine-baseline`: the zero-shot
   baseline (cosine of the predicted DINOv3 features and the prompt), `found_cos_*`.
 - **With `--cfg.retina all` / the saccade cost** (main's options): validation runs every retina, the prompt types
   inside each one; `eval.jsonl` holds `<retina>/<type>/<key>`, and the plain keys (best.pt's `found_mean_policy`) are
