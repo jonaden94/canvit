@@ -9,7 +9,7 @@ P3/P4 — the ``state`` and ``t`` arguments exist for them and are unused here.
 """
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 import torch
@@ -89,6 +89,15 @@ class PolicySelector:
     form, so the `run_rollout` parity digest is unaffected. Adds NO RNG draws either way."""
     generator: torch.Generator | None = None
     last_aux: dict | None = None
+    efference_copy: bool = False
+    """Append the efference copy (where the policy looks now: a Gaussian bump at the current fixation,
+    ``core.policy.features.efference_copy_map``) as the scorer's LAST input channel. Off (default):
+    byte-identical to before, no extra state."""
+    efcopy_sigma: float | None = None
+    """The bump's sigma in scene units ([-1, 1]); None = one policy-grid cell (2 / grid)."""
+    _last_centres: Tensor | None = field(default=None, init=False, repr=False)
+    # the current fixation (efference_copy); init=False: a dataclasses.replace copy (deploy_selector)
+    # starts empty, so nothing from training leaks into a deploy rollout
 
     def start_rollout(
         self, *, t0_type: ViewpointType, batch_size: int, device: torch.device
@@ -96,7 +105,16 @@ class PolicySelector:
         if hasattr(self.encoder, "reset"):
             self.encoder.reset()  # type: ignore[attr-defined]
         self.last_aux = None
+        self._last_centres = None
         return self.fallback.start_rollout(t0_type=t0_type, batch_size=batch_size, device=device)
+
+    def _with_efference_copy(self, feats: Tensor, batch_size: int) -> Tensor:
+        from canvit.core.policy.features import efference_copy_map
+        grid = feats.shape[-1]
+        centres = (self._last_centres if self._last_centres is not None
+                   else torch.zeros(batch_size, 2, device=feats.device))  # no glimpse yet: the scene centre
+        sigma = self.efcopy_sigma if self.efcopy_sigma is not None else 2.0 / grid
+        return torch.cat([feats, efference_copy_map(centres, grid, sigma).to(feats.dtype)], dim=1)
 
     def select(
         self,
@@ -109,14 +127,19 @@ class PolicySelector:
         state: RecurrentState,
     ) -> NamedViewpoint:
         if vp_type == ViewpointType.FULL:
-            return self.fallback.select(
+            full = self.fallback.select(
                 vp_type=vp_type, ctx=ctx, t=t, batch_size=batch_size, device=device, state=state
             )
+            if self.efference_copy:
+                self._last_centres = full.centers.detach()
+            return full
         if self.feats_detached:  # cut the backbone from the policy graph (scorer still learns)
             with torch.no_grad():
                 feats = self.encoder(state)  # type: ignore[operator]
         else:
             feats = self.encoder(state)  # type: ignore[operator]
+        if self.efference_copy:
+            feats = self._with_efference_copy(feats, batch_size)
         # `ctx` may be None on this path (callers that never start a rollout, e.g. the
         # select_bn_eval tests): the historical code never read it here, so neither may this.
         cond_fn = getattr(ctx, "cond", None)
@@ -151,6 +174,8 @@ class PolicySelector:
                 idx = torch.where(on_pol, idx, rand_idx)
         self.last_aux = {"feats": feats, "flat_idx": idx, "scores": scores}
         acts = self.vp_flat[idx]
+        if self.efference_copy:
+            self._last_centres = acts[:, :2].detach()
         scales = acts[:, 2].contiguous()
         if self.fallback.is_foveated:
             # FIXATION action space: the candidate table's scale column is a hardcoded 1.0

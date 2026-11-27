@@ -34,6 +34,7 @@ from canvit.core.policy import (
     candidate_viewpoints,
     fixation_candidates,
 )
+from canvit.core.policy.features import EFCOPY
 from canvit.harness.config import FoveatedScaleConfig, JointPolicyConfig
 from canvit.harness.policy.joint import BETA_FEATURES, JointPolicy, SaccadeCost, TwinCritic
 from canvit.harness.policy.rl import PG, SAC, VPG, Objective, QReg, resolve_reward
@@ -162,6 +163,8 @@ def build_policy(
     # clip). Design: canvit_claude/canvit/active_pretraining/02-policy-tokens-design.md.
     n_tok = getattr(getattr(canvit, "cfg", None), "n_policy_tokens", 0)
     if n_tok:
+        if rl.efference_copy:
+            raise ValueError("efference_copy is not implemented for policy tokens")
         if saccade_cost.active:
             raise ValueError("saccade_cost is not implemented for policy tokens")
         if isinstance(obj, VPG):
@@ -258,9 +261,14 @@ def build_policy(
     # user's `dueling` knob to turn off. QReg honors the knob; plain PG never gets one
     # (softmax is shift-invariant, so a V(s) it cannot train would be dead weight).
     dueling = isinstance(obj, VPG) or (isinstance(obj, QReg) and obj.dueling)
+    if rl.efference_copy and isinstance(obj, SAC):
+        raise ValueError("efference_copy with objective='sac': the critics read the state encoder's "
+                         "features, which do not carry it")
+    # the efference copy is the scorer's LAST group; the state encoder never builds it (the selector does)
+    scorer_groups = (*feature_groups, EFCOPY) if rl.efference_copy else tuple(feature_groups)
     scorer = ViewpointScorer(
         canvas_dim=canvit.cfg.canvas_dim, width=rl.width, n_scale=n_scale, scales=scales,
-        centers_per_axis=rl.centers_per_axis, block_layers=rl.block_layers, groups=feature_groups,
+        centers_per_axis=rl.centers_per_axis, block_layers=rl.block_layers, groups=scorer_groups,
         dueling=dueling, action_space=action_space, readout=rl.policy_readout,
         input_norm=scorer_input_norm, film_cond_dim=film_cond_dim,  # type: ignore[arg-type]
         levels=rl.policy_levels,
@@ -280,6 +288,7 @@ def build_policy(
         mode="argmax" if isinstance(obj, QReg) else "sample",  # PG and VPG are both on-policy
         prime_on_policy=rl.prime_on_policy if isinstance(obj, QReg) else 1.0,
         feats_detached=rl.feats_detached, select_bn_eval=rl.select_bn_eval, generator=generator,
+        efference_copy=rl.efference_copy,
     )
 
     jp = JointPolicy(

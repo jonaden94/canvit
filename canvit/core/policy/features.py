@@ -20,7 +20,20 @@ INTRINSIC_GROUPS = ("cos_prev", "cos_init", "ln_feat", "feat_delta")  # no probe
 
 POLICY_GRID = 32  # the scorer's working resolution; larger canvases are pooled to it
 
-_SCALAR_GROUPS = {"ent", "ent_delta", "cos_prev", "cos_init"}
+_SCALAR_GROUPS = {"ent", "ent_delta", "cos_prev", "cos_init", "efcopy"}
+EFCOPY = "efcopy"
+"""The efference copy: where the policy looks NOW (a Gaussian bump at the current fixation centre on the
+policy grid). Not a canvas statistic, so the StateEncoder never builds it; the PolicySelector appends it
+last (``JointPolicyConfig.efference_copy``)."""
+
+
+def efference_copy_map(centres: Tensor, grid: int, sigma: float) -> Tensor:
+    """[B, 2] fixation centres (cy, cx) in [-1, 1] -> [B, 1, grid, grid]: exp(-d^2 / (2 sigma^2)) with d the
+    distance from each cell centre (same units, scene width 2) to the fixation."""
+    c = (torch.arange(grid, device=centres.device, dtype=torch.float32) + 0.5) * (2.0 / grid) - 1.0
+    dy = c.view(1, grid, 1) - centres[:, 0].float().view(-1, 1, 1)
+    dx = c.view(1, 1, grid) - centres[:, 1].float().view(-1, 1, 1)
+    return torch.exp(-(dy * dy + dx * dx) / (2.0 * sigma * sigma)).unsqueeze(1)
 
 
 def group_sizes(canvas_dim: int, groups: tuple[str, ...]) -> list[int]:

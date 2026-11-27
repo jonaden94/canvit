@@ -161,6 +161,12 @@ class JointPolicyConfig:
     # Optional per-saccade cost (objective='pg' with any reward, 'qreg'; refused for 'vpg').
     # d = Euclidean distance between consecutive glimpse centres in [-1, 1] units (scene width 2;
     # the first saccade starts at t0's scene centre). "none" (default) leaves every run unchanged.
+    efference_copy: bool = False
+    """Give the policy where it looks NOW: one extra scorer input channel, a Gaussian bump (sigma one policy
+    cell) at the current fixation centre (the scene centre before the first policy glimpse), next to the
+    unchanged canvas feature groups. Without it the policy sees only the canvas, which shows every glimpse
+    so far but not which one is the current fixation (needed to learn short saccades under a saccade
+    cost). Off (default): every run unchanged. Refused for SAC and policy tokens."""
     saccade_cost: Literal["none", "log"] = "none"
     """``log``: c(d) = log(1 + d / r), r = ``saccade_cost_r`` (default: half a policy-grid cell) — the
     form that fits human saccade lengths best post hoc; with a large r it is linear in d (the

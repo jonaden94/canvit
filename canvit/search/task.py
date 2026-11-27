@@ -754,7 +754,8 @@ class SearchRunTask:
         losses: list[Tensor] = []
         presences: list[Tensor | None] = []
         checks: dict[str, list[Tensor]] = {k: [] for k in ("argmax_in", "argmax_overlap", "fix_in", "fix_overlap",
-                                                            "cos_in", "cos_overlap", "scene_cos")}
+                                                            "cos_in", "cos_overlap", "scene_cos", "saccade_len")}
+        prev_centre: list[Tensor] = []  # the previous fixation, for the saccade length
         cosine = self._prompt_mode and self.cfg.prompt.eval_cosine_baseline
         frac = self.cfg.overlap_box_frac
         visited = torch.zeros(B, cg * cg, dtype=torch.bool, device=images.device)
@@ -781,6 +782,11 @@ class SearchRunTask:
             checks["argmax_overlap"].append(square_overlaps_box(guess, boxes, box_frac=frac))
             checks["fix_in"].append(inside_box(fix, boxes))
             checks["fix_overlap"].append(square_overlaps_box(fix, boxes, box_frac=frac))
+            # saccade length to fixation t (scene units, width 2, as the saccade cost); t0 has none (0)
+            centre = vp.centers.float()
+            checks["saccade_len"].append((centre - prev_centre[0]).norm(dim=-1) if prev_centre
+                                         else torch.zeros(B, device=centre.device))
+            prev_centre[:] = [centre]
             if cosine or scene_target is not None:
                 scene = model.predict_scene(hidden.float()).float()  # standardized DINOv3 patch features
                 if scene_target is not None:
@@ -975,7 +981,7 @@ class SearchRunTask:
             crit |= {"found_cos": ("cos_in", False), f"found_cos_{pct}": ("cos_overlap", False)}
         distill = self._prompt_mode and self.cfg.prompt.distill_weight > 0
         scene_cos = {p: 0.0 for p in policies}
-        keys = ("kl", "tpos", "tneg", "fpos", *crit, *(f"correct_{c}" for c in crit))
+        keys = ("kl", "tpos", "tneg", "fpos", "sac", *crit, *(f"correct_{c}" for c in crit))
         sums = {p: {k: [0.0] * T for k in keys} for p in policies}
         n_tp = n_ta = 0
         # Release val only (batch["band"]): the last glimpse's metrics per class-size band (release spec 5).
@@ -1023,6 +1029,7 @@ class SearchRunTask:
                     for t in range(T):
                         said = pres[t] > 0 if pres[t] is not None else None  # p(present) > 0.5
                         s["kl"][t] += losses[t][present].sum().item()
+                        s["sac"][t] += chk["saccade_len"][t].float().sum().item()  # over ALL trials
                         for c, (k, cumulative) in crit.items():
                             ok = chk[k][t]
                             if cumulative:  # some fixation 0..t
@@ -1075,6 +1082,11 @@ class SearchRunTask:
                     full[f"f1_t{t}_{p}"] = 2 * prec * rec / (prec + rec) if prec + rec > 0 else 0.0
             if distill:
                 full[f"scene_cos_t{T - 1}_{p}"] = scene_cos[p] / max(n, 1)
+            # mean saccade length (scene units, width 2) to fixation t, over all trials, and over t1..t(T-1)
+            for t in range(1, T):
+                full[f"saccade_len_t{t}_{p}"] = s["sac"][t] / max(n, 1)
+            if T > 1:
+                full[f"saccade_len_{p}"] = sum(s["sac"][1:]) / max(n * (T - 1), 1)
         band_keys: list[str] = []
         if has_bands:
             for p in policies:
@@ -1091,7 +1103,7 @@ class SearchRunTask:
         # ordered by metric, then fixation rule, then glimpse (W&B shows panels in log order)
         out = {f"{k}_t{t}_{p}": full[f"{k}_t{t}_{p}"]
                for k in names for p in policies for t in range(T) if k in per_glimpse or t == T - 1}
-        out |= {k: v for k, v in full.items() if k.startswith(("found_cos", "scene_cos"))}
+        out |= {k: v for k, v in full.items() if k.startswith(("found_cos", "scene_cos", "saccade_len"))}
         return full, out | {k: full[k] for k in band_keys}
 
     @staticmethod
@@ -1133,6 +1145,7 @@ class SearchRunTask:
         for c in ("correct_found", f"correct_found_{pct}"):
             wanted += [f"{c}_t{L}_policy", f"{c}_t{L}_random"]
         wanted += [f"presence_acc_t{L}_policy", f"loss_t{L}_policy"]
+        wanted += [f"saccade_len_{p}" for p in ("policy", "greedy", "random")]
         ov: dict[str, float] = {}
         for k in wanted:
             if k.endswith("_gain"):  # policy minus random, found and found_X_percent only

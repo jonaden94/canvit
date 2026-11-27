@@ -518,3 +518,31 @@ def test_cli_passes_search_resume_from(tmp_path):
     p = tmp_path / "step-5000.pt"
     _, s = SearchCmd(cfg=SearchConfig(run_group="g", resume_from=p)).build()
     assert s.resume_from == p
+
+
+def test_efference_copy_with_saccade_cost_trains_and_validation_reports_saccade_length(fake_cs18):
+    """exp44's arm through harness.run: the exp43 recipe on all retinas, the efference copy as the scorer's
+    last group, the per-glimpse log cost. Validation reports the deployed policy's saccade lengths."""
+    root, _ = fake_cs18
+    task = _TinyMultiTask(_cfg(root, retina="all", supervise="every"),
+                          rl=_rl(reward="fractional", reward_center="running_mean", reward_scale="running_std",
+                                 efference_copy=True, saccade_cost="log", saccade_cost_weight=0.3,
+                                 saccade_cost_r=0.06))
+    seen = {}
+    orig = SearchRunTask.evaluate
+
+    def spy(self, **kw):
+        out = orig(self, **kw)
+        seen[kw["step"]] = out
+        return out
+    task.evaluate = spy.__get__(task)  # type: ignore[method-assign]
+    last = _run(task, n_steps=2)
+    assert torch.isfinite(torch.tensor(last["total_loss"]))
+    assert task._joint.scorer.frontend.groups[-1] == "efcopy" and task._joint.policy_selector.efference_copy
+    out = seen[2]
+    T = task.cfg.n_timesteps
+    for p in ("policy", "greedy", "random"):
+        lens = [out[f"saccade_len_t{t}_{p}"] for t in range(1, T)]
+        assert all(0.0 <= v <= 2 * 2 ** 0.5 for v in lens)            # a distance inside the [-1, 1] square
+        assert abs(out[f"saccade_len_{p}"] - sum(lens) / len(lens)) < 1e-9
+    assert out["saccade_len_random"] > 0
