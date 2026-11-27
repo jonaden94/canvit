@@ -31,10 +31,11 @@ from canvit.search.release import (
 )
 
 RELEASE = Path("/user/henrich1/u25995/jonathan/datasets/visual_search/search_release/basic-v1")
-# Releases whose reference epochs the slow parity test checks: basic-v1, basic-v2 (visual prompts) once it exists,
-# and any extra release dirs in $CANVIT_EXTRA_RELEASES (os.pathsep-separated; e.g. a partial release in progress).
+# Releases whose reference epochs the slow parity test checks: basic-v1, basic-v2 (visual prompts), basic-v3-text and
+# basic-v3 (+ the V3Det negatives, source_match on) once they exist, and any extra release dirs in
+# $CANVIT_EXTRA_RELEASES (os.pathsep-separated; e.g. a partial release in progress).
 # Nothing is ever imported from a release folder (it must never be written to, not even a __pycache__).
-PARITY_RELEASES = [RELEASE, RELEASE.parent / "basic-v2",
+PARITY_RELEASES = [RELEASE, *(RELEASE.parent / n for n in ("basic-v2", "basic-v3-text", "basic-v3")),
                    *(Path(p) for p in os.environ.get("CANVIT_EXTRA_RELEASES", "").split(os.pathsep) if p)]
 W, H = 320, 200  # stored picture size (before the fix)
 BOX = (0.25, 0.5, 0.125, 0.25)  # x, y, w, h as fractions of the FIXED picture: a white rectangle
@@ -240,6 +241,31 @@ def test_epochs_equal_the_reference(release):
                 assert np.array_equal(a.astype(np.float32), b, equal_nan=True), (e, c)
             else:
                 assert (a.astype(object) == b.astype(object)).all(), (e, c)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("release", PARITY_RELEASES, ids=lambda p: p.name)
+def test_val_trials_are_val_parquet_as_is(release):
+    """The val trials are val.parquet's rows as they are (no sampler; e.g. basic-v3's source-matched absent trials):
+    every present trial, then interleaved with the absent ones in file order, with their picture, box, text and
+    (on a visual-prompt release) vp_idx."""
+    if not (release / "meta.json").exists():
+        pytest.skip(f"{release} not on disk")
+    from canvit.search.release import val_trials
+    vp = (release / "vp_features.npy").exists()
+    v = pd.read_parquet(release / "val.parquet")
+    got = val_trials(release, visual_prompts=vp)
+    tp, ta = np.flatnonzero(v["present"].to_numpy()), np.flatnonzero(~v["present"].to_numpy())
+    n = min(len(tp), len(ta))
+    order = [*(i for pair in zip(tp[:n], ta[:n]) for i in pair), *tp[n:], *ta[n:]]
+    assert len(got) == len(v) == len(order)
+    w = v.iloc[order]
+    assert [t.image_idx for t in got] == w["image_idx"].tolist()
+    assert [t.text for t in got] == w["text"].tolist()
+    assert [t.box is not None for t in got] == w["present"].tolist()
+    box = w[["box_x", "box_y", "box_w", "box_h"]].to_numpy(np.float64)
+    assert all(t.box == tuple(float(x) for x in b) for t, b, p in zip(got, box, w["present"]) if p)
+    assert [t.vp_idx for t in got] == (w["vp_idx"].tolist() if vp else [-1] * len(w))
 
 
 @pytest.mark.slow

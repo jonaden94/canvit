@@ -1,9 +1,9 @@
 """VENDORED from get_datasets' reference sampler (``functionality/search_index/sampler.py``) as shipped in the search
 releases: ``basic-v1/sampler.py`` (sha256 7054868f2b3f33acaa6e6406fc1cccbcccb75013caec72debe11a8536977eda6,
-release commit d0cf175) and, with the visual-prompt extension, the 2026-11-25 partial visual-prompt release's
-``sampler.py`` (sha256 44dc9e5b89e1f0070e70017766425b4eed1ac93328a1f143f1db7d373a9d01c3, uncommitted in
-get_datasets), which is basic-v1's plus the ``vp_*`` parts. The releases' spec (README section 4) says: port it as
-it is. Changes, all marked ``# canvit:``:
+release commit d0cf175); since 2026-11-27 get_datasets 14c6fc6's = ``basic-v2/sampler.py`` (sha256
+ae6c4767aa09f0dca88e70b9f1db01b03ec8053b974b6df9b3bb7444e7285881), which is basic-v1's plus the ``vp_*`` parts
+(visual prompts) and ``source_match`` (on from basic-v3; read from the release's meta.json ``sampler_defaults``).
+The releases' spec (README section 4) says: port it as it is. Changes, all marked ``# canvit:``:
 - each epoch row also carries ``image_idx`` (the row of ``images.parquet``, as the releases'
   ``reference/epoch_*.parquet`` do): present rows from ``examples.image_idx``, absent rows from
   ``neg_explicit.image_idx`` / ``implicit_images.image_idx``;
@@ -30,6 +30,11 @@ Absent trials (share `absent` of all trials): prompt and text copied from a rand
 prompt has negatives; the image is drawn uniformly from all negatives of that prompt (explicit negatives at the
 prompt or above it, implicit negatives of complete sources: no object at, below or above the prompt), never a val
 absent trial.
+source_match (default off; on from basic-v3, owner 2026-11-26): the absent picture comes from the SAME source as its
+donor present trial wherever the prompt has negatives from that source (explicit negatives of that source, or
+implicit ones if the source is complete), else uniformly from all negatives as above. Absent pictures then follow the
+source mix of the class's present pictures, so the look of a source (e.g. V3Det web photos vs EntitySeg scenes) is no
+cue for present / absent.
 
 Text options (all off by default; user 2026-11-24, for ablations): synonym_p = probability that a trial's text is
 replaced by a random synonym of its prompt (the normalised labels of all sources on the node); definition_p =
@@ -45,7 +50,7 @@ vp_boxes / vp_features: uniform among the prompt's candidates (vp_candidates) th
 image group and not a near-duplicate of the target picture (vp_neardup); -1 if none is left. Drawn with a separate
 random stream after everything else, so the other columns equal those of a release without visual prompts.
 """
-# ruff: noqa: E702  (the reference's own one-line statements, kept verbatim)
+# ruff: noqa: E702, E501  (the reference's own one-line statements and line lengths, kept verbatim)
 from pathlib import Path
 
 import numpy as np
@@ -70,8 +75,9 @@ def fill(count, draws, r):
 
 class SearchSampler:
     def __init__(self, index_dir, K=300, r=2, absent=0.5, synonym_p=0.0, definition_p=0.0, template=None,
-                 definition_heldout=False):
+                 definition_heldout=False, source_match=False):
         self.K, self.r, self.absent = K, r, absent
+        self.source_match = source_match
         self.synonym_p, self.definition_p, self.template = synonym_p, definition_p, template
         rd = lambda n, **kw: pd.read_parquet(f'{index_dir}/{n}.parquet', **kw)  # noqa: E731
         self.ex = rd('examples')
@@ -220,6 +226,23 @@ class SearchSampler:
                 src.append(self.imp_source[i]); img.append(self.imp_image[i]); idx.append(self.imp_idx[i])
         return np.concatenate(src), np.concatenate(img), np.concatenate(idx)
 
+    def negatives_from(self, x, s, m, rng):
+        """m random negatives of prompt x from source s (uniform over its negatives there); None if s has none"""
+        lst = self._explicit(x)
+        lst = lst[self.neg_src[lst] == s]
+        n_imp = int(self.n_imp[x][self.srcs.index(s)]) if s in self.srcs else 0
+        if len(lst) + n_imp == 0:
+            return None
+        k_exp = rng.binomial(m, len(lst) / (len(lst) + n_imp))
+        src, img, idx = [], [], []  # canvit: image_idx carried
+        if k_exp:
+            j = lst[rng.integers(len(lst), size=k_exp)]
+            src.append(self.neg_src[j]); img.append(self.neg_img[j]); idx.append(self.neg_idx[j])
+        if m - k_exp:
+            i = self._implicit(x, s, m - k_exp, rng)
+            src.append(self.imp_source[i]); img.append(self.imp_image[i]); idx.append(self.imp_idx[i])
+        return np.concatenate(src), np.concatenate(img), np.concatenate(idx)
+
     def _texts(self, prompts, text, rng):
         """apply the text options to the drawn texts"""
         if not (self.synonym_p or self.definition_p or self.template):
@@ -255,12 +278,19 @@ class SearchSampler:
         n_abs = int(round(len(pres) * self.absent / (1 - self.absent)))
         ok = np.flatnonzero(pres['prompt'].map(self.has_negatives).to_numpy())
         pick = np.sort(rng.choice(ok, size=n_abs, replace=n_abs > len(ok)))
-        donor = pres.iloc[pick][['prompt', 'text']].reset_index(drop=True)
+        donor = pres.iloc[pick][['prompt', 'text', 'source']].reset_index(drop=True)
         parts = []
-        for x, g in donor.groupby('prompt', sort=True):
-            s, im, ii = self.negatives(x, len(g), rng)  # canvit: image_idx carried
-            parts.append(pd.DataFrame({'source': s, 'image': im, 'image_idx': ii, 'prompt': x,
-                                       'text': g['text'].to_numpy()[:len(s)]}))
+        if not self.source_match:
+            for x, g in donor.groupby('prompt', sort=True):
+                s, im, ii = self.negatives(x, len(g), rng)  # canvit: image_idx carried
+                parts.append(pd.DataFrame({'source': s, 'image': im, 'image_idx': ii, 'prompt': x,
+                                           'text': g['text'].to_numpy()[:len(s)]}))
+        else:
+            for (x, src), g in donor.groupby(['prompt', 'source'], sort=True):
+                got = self.negatives_from(x, src, len(g), rng)
+                s, im, ii = got if got is not None else self.negatives(x, len(g), rng)  # canvit: image_idx carried
+                parts.append(pd.DataFrame({'source': s, 'image': im, 'image_idx': ii, 'prompt': x,
+                                           'text': g['text'].to_numpy()[:len(s)]}))
         ab = pd.concat(parts, ignore_index=True).assign(present=False, example_id=-1)
         out = pd.concat([pres, ab], ignore_index=True)
         out = out.iloc[rng.permutation(len(out))].reset_index(drop=True)
