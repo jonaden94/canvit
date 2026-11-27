@@ -128,7 +128,9 @@ def test_eval_writes_every_metric_to_jsonl_and_an_overview_to_the_tracker(fake_c
                 assert full[f"hit_t{t}_{p}"] >= full[f"hit_t{t - 1}_{p}"]
         assert full[f"hit_t0_{p}"] == full["hit_t0_random"]  # t0 is the same centre for all
     ov = {k.removeprefix("overview/"): v for k, v in tr.logged.items()}
-    assert all(k.startswith("overview/") for k in tr.logged) and len(ov) == 20 + 2 * 3  # + t0, t1 of 3 series
+    # + t0, t1 of 3 series, + the mean saccade length of the 3 fixation rules (2026-11-27)
+    assert all(k.startswith("overview/") for k in tr.logged) and len(ov) == 20 + 2 * 3 + 3
+    assert all(ov[f"saccade_len_{p}"] == full[f"saccade_len_{p}"] for p in ("policy", "greedy", "random"))
     for t in range(2):
         for k in (f"found_t{t}_policy", f"found_t{t}_random", f"hit_t{t}_policy"):
             assert ov[k] == full[k], k
