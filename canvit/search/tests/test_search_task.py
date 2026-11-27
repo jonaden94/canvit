@@ -479,3 +479,42 @@ def test_search_run_stops_at_max_steps_and_a_spare_array_task_does_nothing(fake_
     assert (tmp_path / "step-4.pt").stat().st_mtime_ns == mtime, "a validation-only job must not rewrite the checkpoint"
     assert read_last_val(tmp_path)["step"] == 4 and load_checkpoint(tmp_path / "best.pt", "cpu")["step"] == 4
     assert chunk() == {}                      # and now it is on record: nothing to do
+
+
+def test_resume_from_continues_another_runs_state_at_this_runs_lr(fake_cs18, tmp_path, monkeypatch):
+    """An LR decay of a finished run: a NEW run dir continues the source's full state (step,
+    weights, AdamW moments, policy) with this run's LRs, validates the inherited weights at its
+    start and keeps its own best; the source run's files are not touched."""
+    from canvit.harness.infra.checkpoint import load_checkpoint
+    root, _ = fake_cs18
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    evals: list[tuple[str, int]] = []
+
+    def fake_eval(self, **kw):
+        evals.append((self.cfg.run_name, kw["step"]))
+        return {"found_t2_policy": 0.1}
+    monkeypatch.setattr(SearchRunTask, "evaluate", fake_eval)
+
+    def go(ckpt_dir, *, lr, resume_from=None):
+        task = _TinyTask(replace(_cfg(root, peak_lr=lr, lr_schedule="constant"), warmup_steps=0,
+                                 run_name=ckpt_dir.name), rl=_rl(policy_lr=lr, policy_warmup_steps=0))
+        s = RunSettings(n_steps=2, max_steps=4, eval_every=1, log_every=1, grad_clip=1.0, amp=False, seed=0,
+                        device="cpu", tracker="none", ckpt_dir=ckpt_dir, resume=True, resume_from=resume_from)
+        run(task=task, spec=task.default_spec(), settings=s)
+    go(src, lr=1e-3)
+    src_files = {p.name: p.stat().st_mtime_ns for p in src.iterdir()}
+    go(dst, lr=1e-4, resume_from=src / "step-2.pt")
+    assert evals == [("src", 0), ("src", 1), ("src", 2), ("dst", 2), ("dst", 3), ("dst", 4)]
+    out = load_checkpoint(dst / "latest.pt", "cpu")
+    assert out["step"] == 4 and sorted(p.name for p in dst.glob("step-*.pt")) == ["step-4.pt"]
+    groups = out["optimizer_state"]["param_groups"]
+    assert len(groups) == 2 and {g["lr"] for g in groups} == {1e-4}   # task head AND policy at the new LR
+    assert {p.name: p.stat().st_mtime_ns for p in src.iterdir()} == src_files, "the source run was modified"
+
+
+
+def test_cli_passes_search_resume_from(tmp_path):
+    from canvit.harness.cli import SearchCmd
+    p = tmp_path / "step-5000.pt"
+    _, s = SearchCmd(cfg=SearchConfig(run_group="g", resume_from=p)).build()
+    assert s.resume_from == p

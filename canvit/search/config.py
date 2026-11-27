@@ -257,6 +257,11 @@ class SearchConfig:
     device: str = "cuda"
     amp: bool = True
     seed: int = 0
+    resume_from: Path | None = None
+    """Continue ANOTHER run's checkpoint with its full state (RunSettings.resume_from): weights,
+    AdamW, policy (incl. reward normalisers and entropy coefficient), step count; the LRs are
+    this config's (e.g. an LR decay of a finished run). Only used while this run has no
+    checkpoint of its own."""
     tracker: Literal["comet", "wandb", "none"] = "wandb"
     wandb_project: str | None = field(default_factory=_default_wandb_project)
     wandb_entity: str | None = field(default_factory=_default_wandb_entity)

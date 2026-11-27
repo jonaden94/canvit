@@ -480,7 +480,7 @@ class SearchCmd:
             seed=self.opts.seed if self.opts.seed is not None else self.cfg.seed,
             device=self.cfg.device,
             resume=self.opts.resume if self.opts.resume is not None else False,
-            max_steps=self.cfg.max_steps,
+            max_steps=self.cfg.max_steps, resume_from=self.cfg.resume_from,
             **_identity(self.cfg, self.opts, prefix="search"),
             **{**_common(self.opts), "viz_every": self.opts.viz_every or self.cfg.viz_every,
                # a time limit must never cost more than one validation interval (2026-11-26)

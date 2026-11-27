@@ -36,6 +36,22 @@ SEED="${SEED:-1}"
 ENT="${ENT:-4.0}"             # PG entropy target; 4.0 = the original arms (names unchanged)
 SUFFIX=""; [ "$ENT" != "4.0" ] && SUFFIX="-e$ENT"
 RUN_NAME=exp43-search-$ARM$SUFFIX-s$SEED
+LR=0.0004                     # task head AND policy (one AdamW, two groups)
+# DECAY=1 (owner 2026-11-27): continue the finished 5,000-step run with ALL its state (weights, AdamW,
+# policy incl. reward normalisers + entropy coefficient, step count) at 0.1x LR for both the head and
+# the policy, 2,000 more steps to 7,000; everything else 1:1. A new run dir + W&B run (W&B forking is
+# not enabled for our entity), logging steps 5,000-7,000.
+if [ -n "${DECAY:-}" ]; then
+  FROM_CKPT=/mnt/vast-nhr/projects/nib00021/jonathan/repos/canvit/logs/$RUN_GROUP/$RUN_NAME/checkpoints/step-5000.pt
+  [ -f "$FROM_CKPT" ] || { echo "REFUSING: $FROM_CKPT missing"; exit 1; }
+  CFG_RESUME_FROM=$FROM_CKPT
+  RUN_NAME=$RUN_NAME-lr0.1x-from5k
+  LR=0.00004
+  MAX_STEPS="${MAX_STEPS:-7000}"
+  STEPS_PER_JOB="${STEPS_PER_JOB:-2000}"
+  TIME="${TIME:-0-02:00:00}"
+  ARRAY="${ARRAY:-0-1%1}"     # 2,000 steps = one job + a spare (the job count below counts from step 0)
+fi
 MAX_STEPS="${MAX_STEPS:-5000}"
 STEPS_PER_JOB="${STEPS_PER_JOB:-5000}"   # ~2 h 30 min on production A100s (val 250-300 s, not the smoke's 110 s)
 N_JOBS=$(( (MAX_STEPS + STEPS_PER_JOB - 1) / STEPS_PER_JOB ))
@@ -55,7 +71,7 @@ CFG_BATCH_SIZE=64
 CFG_MAX_STEPS=$MAX_STEPS
 CFG_VAL_EVERY=500
 CFG_NUM_WORKERS=8
-CFG_PEAK_LR=0.0004            # task head = the policy's AdamW (exp42)
+CFG_PEAK_LR=$LR               # task head = the policy's AdamW (exp42)
 CFG_WEIGHT_DECAY=0.0001
 CFG_WARMUP_STEPS=0
 CFG_LR_SCHEDULE=constant   # head LR constant, like the policy (exp42)
@@ -65,7 +81,7 @@ CFG_HEAD_LEVELS=3
 OPT_N_STEPS=$STEPS_PER_JOB    # per array task; the next task resumes from the last checkpoint
 OPT_RESUME=True
 AUG="--cfg.aug.color-jitter --cfg.aug.rotate --cfg.aug.affine --cfg.aug.autocontrast --cfg.aug.no-crop"
-POLICY="--rl.block-layers 3 --rl.policy-levels 3 --rl.reward fractional --rl.reward-center running_mean --rl.reward-scale running_std --rl.policy-lr 0.0004 --rl.policy-weight-decay 0.0001 --rl.policy-betas 0.9 0.999 --rl.policy-warmup-steps 0 --rl.policy-warmup-frac 0"
+POLICY="--rl.block-layers 3 --rl.policy-levels 3 --rl.reward fractional --rl.reward-center running_mean --rl.reward-scale running_std --rl.policy-lr $LR --rl.policy-weight-decay 0.0001 --rl.policy-betas 0.9 0.999 --rl.policy-warmup-steps 0 --rl.policy-warmup-frac 0"
 PG="--rl.objective pg --rl.entropy-target $ENT --rl.entropy-alpha-min 1e-6 --rl.entropy-alpha-max None --rl.entropy-alpha-init None --rl.entropy-update per_rollout --rl.alpha-lr 0.01"
 # QReg has no entropy dual ascent: unset search's PG defaults for it
 QREG="--rl.objective qreg --rl.entropy-alpha-init None --rl.entropy-alpha-min None --rl.entropy-alpha-max None --rl.entropy-update per_glimpse"
