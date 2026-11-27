@@ -135,6 +135,9 @@ def test_rollout_with_zero_weight_trains_exactly_as_without_and_logs_saccades(se
     ({"objective": "vpg", "reward_center": "default", "reward_scale": "default"}, "not 'vpg'"),
     ({"saccade_cost": "none", "saccade_cost_weight": 0.0}, "saccade_cost_r is the log cost's scale"),  # r, no cost
     ({"saccade_cost_r": 0.0}, "saccade_cost_r is the log cost's scale"),
+    # Added by Claude (AI, Claude Opus 5.5), 2026-11-27: dense QReg's extra cells carry no saccade cost.
+    ({"objective": "qreg", "reward": "fractional", "reward_center": "running_mean", "reward_scale": "running_std",
+      "qreg_extra_candidates": 2}, "extra candidate cells are not costed"),
 ])
 def test_the_cost_is_refused_where_it_is_not_defined(seg, kw, match):
     # Changed by Claude (AI, Claude Opus 5.5), 2026-11-26: the cost now runs on the per-glimpse
@@ -270,7 +273,7 @@ def _glimpse_targets(monkeypatch, jp: JointPolicy, **kw) -> torch.Tensor:
     return torch.stack(seen, dim=1)  # [B, T]
 
 
-@pytest.mark.parametrize("objective, with_mask", [("pg", False), ("pg", True), ("qreg", False)])
+@pytest.mark.parametrize("objective, with_mask", [("pg", False), ("pg", True), ("qreg", False), ("qreg", True)])
 @pytest.mark.parametrize("form", ["log"])  # the linear form was dropped 2026-11-26 (Valentin)
 def test_glimpse_path_zero_weight_is_the_historical_loss_bit_for_bit(objective, with_mask, form):
     scores, flat_idx, reward, saccade_len, mask = _glimpse_batch()
@@ -364,3 +367,13 @@ def test_inline_rollout_with_a_constant_task_beta_trains_as_the_fixed_beta(seg, 
 
 def test_saccade_cost_r_defaults_to_half_a_grid_cell(seg):
     assert _build(seg, _inline_rl("pg", saccade_cost="log"), scorer_input_norm="none").saccade_cost.r == 1 / 32
+
+
+def test_masked_qreg_glimpse_path_uses_the_cost_target():
+    # Added by Claude (AI, Claude Opus 5.5), 2026-11-27: main's masked QReg (exp43's target-present
+    # mask) must see the cost: a positive weight changes its loss, zero weight does not.
+    scores, flat_idx, reward, saccade_len, mask = _glimpse_batch()
+    kw = {"flat_idx": flat_idx, "reward": reward, "mask": mask, "saccade_len": saccade_len}
+    ref, _ = _glimpse_seq(_jp_inline("qreg", SaccadeCost("log", 0.0)), scores, **kw)
+    moved, _ = _glimpse_seq(_jp_inline("qreg", SaccadeCost("log", 0.3)), scores, **kw)
+    assert not torch.equal(ref, moved)
