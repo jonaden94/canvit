@@ -654,7 +654,7 @@ class SearchRunTask:
         return torch.cat([tp[:k_tp], ta[:n - k_tp]])
 
     def _policy_logits(self, model, joint, state: RecurrentState, targets: Tensor, idx: Tensor,
-                       beta: Tensor | None = None) -> Tensor:
+                       beta: Tensor | None = None, centres: Tensor | None = None) -> Tensor:
         """[n, Gp, Gp] scorer logits on ``state`` for the batch rows ``idx``: the
         distribution the policy draws the NEXT fixation from. The scorer is deterministic
         (no BatchNorm, no dropout), so this equals the selector's own forward. The encoder's
@@ -669,7 +669,9 @@ class SearchRunTask:
         try:
             with torch.no_grad():
                 cond = self._policy_cond(model, targets[idx], None if beta is None else beta[idx])
-                scores = joint.scorer(enc(st).float(), cond=cond)
+                # the selector's own input (with the efference copy at ``centres`` = the fixation just taken)
+                feats = joint.policy_selector.scorer_input(enc(st).float(), None if centres is None else centres[idx])
+                scores = joint.scorer(feats, cond=cond)
         finally:
             enc.prev = prev
         g = int(round(scores[0].numel() ** 0.5))
@@ -684,7 +686,7 @@ class SearchRunTask:
                 "logits": logits.detach().float().cpu(),
                 "presence": presence.detach().float().cpu() if presence is not None else None,
                 "canvas": hidden[idx].detach().float().cpu(),
-                "policy_next": (self._policy_logits(model, joint, state, targets, idx, beta).cpu()
+                "policy_next": (self._policy_logits(model, joint, state, targets, idx, beta, centers).cpu()
                                 if joint is not None else None)}
 
     def _episode(self, frames: list[dict], *, images, boxes, targets, present, labels: list[str] | None = None):

@@ -106,3 +106,19 @@ def test_refused_for_sac():
                      feature_groups=("ln_feat",), device=torch.device("cpu"), canvas_grid=8,
                      min_viewpoint_scale=0.05, foveated_scale=FoveatedScaleConfig(),
                      generator=torch.Generator().manual_seed(0), encode_model=None, scorer_input_norm="none")
+
+
+def test_scorer_input_is_the_selectors_own_and_note_fixation_overrides_the_pick():
+    """Figures and teacher-forced evaluation run the scorer themselves: through scorer_input they get the
+    selector's input, and note_fixation makes the channel show the fixation actually taken."""
+    off, on = _selector([0]), _selector([7, 9], efference_copy=True)
+    f = torch.zeros(2, 3, _G, _G)
+    assert off.scorer_input(f, torch.zeros(2, 2)) is f
+    c = torch.tensor([[0.5, -0.5], [-0.25, 0.75]])
+    assert torch.equal(on.scorer_input(f, c)[:, 3:], efference_copy_map(c, _G, 2 / _G))
+    ctx = on.start_rollout(t0_type=ViewpointType.FULL, batch_size=2, device=torch.device("cpu"))
+    on.select(vp_type=ViewpointType.FULL, ctx=ctx, t=0, batch_size=2, device=torch.device("cpu"), state=None)
+    on.select(vp_type=ViewpointType.RANDOM, ctx=ctx, t=1, batch_size=2, device=torch.device("cpu"), state=None)
+    on.note_fixation(c)                                               # e.g. the human's fixation instead of 7
+    on.select(vp_type=ViewpointType.RANDOM, ctx=ctx, t=2, batch_size=2, device=torch.device("cpu"), state=None)
+    assert torch.equal(on.net.seen[-1][:, 3:], efference_copy_map(c, _G, 2 / _G))

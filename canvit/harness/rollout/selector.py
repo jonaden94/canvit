@@ -108,13 +108,25 @@ class PolicySelector:
         self._last_centres = None
         return self.fallback.start_rollout(t0_type=t0_type, batch_size=batch_size, device=device)
 
-    def _with_efference_copy(self, feats: Tensor, batch_size: int) -> Tensor:
+    def scorer_input(self, feats: Tensor, centres: Tensor | None) -> Tensor:
+        """The scorer's input for the state encoder's ``feats`` [B, C, G, G] when the policy looks at
+        ``centres`` [B, 2] (cy, cx) now (None: the scene centre, before any glimpse): ``feats`` itself,
+        or with the efference copy appended last. Every caller that runs the scorer itself (figures,
+        teacher-forced evaluation) must go through this, so the input is the selector's own."""
+        if not self.efference_copy:
+            return feats
         from canvit.core.policy.features import efference_copy_map
         grid = feats.shape[-1]
-        centres = (self._last_centres if self._last_centres is not None
-                   else torch.zeros(batch_size, 2, device=feats.device))  # no glimpse yet: the scene centre
+        if centres is None:
+            centres = torch.zeros(feats.shape[0], 2, device=feats.device)
         sigma = self.efcopy_sigma if self.efcopy_sigma is not None else 2.0 / grid
-        return torch.cat([feats, efference_copy_map(centres, grid, sigma).to(feats.dtype)], dim=1)
+        return torch.cat([feats, efference_copy_map(centres.to(feats.device), grid, sigma).to(feats.dtype)], dim=1)
+
+    def note_fixation(self, centres: Tensor) -> None:
+        """The fixation actually taken, when the caller overrides this selector's pick (teacher-forced
+        evaluation): the efference copy must show where the model looks, not what it proposed."""
+        if self.efference_copy:
+            self._last_centres = centres.detach()
 
     def select(
         self,
@@ -139,7 +151,7 @@ class PolicySelector:
         else:
             feats = self.encoder(state)  # type: ignore[operator]
         if self.efference_copy:
-            feats = self._with_efference_copy(feats, batch_size)
+            feats = self.scorer_input(feats, self._last_centres)
         # `ctx` may be None on this path (callers that never start a rollout, e.g. the
         # select_bn_eval tests): the historical code never read it here, so neither may this.
         cond_fn = getattr(ctx, "cond", None)

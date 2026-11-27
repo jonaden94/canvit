@@ -209,6 +209,8 @@ class PolicyEpisode:
             if t > 0:
                 xy = next_xy(t, scores)
                 vp = Viewpoint(centers=xy.flip(-1).to(vp.centers.dtype), scales=vp.scales)  # (y, x)
+                if hasattr(sel, "note_fixation"):  # the efference copy shows the forced fixation, not the pick
+                    sel.note_fixation(vp.centers)
             centres.append(vp.centers.flip(-1).float())
             if state is None:
                 state = model.init_state(batch_size=B, canvas_grid_size=cg)

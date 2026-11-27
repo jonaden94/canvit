@@ -59,7 +59,8 @@ CFG_HEAD_BLOCK_LAYERS=3
 CFG_HEAD_LEVELS=3
 OPT_N_STEPS=$STEPS_PER_JOB
 OPT_RESUME=True
-AUG="--cfg.aug.color-jitter --cfg.aug.rotate --cfg.aug.affine --cfg.aug.autocontrast --cfg.aug.no-crop"
+# color-jitter takes a value since d70eeb6 (None = the dataset default, False for COCO-Search18)
+AUG="--cfg.aug.color-jitter True --cfg.aug.rotate --cfg.aug.affine --cfg.aug.autocontrast --cfg.aug.no-crop"
 POLICY="--rl.block-layers 3 --rl.policy-levels 3 --rl.reward fractional --rl.reward-center running_mean --rl.reward-scale running_std --rl.policy-lr $LR --rl.policy-weight-decay 0.0001 --rl.policy-betas 0.9 0.999 --rl.policy-warmup-steps 0 --rl.policy-warmup-frac 0"
 PG="--rl.objective pg --rl.entropy-target $ENT --rl.entropy-alpha-min 1e-6 --rl.entropy-alpha-max None --rl.entropy-alpha-init None --rl.entropy-update per_rollout --rl.alpha-lr 0.01"
 case "$POS" in
