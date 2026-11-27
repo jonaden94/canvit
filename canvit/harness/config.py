@@ -158,20 +158,25 @@ class JointPolicyConfig:
     ``per_step``). ``ema_abs``: divide by an EMA of the mean absolute reward and clip to +-10
     (Haoze). ``none``: no scaling."""
 
-    # Optional per-saccade cost (objective='pg' with reward='terminal' only; refused elsewhere).
+    # Optional per-saccade cost (objective='pg' with any reward, 'qreg'; refused for 'vpg').
     # d = Euclidean distance between consecutive glimpse centres in [-1, 1] units (scene width 2;
     # the first saccade starts at t0's scene centre). "none" (default) leaves every run unchanged.
-    saccade_cost: Literal["none", "log", "linear"] = "none"
-    """``log``: c(d) = log(1 + d / r), r = half a policy-grid cell (1 / centers_per_axis) — the
-    form that fits human saccade lengths best post hoc. ``linear``: c(d) = d / 2, the fraction of
-    the scene width. ``none``: no cost, nothing measured."""
+    saccade_cost: Literal["none", "log"] = "none"
+    """``log``: c(d) = log(1 + d / r), r = ``saccade_cost_r`` (default: half a policy-grid cell) — the
+    form that fits human saccade lengths best post hoc; with a large r it is linear in d (the
+    separate ``linear`` form was dropped 2026-11-26, Valentin). ``none``: no cost, nothing measured."""
+    saccade_cost_r: float | None = None
+    """r of the ``log`` cost in scene units ([-1, 1], scene width 2). None (default) = half a policy-grid
+    cell, 1 / centers_per_axis (1/32 on a 32x32 grid, 1/8 on 8x8); set it to keep the cost's
+    shape fixed across grids."""
     saccade_cost_weight: float = 0.0
     """beta (``standardized``) or lambda (``raw``). 0 with a form set: saccade lengths and costs
     are logged (policy/saccade_len, policy/saccade_cost) but the target is unchanged."""
     saccade_cost_combine: Literal["standardized", "raw"] = "standardized"
     """``standardized``: action t's target = the standardised reward - weight * z_batch(c_t);
     unit-free, so the weight keeps its meaning while the terminal reward shrinks ~10x over
-    training. ``raw``: target = standardise(R - weight * sum_t c_t), the cost in reward units."""
+    training. ``raw``: target = standardise(R - weight * sum_t c_t) for a terminal reward,
+    standardise(r_t - weight * c_t) for a per-glimpse one; the cost in reward units."""
     saccade_cost_beta_mode: Literal["fixed", "conditioned"] = "fixed"
     """``fixed`` (stage 1): every trial uses beta = ``saccade_cost_weight``. ``conditioned``
     (stage 2): each training trial draws beta ~ U[0, saccade_cost_weight] and the policy gets

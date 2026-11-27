@@ -1140,7 +1140,7 @@ class SearchRunTask:
             meta["saccade_cost"] = {
                 "form": rl.saccade_cost, "weight": rl.saccade_cost_weight, "combine": rl.saccade_cost_combine,
                 "beta_mode": rl.saccade_cost_beta_mode, "beta_eval": rl.saccade_cost_beta_eval,
-                "r": 1.0 / rl.centers_per_axis,
+                "r": 1.0 / rl.centers_per_axis if rl.saccade_cost_r is None else rl.saccade_cost_r,
                 "beta_features": "[beta, log1p(beta / 0.1)] appended to the FiLM cue (conditioned only)"}
         return meta
 
