@@ -17,6 +17,20 @@ SEED="${SEED:-1}"
 ENT="${ENT:-4.0}"             # PG entropy target; 4.0 = the original arms (names unchanged)
 SUFFIX=""; [ "$ENT" != "4.0" ] && SUFFIX="-e$ENT"
 RUN_NAME=exp42-p2l3-$ARM$SUFFIX-s$SEED
+LR=0.0004                     # the policy (the only trained part; the model is frozen)
+# DECAY=1 (owner 2026-11-27): continue the finished run from its step-40960.pt with ALL its state
+# (policy, AdamW, reward normalisers, entropy coefficient, step count, shard position) at 0.1x LR,
+# 4 more chunks (16,384 steps, ~1.05M images) to 57,344; everything else 1:1 (entropy controller
+# incl. alpha_lr unchanged). New run dir + W&B run (W&B forking is not enabled for our entity).
+# No spare array task: distill has no max_steps, a spare would train another chunk.
+if [ -n "${DECAY:-}" ]; then
+  FROM_CKPT=/mnt/vast-nhr/projects/nib00021/jonathan/repos/canvit/logs/$RUN_GROUP/$RUN_NAME/checkpoints/step-40960.pt
+  [ -f "$FROM_CKPT" ] || { echo "REFUSING: $FROM_CKPT missing"; exit 1; }
+  CFG_RESUME_FROM=$FROM_CKPT
+  RUN_NAME=$RUN_NAME-lr0.1x-from40960
+  LR=0.00004
+  ARRAY="${ARRAY:-0-3%1}"
+fi
 ARRAY="${ARRAY:-0-9%1}"       # 10 x 4096 = 40,960 steps (owner 2026-11-25; was 20 x 4096)
 TIME="${TIME:-0-02:00:00}"
 MEM=128G
@@ -26,7 +40,7 @@ TASK=distill
 # === config ===
 CFG_WANDB_PROJECT=jon_exp42_policy_seeds
 CFG_SEED=$SEED
-CFG_PEAK_LR=0.0004            # no trainable task group; kept equal to the policy LR
+CFG_PEAK_LR=$LR               # no trainable task group; kept equal to the policy LR
 CFG_WARMUP_STEPS=0
 CFG_BATCH_SIZE_PER_GPU=64
 CFG_STEPS_PER_JOB="${STEPS_PER_JOB:-4096}"
@@ -35,10 +49,10 @@ CFG_LOG_EVERY=128
 CFG_NUM_WORKERS=4
 SEED_CKPT=/mnt/vast-nhr/projects/nib00021/jonathan/repos/canvit/logs/jon_exp38_multi_retina/exp38-multi-retina-4gpu-lr2x-s1/checkpoints/step-360448.pt
 [ -f "$SEED_CKPT" ] || { echo "REFUSING: $SEED_CKPT missing"; exit 1; }
-CFG_SEED_CKPT=$SEED_CKPT
+[ -z "${DECAY:-}" ] && CFG_SEED_CKPT=$SEED_CKPT   # DECAY: the state comes from resume_from
 RETINAS="0.75 65 6 False 0.75 80 7 True 0.75 92 8 True 2.2 65 6 False 2.2 80 7 True 2.2 92 8 True 7.7 65 6 False 7.7 80 7 True 7.7 92 8 True"
 MODEL_ARGS="--cfg.model.patcher-name foveated --cfg.model.foveated-patcher.fov 50 --cfg.model.foveated-patcher.retinas $RETINAS --cfg.model.foveated-patcher.arch-flag doubleres --cfg.model.foveated-patcher.rf-interp bilinear --cfg.model.foveated-patcher.conditioning.mode film --cfg.model.foveated-patcher.conditioning.film.fourier.num-features 256 --cfg.model.foveated-patcher.conditioning.film.fourier.sigma 4 --cfg.foveated-scale.fixed-scale 2.0"
-POLICY="--preset policy_only --cfg.rl.second-branch none --cfg.rl.no-select-bn-eval --cfg.rl.policy-lr 0.0004 --cfg.rl.policy-warmup-steps 0 --cfg.rl.policy-warmup-frac 0 --cfg.rl.policy-weight-decay 0.0001 --cfg.rl.policy-betas 0.9 0.999"
+POLICY="--preset policy_only --cfg.rl.second-branch none --cfg.rl.no-select-bn-eval --cfg.rl.policy-lr $LR --cfg.rl.policy-warmup-steps 0 --cfg.rl.policy-warmup-frac 0 --cfg.rl.policy-weight-decay 0.0001 --cfg.rl.policy-betas 0.9 0.999"
 # PG entropy control (2026-11-25, after exp41): ONE dual step per rollout on the rollout's mean
 # entropy, step 0.01 in log(alpha) (the search runs' / FoAViS setting) instead of one step per
 # glimpse at 0.05. exp41's per-glimpse controller swung alpha over 4-5 decades (T3-iso) and, for
