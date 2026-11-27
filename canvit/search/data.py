@@ -48,7 +48,7 @@ from torchvision.transforms.v2 import functional as TF
 
 from canvit.core.preprocess import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 
-from .config import SearchAugConfig, SearchConfig
+from .config import SearchAugConfig, SearchConfig, resolve_aug
 
 log = logging.getLogger(__name__)
 
@@ -150,7 +150,9 @@ def load_records(cfg: SearchConfig, part: str, classes: list[str]) -> list[Searc
 def _photometric(aug: SearchAugConfig) -> list:
     ops: list = []
     if aug.color_jitter:
-        ops += [v2.RandomApply([v2.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8), v2.RandomGrayscale(p=0.1)]
+        ops += [v2.RandomApply([v2.ColorJitter(*aug.jitter)], p=0.8)]
+        if aug.grayscale_p:
+            ops += [v2.RandomGrayscale(p=aug.grayscale_p)]
     if aug.autocontrast:
         ops += [v2.RandomAutocontrast(p=0.5)]
     return ops
@@ -194,11 +196,13 @@ def letterbox_hw(h: int, w: int, scene: int) -> tuple[int, int]:
 class SearchDataset(Dataset):
     """Records -> the sample contract. ``aug=None`` = validation (deterministic)."""
 
+    DATASET = "coco_search18"  # whose augmentation defaults fill the aug config's None fields
+
     def __init__(self, records: list[SearchRecord], *, scene_size: int, aug: SearchAugConfig | None,
                  visual_prompts=None):
         self.records = records
         self.scene = scene_size
-        self.aug = aug
+        self.aug = resolve_aug(aug, self.DATASET) if aug is not None else None
         self.visual_prompts = visual_prompts  # release.VisualPrompts: adds vp_feat / vp_cov / vp_valid
 
     def __len__(self) -> int:

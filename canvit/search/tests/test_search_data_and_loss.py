@@ -74,6 +74,19 @@ def test_letterbox_maps_the_box_exactly(fake_cs18):
         assert torch.allclose(s["image"][:, 0, :], s["image"][:, 0, :1].expand(-1, S))
 
 
+def test_aug_defaults_per_dataset():
+    from canvit.search.config import resolve_aug
+    from canvit.search.release import ReleaseDataset
+    c = resolve_aug(SearchAugConfig(), "coco_search18")
+    assert (c.crop_scale, c.color_jitter, c.jitter, c.grayscale_p) == ((0.6, 1.0), False, (0.4, 0.4, 0.4, 0.1), 0.1)
+    r = resolve_aug(SearchAugConfig(), "release")
+    assert (r.crop_scale, r.color_jitter, r.jitter, r.grayscale_p) == ((0.9, 1.0), True, (0.4, 0.4, 0.4, 0.0), 0.0)
+    u = resolve_aug(SearchAugConfig(crop_scale=(0.8, 1.0), color_jitter=False), "release")  # the user's values win
+    assert (u.crop_scale, u.color_jitter, u.jitter) == ((0.8, 1.0), False, (0.4, 0.4, 0.4, 0.0))
+    assert SearchDataset([], scene_size=S, aug=SearchAugConfig()).aug == c
+    assert ReleaseDataset.DATASET == "release"
+
+
 @pytest.mark.parametrize("aug", [
     SearchAugConfig(),
     SearchAugConfig(rotate=True, affine=True, color_jitter=True, autocontrast=True),

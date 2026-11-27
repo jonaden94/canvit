@@ -256,11 +256,20 @@ Task config, `--cfg.<name>` (dashes, e.g. `--cfg.presence-loss ce`):
 
 Augmentation, `--cfg.aug.<name>`:
 
-| option | default |
-|---|---|
-| `hflip_p` | 0.5 |
-| `crop` / `crop_scale` | True / (0.6, 1.0); the target box always stays fully inside |
-| `color_jitter`, `rotate`, `affine`, `autocontrast` | all False (Haoze's settings when on) |
+Defaults depend on the dataset (fields left at `None` are filled by `config.resolve_aug`; a value given on the
+command line always wins):
+
+| option | `coco_search18` | `release` |
+|---|---|---|
+| `hflip_p` | 0.5 | 0.5 |
+| `crop` / `crop_scale` | True / (0.6, 1.0) | True / (0.9, 1.0) |
+| `color_jitter` (p 0.8) | False | True |
+| `jitter` (brightness, contrast, saturation, hue) | (0.4, 0.4, 0.4, 0.1) when on | (0.4, 0.4, 0.4, 0.0): prompts can name a colour |
+| `grayscale_p` (after the jitter) | 0.1 when on | 0.0 |
+| `rotate`, `affine`, `autocontrast` | False (Haoze's settings when on) | False |
+
+The target box always stays fully inside. Examples: no crop `--cfg.aug.no-crop`; 80-100 % `--cfg.aug.crop-scale
+0.8 1.0`; no jitter `--cfg.aug.color-jitter False`; weaker jitter `--cfg.aug.jitter 0.2 0.2 0.2 0.0`.
 
 Policy, `--rl.<name>` (search defaults, not the generic ones):
 

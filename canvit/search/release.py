@@ -209,7 +209,10 @@ def coco_test_prompts(release_dir: Path, pairs: list[tuple[str, str]]) -> list[i
 
 class ReleaseDataset(SearchDataset):
     """``Trial`` -> the sample contract. The scene transform (augmentation, retention retries, letterbox) is
-    ``SearchDataset``'s, the same as COCO-Search18's. ``aug=None`` = validation."""
+    ``SearchDataset``'s, the same as COCO-Search18's, with the release's augmentation defaults. ``aug=None`` =
+    validation."""
+
+    DATASET = "release"
 
     def __init__(self, pictures: ReleasePictures, *, scene_size: int, aug: SearchAugConfig | None,
                  visual_prompts: VisualPrompts | None = None):
@@ -217,7 +220,8 @@ class ReleaseDataset(SearchDataset):
         self.pictures = pictures
         # Decode no smaller than the scene needs: a crop keeping area fraction a keeps sqrt(a) of each side,
         # which is then resized to the letterboxed content (longer side = scene_size).
-        self.long_side = (math.ceil(scene_size / math.sqrt(aug.crop_scale[0])) if aug is not None and aug.crop
+        a = self.aug
+        self.long_side = (math.ceil(scene_size / math.sqrt(a.crop_scale[0])) if a is not None and a.crop
                           else scene_size)
 
     def __getitem__(self, trial: Trial) -> dict:  # type: ignore[override]

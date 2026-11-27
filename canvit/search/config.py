@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
@@ -45,14 +45,24 @@ def _fixed_scale_2() -> FoveatedScaleConfig:
 @dataclass
 class SearchAugConfig:
     """Train-time augmentation (torchvision v2, boxes transformed with the image), applied
-    to the original image before letterboxing. Defaults per the design doc §2.3."""
+    to the original image before letterboxing. Defaults per the design doc §2.3; a ``None`` field takes its
+    dataset's default (``resolve_aug``): COCO-Search18 keeps Haoze's, the curated release has its own (owner
+    2026-11-27: a 60 % crop zooms in and makes search too easy; colour jitter instead)."""
 
     hflip_p: float = 0.5
     crop: bool = True
     """Random scaled crop with the image's aspect kept (output = the letterboxed content size)."""
-    crop_scale: tuple[float, float] = (0.6, 1.0)
-    color_jitter: bool = False
-    """Haoze: ColorJitter(0.4, 0.4, 0.4, 0.1) p 0.8, then greyscale p 0.1."""
+    crop_scale: tuple[float, float] | None = None
+    """Kept area fraction (min, max). None: (0.6, 1.0) on coco_search18 (Haoze), (0.9, 1.0) on the release."""
+    color_jitter: bool | None = None
+    """ColorJitter(*jitter) with p 0.8, then greyscale with p ``grayscale_p``. None: off on coco_search18, on on
+    the release."""
+    jitter: tuple[float, float, float, float] | None = None
+    """(brightness, contrast, saturation, hue) of the jitter. None: Haoze's (0.4, 0.4, 0.4, 0.1) on coco_search18;
+    (0.4, 0.4, 0.4, 0.0) on the release, whose prompts can name a colour ("white jug": ~2,000 of 15,335 texts),
+    so no hue shift."""
+    grayscale_p: float | None = None
+    """None: 0.1 on coco_search18 (Haoze), 0.0 on the release (colour prompts)."""
     rotate: bool = False
     """Haoze: rotation +-60 deg, p 0.5 (the box becomes the axis-aligned box of the rotated box)."""
     affine: bool = False
@@ -64,6 +74,18 @@ class SearchAugConfig:
     inside the frame; otherwise the geometric chain is redrawn."""
     max_tries: int = 10
     """Redraws before falling back to the un-augmented sample."""
+
+
+_AUG_DEFAULTS = {
+    "coco_search18": dict(crop_scale=(0.6, 1.0), color_jitter=False, jitter=(0.4, 0.4, 0.4, 0.1), grayscale_p=0.1),
+    "release": dict(crop_scale=(0.9, 1.0), color_jitter=True, jitter=(0.4, 0.4, 0.4, 0.0), grayscale_p=0.0),
+}
+
+
+def resolve_aug(aug: SearchAugConfig, dataset: str) -> SearchAugConfig:
+    """``aug`` with every ``None`` field set to ``dataset``'s default (the fields set by the user are kept)."""
+    d = _AUG_DEFAULTS[dataset]
+    return replace(aug, **{k: v for k, v in d.items() if getattr(aug, k) is None})
 
 
 @dataclass

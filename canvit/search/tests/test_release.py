@@ -130,7 +130,7 @@ def test_scene_box_covers_the_white_rectangle(fake_release):
 
 def test_augmented_scene_keeps_the_target(fake_release):
     ds = ReleaseDataset(ReleasePictures(fake_release), scene_size=64, aug=SearchAugConfig())
-    assert ds.long_side == math.ceil(64 / math.sqrt(0.6))
+    assert ds.long_side == math.ceil(64 / math.sqrt(0.9))  # the release default crop 0.9-1.0
     torch.manual_seed(0)
     for _ in range(10):
         b = ds[Trial(0, BOX, "thing")]["boxes"]
